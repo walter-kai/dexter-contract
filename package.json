@@ -1,0 +1,32 @@
+{
+  "name": "dexter-batchLimit",
+  "version": "1.0.0",
+  "description": "Uniswap v4 hooks for swap tracking and analytics",
+  "scripts": {
+    "anvil": "source .env && anvil --fork-url $MAINNET_RPC_URL --chain-id 1",
+    "test": "forge test",
+    "test:verbose": "forge test -vvv",
+    "build": "forge build",
+    "remap": "forge remappings > remappings.txt",
+    "deploy:swap:main": "./deploy/deploy-with-ledger.sh script/DeploySwapToken.s.sol mainnet",
+    "deploy:swap:anvil": "./deploy/deploy-with-ledger.sh script/DeploySwapToken.s.sol anvil",
+    "deploy:batch:anvil": "./deploy/deploy-with-ledger.sh script/DeployBatch.s.sol anvil",
+    "deploy:batch:main": "./deploy/deploy-with-ledger.sh script/DeployBatch.s.sol mainnet",
+    "deploy:ledger": "./deploy/deploy-with-ledger.sh"
+  },
+  "keywords": [
+    "uniswap",
+    "v4",
+    "hooks",
+    "defi",
+    "swap",
+    "analytics"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.0.1",
+    "ethers": "^6.15.0",
+    "ts-node": "^10.9.2"
+  }
+}
