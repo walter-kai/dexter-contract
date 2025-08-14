@@ -1593,14 +1593,70 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return batchId;
     }
 
-    function executeBatchLevel(uint256 batchId, uint256 /* priceLevel */) 
+    /**
+     * @notice Manually execute a specific batch level (owner only)
+     * @dev Allows owner to execute orders at favorable prices for optimal execution
+     * @param batchId The batch order ID to execute
+     * @param priceLevel The specific price level to execute (0-based index)
+     * @return isFullyExecuted Whether the entire batch is now fully executed
+     */
+    function executeBatchLevel(uint256 batchId, uint256 priceLevel) 
         external 
-        view
+        onlyOwner
         returns (bool isFullyExecuted) {
-        // This would be called by the hook automatically, return status
-        BatchOrderInfo storage info = batchOrdersInfo[batchId];
-        uint256 claimable = claimableOutputTokens[batchId];
-        return claimable > 0 && !info.isActive;
+        
+        BatchOrderInfo storage batchInfo = batchOrdersInfo[batchId];
+        require(batchInfo.isActive, "Batch order not active");
+        require(priceLevel < batchInfo.targetTicks.length, "Invalid price level");
+        
+        int24 targetTick = batchInfo.targetTicks[priceLevel];
+        uint256 targetAmount = batchInfo.targetAmounts[priceLevel];
+        
+        // Check if this level has pending orders
+        PoolId poolId = batchInfo.poolKey.toId();
+        uint256 pendingAmount = pendingBatchOrders[poolId][targetTick][batchInfo.zeroForOne];
+        
+        if (pendingAmount >= targetAmount) {
+            // Create memory copy for the swap
+            PoolKey memory poolKey = batchInfo.poolKey;
+            
+            // Execute the swap directly (similar to _executeBatchOrderAtTick logic)
+            BalanceDelta delta = poolManager.swap(
+                poolKey, 
+                SwapParams({
+                    zeroForOne: batchInfo.zeroForOne,
+                    amountSpecified: -int256(targetAmount), // Exact input
+                    sqrtPriceLimitX96: batchInfo.zeroForOne
+                        ? TickMath.MIN_SQRT_PRICE + 1
+                        : TickMath.MAX_SQRT_PRICE - 1
+                }), 
+                ""
+            );
+            
+            // Update pending orders
+            pendingBatchOrders[poolId][targetTick][batchInfo.zeroForOne] -= targetAmount;
+            
+            // Calculate output amount
+            uint256 outputAmount = batchInfo.zeroForOne
+                ? uint256(int256(delta.amount1()))
+                : uint256(int256(delta.amount0()));
+
+            // Update claimable tokens
+            claimableOutputTokens[batchId] += outputAmount;
+            
+            emit ManualBatchLevelExecuted(batchId, priceLevel, msg.sender, targetAmount);
+            emit BatchLevelExecuted(batchId, priceLevel, uint256(int256(targetTick)), targetAmount);
+        }
+        
+        // Check if batch is fully executed
+        uint256 totalClaimable = claimableOutputTokens[batchId];
+        if (totalClaimable >= batchInfo.totalAmount) {
+            batchInfo.isActive = false;
+            emit BatchFullyExecuted(batchId, batchInfo.totalAmount, totalClaimable);
+            isFullyExecuted = true;
+        }
+        
+        return isFullyExecuted;
     }
 
     function getBatchOrders(uint256 /* batchId */) external pure returns (uint256[] memory orderIds) {

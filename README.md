@@ -108,6 +108,12 @@ The system leverages Uniswap V4's hook architecture for seamless integration:
 
 ### 6. **Advanced Order Management**
 
+#### **Manual Execution (Owner Only)**
+- Contract owner can manually execute batch levels at favorable prices
+- Allows optimization when better execution opportunities arise
+- Owner can take reduced profit margins for improved user experience
+- Emits dedicated events for tracking manual vs automatic execution
+
 #### **Multi-Currency Support**
 - Works with any ERC20 token pair
 - Automatic pool initialization with hook integration
@@ -220,6 +226,20 @@ limitOrderBatch.revealAndCreateMEVProtectedOrder(
 // Redeem claim tokens for actual output tokens
 uint256 claimAmount = limitOrderBatch.balanceOf(user, batchId);
 limitOrderBatch.redeem(batchId, claimAmount, user);
+```
+
+### Manual Execution (Owner Only)
+```solidity
+// Owner can manually execute specific price levels for better execution
+bool isFullyExecuted = limitOrderBatch.executeBatchLevel(
+    batchId,    // The batch order ID
+    2           // Execute price level 2 (0-based index)
+);
+
+// This allows the owner to:
+// - Execute at favorable prices when opportunities arise
+// - Optimize execution timing across market conditions  
+// - Take reduced profit margins for better user experience
 ```
 
 ## 🔧 Configuration

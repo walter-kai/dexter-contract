@@ -39,6 +39,13 @@ interface ILimitOrderBatch {
         uint256 amountExecuted
     );
 
+    event ManualBatchLevelExecuted(
+        uint256 indexed batchId,
+        uint256 priceLevel,
+        address indexed owner,
+        uint256 amount
+    );
+
     event BatchFullyExecuted(
         uint256 indexed batchId,
         uint256 totalAmountExecuted,
@@ -68,6 +75,11 @@ interface ILimitOrderBatch {
         payable 
         returns (uint256 batchId);
 
+    /// @notice Manually execute a specific batch level (owner only)
+    /// @dev Allows owner to execute orders at favorable prices for optimal execution
+    /// @param batchId The batch order ID to execute
+    /// @param priceLevel The specific price level to execute
+    /// @return isFullyExecuted Whether the entire batch is now fully executed
     function executeBatchLevel(uint256 batchId, uint256 priceLevel) 
         external 
         returns (bool isFullyExecuted);
