@@ -17,6 +17,7 @@ interface ILimitOrderBatch {
         uint256[] targetPrices;     // Array of trigger prices
         uint256[] targetAmounts;    // Array of amounts for each price level
         uint256 expirationTime;
+        uint256 bestPriceTimeout; // Seconds to wait for better price, 0 = disabled
     }
 
     // ===== EVENTS =====

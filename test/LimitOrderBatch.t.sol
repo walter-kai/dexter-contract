@@ -497,7 +497,7 @@ contract LimitOrderBatchTest is Test {
         assertEq(finalBatchCount, 4, "Should have 4 total batches after creating 3 orders (nextBatchOrderId starts at 1)");
     }
 
-    function testPriceImprovementQueue() public {
+    function testBestExecutionQueue() public {
         // Place a limit order at tick 120
         int24 orderTick = 120; // Multiple of 60 (tickSpacing)
         uint256 orderAmount = 3e18;
@@ -536,7 +536,7 @@ contract LimitOrderBatchTest is Test {
         uint256 pendingAmount = hook.getPendingBatchOrdersWithKey(key, orderTick, true); // zeroForOne = true
         console.log("Pending amount at tick", uint256(int256(orderTick)), "for zeroForOne=true:", pendingAmount);
         
-        // Trigger the afterSwap which should queue the order for price improvement
+        // Trigger the afterSwap which should queue the order for best execution
         hook.testAfterSwap(
             address(0x456), // Some swapper address
             key,
@@ -545,7 +545,7 @@ contract LimitOrderBatchTest is Test {
             "" // Empty hook data
         );
 
-        // Check that the order was queued for price improvement
+        // Check that the order was queued for best execution
         (uint256 queueLength, uint256 currentIndex, LimitOrderBatch.QueuedOrder[] memory queuedOrders) = hook.getQueueStatus(key);
         
         // Debug MockPoolManager to see what it's returning
@@ -554,7 +554,7 @@ contract LimitOrderBatchTest is Test {
         console.log("lastQueriedPoolId:", uint256(poolManager.lastQueriedPoolId()));
         console.log("lastReturnedTick:", int256(poolManager.lastReturnedTick()));
         
-        assertEq(queueLength, 1, "Should have 1 order in the price improvement queue");
+        assertEq(queueLength, 1, "Should have 1 order in the best execution queue");
         assertEq(currentIndex, 0, "Queue index should be 0");
         
         // Verify the queued order details
@@ -569,7 +569,7 @@ contract LimitOrderBatchTest is Test {
         assertEq(claimableOutput, 0, "Should have no claimable output tokens while queued");
 
         // Test Case 1: Price improves - order should execute
-        console.log("=== Testing Price Improvement Execution ===");
+        console.log("=== Testing Best Execution ===");
         
         // Move price to the target tick (better price for the sell order)
         int24 improvedTick = orderTick + int24(key.tickSpacing); // Better sell price
@@ -591,18 +591,18 @@ contract LimitOrderBatchTest is Test {
             ""
         );
         
-        // Check that the order was executed due to price improvement
-        uint256 claimableAfterImprovement = hook.claimableOutputTokens(batchOrderId);
-        assertTrue(claimableAfterImprovement > 0, "Should have claimable output after price improvement execution");
+        // Check that the order was executed due to best execution
+        uint256 claimableAfterBestExecution = hook.claimableOutputTokens(batchOrderId);
+        assertTrue(claimableAfterBestExecution > 0, "Should have claimable output after best execution");
         
         // Check that the queue is now empty
         (uint256 queueLengthAfter, , ) = hook.getQueueStatus(key);
         assertEq(queueLengthAfter, 0, "Queue should be empty after execution");
         
-        console.log("Claimable output after price improvement:", claimableAfterImprovement);
+        console.log("Claimable output after best execution:", claimableAfterBestExecution);
     }
 
-    function testPriceImprovementTimeout() public {
+    function testBestExecutionTimeout() public {
         // Place a limit order at tick 180
         int24 orderTick = 180;
         uint256 orderAmount = 2e18;
@@ -622,7 +622,7 @@ contract LimitOrderBatchTest is Test {
             sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(orderTick)
         });
 
-        // Queue the order for price improvement
+        // Queue the order for best execution
         hook.testAfterSwap(address(0x456), key, swapParams, BalanceDelta.wrap(0), "");
 
         // Verify order is queued

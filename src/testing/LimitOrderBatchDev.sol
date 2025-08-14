@@ -148,7 +148,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         // Debug output for testing
         emit DebugTryExecuting(currentTick, lastTick, zeroForOne);
 
-        // First, check queued orders for price improvements
+        // First, check queued orders for best execution
         _processQueuedOrders(key, currentTick);
 
         // Following TakeProfitsHook logic for tick range execution
@@ -171,12 +171,12 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
                 }
             }
         } else {
-            // currentTick == lastTick - queue for price improvement
+            // currentTick == lastTick - queue for best execution
             uint256 inputAmount = pendingBatchOrders[poolId][currentTick][zeroForOne];
             emit DebugQueueCheck(currentTick, zeroForOne, inputAmount);
             if (inputAmount > 0) {
                 // For dev mode, we need to call our version that handles key conversion
-                _queueForPriceImprovementWithInternalKey(key, internalKey, currentTick, zeroForOne, inputAmount);
+                _queueForBestPriceWithInternalKey(key, internalKey, currentTick, zeroForOne, inputAmount);
                 return (false, currentTick); // Don't execute immediately
             }
         }
@@ -232,9 +232,9 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     /**
-     * @notice Queue for price improvement with explicit key handling for testing
+     * @notice Queue for best execution with explicit key handling for testing
      */
-    function _queueForPriceImprovementWithInternalKey(
+    function _queueForBestPriceWithInternalKey(
         PoolKey calldata userKey,
         PoolKey memory internalKey,
         int24 currentTick,
@@ -247,10 +247,10 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         int24 targetTick;
         if (zeroForOne) {
             // For selling token0, wait for higher tick (better price)
-            targetTick = currentTick + (PRICE_IMPROVEMENT_TICKS * userKey.tickSpacing);
+            targetTick = currentTick + (BEST_EXECUTION_TICKS * userKey.tickSpacing);
         } else {
             // For selling token1, wait for lower tick (better price)
-            targetTick = currentTick - (PRICE_IMPROVEMENT_TICKS * userKey.tickSpacing);
+            targetTick = currentTick - (BEST_EXECUTION_TICKS * userKey.tickSpacing);
         }
         
         // Find the batch order ID for this tick using internal key
@@ -260,17 +260,17 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         pendingBatchOrders[poolId][currentTick][zeroForOne] -= amount;
         
         // Add to queue (use internal key storage)
-        priceImprovementQueue[poolId].push(QueuedOrder({
+        bestPriceQueue[poolId].push(QueuedOrder({
             batchOrderId: batchOrderId,
             originalTick: currentTick,
             targetTick: targetTick,
             amount: amount,
             queueTime: _getBlockTimestamp(),
-            maxWaitTime: _getBlockTimestamp() + PRICE_IMPROVEMENT_TIMEOUT,
+            maxWaitTime: _getBlockTimestamp() + 300, // 5 minute default for testing
             zeroForOne: zeroForOne
         }));
         
-        emit OrderQueuedForImprovement(batchOrderId, currentTick, targetTick, amount);
+        emit OrderQueuedForBestExecution(batchOrderId, currentTick, targetTick, amount);
     }
 
     // Override the main batch order execution function to use internal key conversion
@@ -285,7 +285,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         int24 lastTick = lastTicks[key.toId()];
 
-        // First, check queued orders for price improvements
+        // First, check queued orders for best execution
         _processQueuedOrders(key, currentTick);
 
         // Following TakeProfitsHook logic for tick range execution
@@ -308,17 +308,17 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
                 }
             }
         } else {
-            // currentTick == lastTick - queue for price improvement
+            // currentTick == lastTick - queue for best execution
             // Check both directions for orders at the current tick
             uint256 inputAmountToken0 = pendingBatchOrders[poolId][currentTick][true]; // Sell token0 orders
             uint256 inputAmountToken1 = pendingBatchOrders[poolId][currentTick][false]; // Sell token1 orders
             
             if (inputAmountToken0 > 0) {
-                _queueForPriceImprovementWithInternalKey(key, internalKey, currentTick, true, inputAmountToken0);
+                _queueForBestPriceWithInternalKey(key, internalKey, currentTick, true, inputAmountToken0);
                 return (false, currentTick); // Don't execute immediately
             }
             if (inputAmountToken1 > 0) {
-                _queueForPriceImprovementWithInternalKey(key, internalKey, currentTick, false, inputAmountToken1);
+                _queueForBestPriceWithInternalKey(key, internalKey, currentTick, false, inputAmountToken1);
                 return (false, currentTick); // Don't execute immediately
             }
         }
@@ -337,9 +337,9 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         PoolId poolId = internalKey.toId();
         
         return (
-            priceImprovementQueue[poolId].length,
+            bestPriceQueue[poolId].length,
             queueIndex[poolId],
-            priceImprovementQueue[poolId]
+            bestPriceQueue[poolId]
         );
     }
 
@@ -347,7 +347,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         // Convert to internal key for accessing queue - we need to use the internal key directly
         PoolKey memory internalKey = _toInternalKey(key);
         PoolId poolId = internalKey.toId();
-        QueuedOrder[] storage queue = priceImprovementQueue[poolId];
+        QueuedOrder[] storage queue = bestPriceQueue[poolId];
         
         uint256 i = 0;
         while (i < queue.length) {
@@ -371,7 +371,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         PoolKey memory internalKey = _toInternalKey(key);
         PoolId poolId = internalKey.toId();
         
-        QueuedOrder[] storage queue = priceImprovementQueue[poolId];
+        QueuedOrder[] storage queue = bestPriceQueue[poolId];
         uint256 currentIndex = queueIndex[poolId];
         
         // Process orders in queue
@@ -380,7 +380,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             bool shouldExecute = false;
             bool shouldRemove = false;
             
-            // Check if price improvement achieved
+            // Check if best execution achieved
             if (order.zeroForOne && currentTick >= order.targetTick) {
                 shouldExecute = true; // Better sell price for token0
             } else if (!order.zeroForOne && currentTick <= order.targetTick) {

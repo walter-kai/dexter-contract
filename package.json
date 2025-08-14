@@ -1,5 +1,5 @@
 {
-  "name": "dexter-batchLimit",
+  "name": "dexter-contract-server",
   "version": "1.0.0",
   "description": "Uniswap v4 hooks for swap tracking and analytics",
   "scripts": {

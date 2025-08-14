@@ -69,6 +69,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         bool useCommitReveal;       // Whether order used commit-reveal
         bytes32 commitment;         // Commitment hash if used
         uint256 creationBlock;      // Block when order was created
+        uint256 bestPriceTimeout; // Seconds to wait for better price, 0 = disabled
     }
 
     // Commit-Reveal for MEV Protection
@@ -89,7 +90,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     mapping(PoolId => bool) public poolInitialized;
     mapping(PoolId => uint256) public poolInitializationBlock;
 
-    // Price improvement queue structures
+    // Best price execution queue structures
     struct QueuedOrder {
         uint256 batchOrderId;
         int24 originalTick;
@@ -101,12 +102,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     // Queue storage
-    mapping(PoolId => QueuedOrder[]) public priceImprovementQueue;
+    mapping(PoolId => QueuedOrder[]) public bestPriceQueue;
     mapping(PoolId => uint256) public queueIndex; // Current processing index
 
     // Configuration
-    uint256 public constant PRICE_IMPROVEMENT_TIMEOUT = 300; // 5 minutes
-    int24 public constant PRICE_IMPROVEMENT_TICKS = 1; // Wait for 1 tick improvement
+    int24 public constant BEST_EXECUTION_TICKS = 1; // Wait for 1 tick better execution
 
     // MEV Protection Configuration
     uint256 public constant MIN_EXECUTION_DELAY = 2; // 2 blocks minimum delay
@@ -225,6 +225,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // MEV protection parameters
         uint256 maxSlippageBps,
         uint256 minOutputAmount,
+        uint256 bestPriceTimeout,
         // Commit-reveal parameters
         uint256 nonce,
         bytes32 salt
@@ -233,7 +234,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         bytes32 commitment = keccak256(abi.encode(
             msg.sender, currency0, currency1, fee, zeroForOne,
             targetPrices, targetAmounts, expirationTime,
-            maxSlippageBps, minOutputAmount, nonce, salt
+            maxSlippageBps, minOutputAmount, bestPriceTimeout, nonce, salt
         ));
         
         require(commitments[commitment] != 0, "Invalid commitment");
@@ -257,7 +258,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         batchId = _createMEVProtectedOrder(
             currency0, currency1, fee, zeroForOne,
             targetPrices, targetAmounts, expirationTime,
-            maxSlippageBps, minOutputAmount, true, commitment
+            maxSlippageBps, minOutputAmount, true, commitment, bestPriceTimeout
         );
         
         emit OrderRevealed(commitment, batchId);
@@ -276,14 +277,15 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256[] calldata targetAmounts,
         uint256 expirationTime,
         uint256 maxSlippageBps,
-        uint256 minOutputAmount
+        uint256 minOutputAmount,
+        uint256 bestPriceTimeout
     ) external payable returns (uint256 batchId) {
         require(maxSlippageBps <= MAX_SLIPPAGE_BPS, "Slippage too high");
         
         return _createMEVProtectedOrder(
             currency0, currency1, fee, zeroForOne,
             targetPrices, targetAmounts, expirationTime,
-            maxSlippageBps, minOutputAmount, false, bytes32(0)
+            maxSlippageBps, minOutputAmount, false, bytes32(0), bestPriceTimeout
         );
     }
 
@@ -301,7 +303,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 maxSlippageBps,
         uint256 minOutputAmount,
         bool useCommitReveal,
-        bytes32 commitment
+        bytes32 commitment,
+        uint256 bestPriceTimeout
     ) internal returns (uint256 batchId) {
         require(targetPrices.length == targetAmounts.length, "Array length mismatch");
         require(targetPrices.length > 0 && targetPrices.length <= 10, "Invalid price levels");
@@ -360,7 +363,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             executionDelay: MIN_EXECUTION_DELAY,
             useCommitReveal: useCommitReveal,
             commitment: commitment,
-            creationBlock: block.number
+            creationBlock: block.number,
+            bestPriceTimeout: bestPriceTimeout
         });
         
         // Populate tickToBatchIds mapping
@@ -625,7 +629,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         int24 lastTick = lastTicks[key.toId()];
 
-        // First, check queued orders for price improvements
+        // First, check queued orders for best execution
         _processQueuedOrders(key, currentTick);
 
         // Following TakeProfitsHook logic for tick range execution
@@ -648,17 +652,21 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
                 }
             }
         } else {
-            // currentTick == lastTick - queue for price improvement
+            // currentTick == lastTick - queue for best price execution
             // Check both directions for orders at the current tick
             uint256 inputAmountToken0 = pendingBatchOrders[key.toId()][currentTick][true]; // Sell token0 orders
             uint256 inputAmountToken1 = pendingBatchOrders[key.toId()][currentTick][false]; // Sell token1 orders
             
             if (inputAmountToken0 > 0) {
-                _queueForPriceImprovement(key, currentTick, true, inputAmountToken0);
+                uint256 batchOrderId = getBatchOrderIdForTick(key, currentTick, true);
+                uint256 timeout = batchOrderId > 0 ? batchOrdersInfo[batchOrderId].bestPriceTimeout : 0;
+                _queueForBestExecution(key, currentTick, true, inputAmountToken0, timeout);
                 return (false, currentTick); // Don't execute immediately
             }
             if (inputAmountToken1 > 0) {
-                _queueForPriceImprovement(key, currentTick, false, inputAmountToken1);
+                uint256 batchOrderId = getBatchOrderIdForTick(key, currentTick, false);
+                uint256 timeout = batchOrderId > 0 ? batchOrdersInfo[batchOrderId].bestPriceTimeout : 0;
+                _queueForBestExecution(key, currentTick, false, inputAmountToken1, timeout);
                 return (false, currentTick); // Don't execute immediately
             }
         }
@@ -667,13 +675,14 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Queue order for price improvement
+     * @notice Queue order for best price execution
      */
-    function _queueForPriceImprovement(
+    function _queueForBestExecution(
         PoolKey calldata key,
         int24 currentTick,
         bool zeroForOne,
-        uint256 amount
+        uint256 amount,
+        uint256 timeoutSeconds
     ) internal {
         PoolId poolId = key.toId();
         
@@ -681,10 +690,10 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         int24 targetTick;
         if (zeroForOne) {
             // For selling token0, wait for higher tick (better price)
-            targetTick = currentTick + (PRICE_IMPROVEMENT_TICKS * key.tickSpacing);
+            targetTick = currentTick + (BEST_EXECUTION_TICKS * key.tickSpacing);
         } else {
             // For selling token1, wait for lower tick (better price)
-            targetTick = currentTick - (PRICE_IMPROVEMENT_TICKS * key.tickSpacing);
+            targetTick = currentTick - (BEST_EXECUTION_TICKS * key.tickSpacing);
         }
         
         // Find the batch order ID for this tick
@@ -693,18 +702,23 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Remove from pending orders at original tick (move to queue)
         pendingBatchOrders[poolId][currentTick][zeroForOne] -= amount;
         
+        // Calculate maxWaitTime: if timeoutSeconds is 0, disable timeout (set to max)
+        uint256 maxWaitTime = timeoutSeconds == 0 
+            ? type(uint256).max 
+            : _getBlockTimestamp() + timeoutSeconds;
+        
         // Add to queue
-        priceImprovementQueue[poolId].push(QueuedOrder({
+        bestPriceQueue[poolId].push(QueuedOrder({
             batchOrderId: batchOrderId,
             originalTick: currentTick,
             targetTick: targetTick,
             amount: amount,
             queueTime: _getBlockTimestamp(),
-            maxWaitTime: _getBlockTimestamp() + PRICE_IMPROVEMENT_TIMEOUT,
+            maxWaitTime: maxWaitTime,
             zeroForOne: zeroForOne
         }));
         
-        emit OrderQueuedForImprovement(batchOrderId, currentTick, targetTick, amount);
+        emit OrderQueuedForBestExecution(batchOrderId, currentTick, targetTick, amount);
     }
 
     /**
@@ -712,7 +726,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      */
     function _processQueuedOrders(PoolKey calldata key, int24 currentTick) internal virtual {
         PoolId poolId = key.toId();
-        QueuedOrder[] storage queue = priceImprovementQueue[poolId];
+        QueuedOrder[] storage queue = bestPriceQueue[poolId];
         uint256 currentIndex = queueIndex[poolId];
         
         // Process orders in queue
@@ -721,7 +735,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             bool shouldExecute = false;
             bool shouldRemove = false;
             
-            // Check if price improvement achieved
+            // Check if best execution achieved
             if (order.zeroForOne && currentTick >= order.targetTick) {
                 shouldExecute = true; // Better sell price for token0
         } else if (!order.zeroForOne && currentTick <= order.targetTick) {
@@ -765,7 +779,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      */
     function clearExpiredQueuedOrders(PoolKey calldata key) external virtual {
         PoolId poolId = key.toId();
-        QueuedOrder[] storage queue = priceImprovementQueue[poolId];
+        QueuedOrder[] storage queue = bestPriceQueue[poolId];
         
         uint256 i = 0;
         while (i < queue.length) {
@@ -793,9 +807,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     ) {
         PoolId poolId = key.toId();
         return (
-            priceImprovementQueue[poolId].length,
+            bestPriceQueue[poolId].length,
             queueIndex[poolId],
-            priceImprovementQueue[poolId]
+            bestPriceQueue[poolId]
         );
     }
 
@@ -1306,7 +1320,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         targetPrices[0] = uint256(sqrtPrice);
         targetAmounts[0] = amount;
         
-        // Call internal helper that accepts memory arrays
+        // Call internal helper that accepts memory arrays - use default 5 minute timeout
         return _createBatchOrderFromMemory(
             Currency.unwrap(key.currency0),
             Currency.unwrap(key.currency1),
@@ -1314,7 +1328,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             zeroForOne,
             targetPrices,
             targetAmounts,
-            expirationTime
+            expirationTime,
+            300 // Default 5 minute best price execution timeout
         );
     }
 
@@ -1328,7 +1343,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         bool zeroForOne,
         uint256[] memory targetPrices,
         uint256[] memory targetAmounts,
-        uint256 expirationTime
+        uint256 expirationTime,
+        uint256 bestPriceTimeout
     ) internal returns (uint256 batchId) {
         require(targetPrices.length == targetAmounts.length, "Array length mismatch");
         require(targetPrices.length > 0 && targetPrices.length <= 10, "Invalid price levels");
@@ -1397,10 +1413,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             executionDelay: 0,          // No MEV protection for regular orders
             useCommitReveal: false,     // No MEV protection for regular orders
             commitment: bytes32(0),     // No MEV protection for regular orders
-            creationBlock: block.number // Track creation block
+            creationBlock: block.number, // Track creation block
+            bestPriceTimeout: bestPriceTimeout
         });
         
-        // FIRST FUNCTION - Populate tickToBatchIds mapping for quick lookup during price improvement
+        // FIRST FUNCTION - Populate tickToBatchIds mapping for quick lookup during best execution
         for (uint256 i = 0; i < targetTicks.length; i++) {
             tickToBatchIds[key.toId()][targetTicks[i]][zeroForOne].push(batchId);
         }
@@ -1455,7 +1472,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             params.zeroForOne,
             params.targetPrices,
             params.targetAmounts,
-            params.expirationTime
+            params.expirationTime,
+            params.bestPriceTimeout
         );
     }
 
@@ -1468,6 +1486,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @param targetPrices Array of target prices
      * @param targetAmounts Array of target amounts
      * @param expirationTime Expiration timestamp
+     * @param bestPriceTimeout Seconds to wait for better price, 0 = disabled
      * @return batchId The batch order ID
      */
     function createBatchOrder(
@@ -1477,7 +1496,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
-        uint256 expirationTime
+        uint256 expirationTime,
+        uint256 bestPriceTimeout
     ) public payable returns (uint256 batchId) {
         require(targetPrices.length == targetAmounts.length, "Array length mismatch");
         require(targetPrices.length > 0 && targetPrices.length <= 10, "Invalid price levels");
@@ -1530,10 +1550,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             executionDelay: 0,          // No MEV protection for regular orders
             useCommitReveal: false,     // No MEV protection for regular orders
             commitment: bytes32(0),     // No MEV protection for regular orders
-            creationBlock: block.number // Track creation block
+            creationBlock: block.number, // Track creation block
+            bestPriceTimeout: bestPriceTimeout
         });
         
-        // SECOND FUNCTION - Populate tickToBatchIds mapping for quick lookup during price improvement
+        // SECOND FUNCTION - Populate tickToBatchIds mapping for quick lookup during best execution
         for (uint256 i = 0; i < targetTicks.length; i++) {
             tickToBatchIds[key.toId()][targetTicks[i]][zeroForOne].push(batchId);
         }
@@ -1726,8 +1747,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         }
     }
 
-    // Events for price improvement queue
-    event OrderQueuedForImprovement(uint256 indexed batchOrderId, int24 originalTick, int24 targetTick, uint256 amount);
+    // Events for best execution queue
+    event OrderQueuedForBestExecution(uint256 indexed batchOrderId, int24 originalTick, int24 targetTick, uint256 amount);
     event OrderExecutedFromQueue(uint256 indexed batchOrderId, int24 originalTick, int24 executionTick, uint256 amount, bool wasTimeout);
 
     // Events for gas price-based dynamic fees
@@ -1794,9 +1815,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         PoolId poolId = internalKey.toId();
         
         return (
-            priceImprovementQueue[poolId].length,
+            bestPriceQueue[poolId].length,
             queueIndex[poolId],
-            priceImprovementQueue[poolId]
+            bestPriceQueue[poolId]
         );
     }
 
@@ -1808,7 +1829,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Convert to internal key with dynamic fee flag
         PoolKey memory internalKey = _toInternalKey(userKey);
         PoolId poolId = internalKey.toId();
-        QueuedOrder[] storage queue = priceImprovementQueue[poolId];
+        QueuedOrder[] storage queue = bestPriceQueue[poolId];
         
         uint256 i = 0;
         while (i < queue.length) {
