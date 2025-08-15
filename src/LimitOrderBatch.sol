@@ -62,25 +62,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 totalAmount;
         uint256 expirationTime;
         bool isActive;
-        // MEV Protection fields
+        // MEV Protection fields (simplified)
         uint256 maxSlippageBps;     // Maximum slippage in basis points
         uint256 minOutputAmount;    // Minimum acceptable output
-        uint256 executionDelay;     // Blocks to wait before execution
-        bool useCommitReveal;       // Whether order used commit-reveal
-        bytes32 commitment;         // Commitment hash if used
         uint256 creationBlock;      // Block when order was created
-        uint256 bestPriceTimeout; // Seconds to wait for better price, 0 = disabled
-    }
-
-    // Commit-Reveal for MEV Protection
-    mapping(bytes32 => uint256) public commitments;
-    mapping(bytes32 => CommitInfo) public commitInfo;
-    
-    struct CommitInfo {
-        address user;
-        uint256 blockNumber;
-        uint256 timestamp;
-        bool revealed;
+        uint256 bestPriceTimeout;  // Seconds to wait for better price, 0 = disabled
     }
     
     mapping(uint256 => BatchOrderInfo) public batchOrdersInfo;
@@ -108,11 +94,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     // Configuration
     int24 public constant BEST_EXECUTION_TICKS = 1; // Wait for 1 tick better execution
 
-    // MEV Protection Configuration
-    uint256 public constant MIN_EXECUTION_DELAY = 2; // 2 blocks minimum delay
+    // MEV Protection Configuration (simplified)
     uint256 public constant MAX_SLIPPAGE_BPS = 500; // 5% maximum slippage protection
-    uint256 public constant MIN_COMMIT_DELAY = 1; // 1 block minimum for commit-reveal
-    uint256 public constant MAX_COMMIT_DELAY = 10; // 10 blocks maximum for commit-reveal
 
     // Gas price-based fee calculation (following GasPriceFeesHook pattern)
     uint128 public movingAverageGasPrice;
@@ -179,7 +162,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      */
     function updateMovingAverageGasPrice() internal {
         uint128 gasPrice = uint128(tx.gasprice);
-        uint128 oldAverage = movingAverageGasPrice;
 
         // New Average = ((Old Average * # of Txns Tracked) + Current Gas Price) / (# of Txns Tracked + 1)
         movingAverageGasPrice =
@@ -193,122 +175,59 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Commit to creating an order (Phase 1 of commit-reveal MEV protection)
-     * @param commitment Hash of order parameters + nonce + salt
+     * @notice Create batch order with MEV protection via deadline and slippage protection
+     * @param currency0 First token address
+     * @param currency1 Second token address  
+     * @param fee Pool fee tier
+     * @param zeroForOne Direction of swap
+     * @param targetPrices Array of target prices for batch levels
+     * @param targetAmounts Array of amounts for each price level
+     * @param deadline Timestamp after which order creation will revert (MEV protection)
+     * @param maxSlippageBps Maximum slippage in basis points (500 = 5%)
+     * @param minOutputAmount Minimum total output expected
+     * @param bestPriceTimeout Seconds to wait for better execution price (0 = disabled)
      */
-    function commitOrder(bytes32 commitment) external {
-        require(commitments[commitment] == 0, "Commitment already exists");
-        
-        commitments[commitment] = block.number;
-        commitInfo[commitment] = CommitInfo({
-            user: msg.sender,
-            blockNumber: block.number,
-            timestamp: block.timestamp,
-            revealed: false
-        });
-        
-        emit OrderCommitted(commitment, msg.sender, block.number);
-    }
-
-    /**
-     * @notice Reveal and create MEV-protected order (Phase 2 of commit-reveal)
-     */
-    function revealAndCreateMEVProtectedOrder(
-        // Order parameters
+    function createBatchOrder(
         address currency0,
         address currency1,
         uint24 fee,
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
-        uint256 expirationTime,
-        // MEV protection parameters
-        uint256 maxSlippageBps,
-        uint256 minOutputAmount,
-        uint256 bestPriceTimeout,
-        // Commit-reveal parameters
-        uint256 nonce,
-        bytes32 salt
-    ) external payable returns (uint256 batchId) {
-        // Verify commitment
-        bytes32 commitment = keccak256(abi.encode(
-            msg.sender, currency0, currency1, fee, zeroForOne,
-            targetPrices, targetAmounts, expirationTime,
-            maxSlippageBps, minOutputAmount, bestPriceTimeout, nonce, salt
-        ));
-        
-        require(commitments[commitment] != 0, "Invalid commitment");
-        require(!commitInfo[commitment].revealed, "Already revealed");
-        require(commitInfo[commitment].user == msg.sender, "Not your commitment");
-        require(
-            block.number >= commitments[commitment] + MIN_COMMIT_DELAY,
-            "Too early to reveal"
-        );
-        require(
-            block.number <= commitments[commitment] + MAX_COMMIT_DELAY,
-            "Commitment expired"
-        );
-        require(maxSlippageBps <= MAX_SLIPPAGE_BPS, "Slippage too high");
-        
-        // Mark as revealed
-        commitInfo[commitment].revealed = true;
-        delete commitments[commitment];
-        
-        // Create the order with MEV protection
-        batchId = _createMEVProtectedOrder(
-            currency0, currency1, fee, zeroForOne,
-            targetPrices, targetAmounts, expirationTime,
-            maxSlippageBps, minOutputAmount, true, commitment, bestPriceTimeout
-        );
-        
-        emit OrderRevealed(commitment, batchId);
-        return batchId;
-    }
-
-    /**
-     * @notice Create order with slippage protection only (no commit-reveal)
-     */
-    function createMEVProtectedOrder(
-        address currency0,
-        address currency1,
-        uint24 fee,
-        bool zeroForOne,
-        uint256[] calldata targetPrices,
-        uint256[] calldata targetAmounts,
-        uint256 expirationTime,
+        uint256 deadline,
         uint256 maxSlippageBps,
         uint256 minOutputAmount,
         uint256 bestPriceTimeout
     ) external payable returns (uint256 batchId) {
+        // MEV Protection: Deadline enforcement
+        require(block.timestamp <= deadline, "Order creation deadline exceeded");
         require(maxSlippageBps <= MAX_SLIPPAGE_BPS, "Slippage too high");
         
-        return _createMEVProtectedOrder(
+        return _createBatchOrder(
             currency0, currency1, fee, zeroForOne,
-            targetPrices, targetAmounts, expirationTime,
-            maxSlippageBps, minOutputAmount, false, bytes32(0), bestPriceTimeout
+            targetPrices, targetAmounts, deadline,
+            maxSlippageBps, minOutputAmount, bestPriceTimeout
         );
     }
 
     /**
-     * @notice Internal function to create MEV-protected orders
+     * @notice Internal function to create batch orders with MEV protection
      */
-    function _createMEVProtectedOrder(
+    function _createBatchOrder(
         address currency0,
         address currency1,
         uint24 fee,
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
-        uint256 expirationTime,
+        uint256 deadline,
         uint256 maxSlippageBps,
         uint256 minOutputAmount,
-        bool useCommitReveal,
-        bytes32 commitment,
         uint256 bestPriceTimeout
     ) internal returns (uint256 batchId) {
         require(targetPrices.length == targetAmounts.length, "Array length mismatch");
         require(targetPrices.length > 0 && targetPrices.length <= 10, "Invalid price levels");
-        require(expirationTime > block.timestamp, "Invalid expiration");
+        require(deadline > block.timestamp, "Invalid deadline");
 
         // Auto-initialize pool with our hook if it doesn't exist
         PoolKey memory key = PoolKey({
@@ -348,7 +267,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Create batch order ID
         batchId = nextBatchOrderId++;
         
-        // Store batch info with MEV protection
+        // Store batch info with simplified MEV protection
         batchOrdersInfo[batchId] = BatchOrderInfo({
             user: msg.sender,
             poolKey: key,
@@ -356,13 +275,10 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             targetAmounts: targetAmounts,
             zeroForOne: zeroForOne,
             totalAmount: totalAmount,
-            expirationTime: expirationTime,
+            expirationTime: deadline,
             isActive: true,
             maxSlippageBps: maxSlippageBps,
             minOutputAmount: minOutputAmount,
-            executionDelay: MIN_EXECUTION_DELAY,
-            useCommitReveal: useCommitReveal,
-            commitment: commitment,
             creationBlock: block.number,
             bestPriceTimeout: bestPriceTimeout
         });
@@ -391,8 +307,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             IERC20(sellToken).safeTransferFrom(msg.sender, address(this), totalAmount);
         }
 
-        emit MEVProtectedOrderCreated(
-            batchId, msg.sender, maxSlippageBps, minOutputAmount, useCommitReveal
+        emit BatchOrderCreated(
+            batchId, msg.sender, maxSlippageBps, minOutputAmount
         );
         
         return batchId;
@@ -839,34 +755,15 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 inputAmount,
         bool updatePendingOrders
     ) internal virtual {
-        // Find batch order ID for MEV protection check
+        // Execute order with slippage protection if configured
         uint256 batchOrderId = getBatchOrderIdForTick(key, tick, zeroForOne);
         
         if (batchOrderId != 0) {
             BatchOrderInfo storage batchInfo = batchOrdersInfo[batchOrderId];
             
-            // Apply MEV protection if enabled
+            // Apply slippage protection if enabled
             if (batchInfo.maxSlippageBps > 0) {
-                // Check execution delay
-                if (block.number < batchInfo.creationBlock + batchInfo.executionDelay) {
-                    emit MEVProtectionTriggered(batchOrderId, "Execution delay not met");
-                    return; // Don't execute yet
-                }
-                
-                // Add randomization to prevent MEV
-                uint256 randomDelay = uint256(keccak256(abi.encode(
-                    block.prevrandao, 
-                    key.toId(), 
-                    tick, 
-                    block.timestamp
-                ))) % 3;
-                
-                if (block.timestamp % 3 != randomDelay) {
-                    return; // Skip execution this block
-                }
-                
-                // Execute with slippage protection
-                _executeMEVProtectedOrder(key, tick, zeroForOne, inputAmount, batchOrderId, updatePendingOrders);
+                _executeOrderWithSlippageProtection(key, tick, zeroForOne, inputAmount, batchOrderId, updatePendingOrders);
                 return;
             }
         }
@@ -901,9 +798,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Execute order with MEV protection
+     * @notice Execute order with slippage protection
      */
-    function _executeMEVProtectedOrder(
+    function _executeOrderWithSlippageProtection(
         PoolKey calldata key,
         int24 tick,
         bool zeroForOne,
@@ -937,7 +834,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         // Check slippage protection
         if (actualOutput < batchInfo.minOutputAmount) {
-            emit MEVProtectionTriggered(batchOrderId, "Slippage protection triggered");
             emit SlippageProtectionActivated(batchOrderId, batchInfo.minOutputAmount, actualOutput);
             return; // Don't complete the trade
         }
@@ -1408,12 +1304,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             totalAmount: totalAmount,
             expirationTime: expirationTime,
             isActive: true,
-            maxSlippageBps: 0,          // No MEV protection for regular orders
-            minOutputAmount: 0,         // No MEV protection for regular orders
-            executionDelay: 0,          // No MEV protection for regular orders
-            useCommitReveal: false,     // No MEV protection for regular orders
-            commitment: bytes32(0),     // No MEV protection for regular orders
-            creationBlock: block.number, // Track creation block
+            maxSlippageBps: 500,         // 5% slippage protection
+            minOutputAmount: 0,          // Calculated during execution
+            creationBlock: block.number,
             bestPriceTimeout: bestPriceTimeout
         });
         
@@ -1545,12 +1438,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             totalAmount: totalAmount,
             expirationTime: expirationTime,
             isActive: true,
-            maxSlippageBps: 0,          // No MEV protection for regular orders
-            minOutputAmount: 0,         // No MEV protection for regular orders
-            executionDelay: 0,          // No MEV protection for regular orders
-            useCommitReveal: false,     // No MEV protection for regular orders
-            commitment: bytes32(0),     // No MEV protection for regular orders
-            creationBlock: block.number, // Track creation block
+            maxSlippageBps: 500,         // 5% slippage protection
+            minOutputAmount: 0,          // Calculated during execution
+            creationBlock: block.number,
             bestPriceTimeout: bestPriceTimeout
         });
         
@@ -1821,17 +1711,13 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 blockNumber
     );
 
-    // Events for MEV Protection
-    event OrderCommitted(bytes32 indexed commitment, address indexed user, uint256 blockNumber);
-    event OrderRevealed(bytes32 indexed commitment, uint256 indexed batchOrderId);
-    event MEVProtectedOrderCreated(
+    // Events for simplified MEV Protection
+    event BatchOrderCreated(
         uint256 indexed batchOrderId, 
         address indexed user, 
         uint256 maxSlippageBps, 
-        uint256 minOutputAmount, 
-        bool useCommitReveal
+        uint256 minOutputAmount
     );
-    event MEVProtectionTriggered(uint256 indexed batchOrderId, string reason);
     event SlippageProtectionActivated(uint256 indexed batchOrderId, uint256 expectedOutput, uint256 actualOutput);
 
     // Events for new TakeProfitsHook-style functionality

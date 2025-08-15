@@ -16,42 +16,44 @@ mapping(PoolId => QueuedOrder[]) bestPriceQueue;
 - **Automatic Execution**: Orders execute automatically when price conditions are met during swaps
 
 ```solidity
+```solidity
 // Example: Create a batch order with multiple price levels
 uint256[] memory targetPrices = [1000, 1100, 1200]; // Different price points
 uint256[] memory targetAmounts = [1e18, 2e18, 1.5e18]; // Amounts for each level
 uint256 batchId = limitOrderBatch.createBatchOrder(
     tokenA, tokenB, 3000, true, // Pool configuration
-    targetPrices, targetAmounts, 
-    block.timestamp + 86400, // 24h expiration
+    targetPrices, targetAmounts,
+    block.timestamp + 86400, // 24-hour deadline for MEV protection
+    500, // 5% maximum slippage protection
+    5e18, // Minimum total output expected
     300 // 5 minutes best execution timeout (0 = disabled)
 );
 ```
-
-### 2. **MEV Protection Suite**
-
-#### **Commit-Reveal Scheme**
-- Two-phase order creation prevents frontrunning
-- Users commit to order hash, then reveal parameters later
-- Configurable delay windows (1-10 blocks)
-
-```solidity
-// Phase 1: Commit to order
-bytes32 commitment = keccak256(abi.encode(params, nonce, salt));
-limitOrderBatch.commitOrder(commitment);
-
-// Phase 2: Reveal after delay
-limitOrderBatch.revealAndCreateMEVProtectedOrder(params, nonce, salt);
 ```
 
-#### **Execution Delays**
-- Minimum 2-block delay before order execution
-- Randomized execution timing to prevent MEV extraction
-- Prevents sandwich attacks during order creation
+### 2. **MEV Protection** (Single Transaction)
 
-#### **Slippage Protection**
-- Maximum 5% slippage protection
-- Orders automatically cancelled if slippage exceeds threshold
-- Real-time price validation during execution
+#### **Universal Router Integration**
+- Compatible with Uniswap V4's Universal Router for standardized MEV protection
+- Deadline-based transaction protection prevents delayed execution attacks
+- Private mempool support (Flashbots, Eden Network) for enhanced protection
+
+```solidity
+// Single transaction with built-in MEV protection via deadline
+uint256 batchId = limitOrderBatch.createBatchOrder(
+    tokenA, tokenB, 3000, true,
+    targetPrices, targetAmounts, 
+    block.timestamp + 300, // 5-minute deadline for MEV protection
+    500, // 5% maximum slippage protection  
+    5e18, // Minimum total output expected
+    300 // best execution timeout (0 = disabled)
+);
+```
+
+#### **Execution Protection**
+- **Deadline Enforcement**: Orders must execute within user-specified timeframe
+- **Best Price Execution**: Can wait for better prices with configurable timeout
+- **Slippage Protection**: Maximum 5% slippage protection with automatic cancellation
 
 ### 3. **Dynamic Pool Fees**
 
