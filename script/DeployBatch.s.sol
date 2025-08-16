@@ -17,8 +17,15 @@ contract DeployBatch is Script {
     address constant ANVIL_ACCOUNT_2 = 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC;
     
     // Use the correct flags that match your hook permissions
-    uint160 constant AFTER_INITIALIZE_FLAG = uint160(1 << 12); // bit 12
-    uint160 constant AFTER_SWAP_FLAG = uint160(1 << 6); // bit 6
+    // Based on LimitOrderBatch.getHookPermissions():
+    // - beforeInitialize: true (bit 15)
+    // - afterInitialize: true (bit 14) 
+    // - beforeSwap: true (bit 7)
+    // - afterSwap: true (bit 6)
+    uint160 constant BEFORE_INITIALIZE_FLAG = uint160(1 << 15);
+    uint160 constant AFTER_INITIALIZE_FLAG = uint160(1 << 14);
+    uint160 constant BEFORE_SWAP_FLAG = uint160(1 << 7);
+    uint160 constant AFTER_SWAP_FLAG = uint160(1 << 6);
 
     function setUp() public {}
 
@@ -45,16 +52,15 @@ contract DeployBatch is Script {
         
         // Always use CREATE2 deployment with proper hook address validation
         // This is required for Uniswap v4 hooks regardless of environment
-        uint160 flags = AFTER_INITIALIZE_FLAG | AFTER_SWAP_FLAG; // Match hook permissions
+        uint160 flags = BEFORE_INITIALIZE_FLAG | AFTER_INITIALIZE_FLAG | BEFORE_SWAP_FLAG | AFTER_SWAP_FLAG;
 
         // Prepare constructor arguments for LimitOrderBatch hook
         bytes memory constructorArgs = abi.encode(address(poolManager), feeRecipient);
         
         // Mine a salt that will produce a hook address with the correct flags
-        // In forge script, CREATE2 deployments use the CREATE2 deployer proxy
-        address create2Deployer = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        // For forge script deployments, use the broadcaster address (msg.sender)
         (address hookAddress, bytes32 salt) = HookMiner.find(
-            create2Deployer, // Use CREATE2 deployer proxy, not msg.sender
+            msg.sender, // Use the broadcaster address, not the script contract
             flags,
             type(LimitOrderBatch).creationCode,
             constructorArgs
@@ -63,7 +69,7 @@ contract DeployBatch is Script {
         console2.log("=== DEPLOYMENT DEBUG ===");
         console2.log("Hook address:", hookAddress);
         console2.log("Salt:", vm.toString(salt));
-        console2.log("CREATE2 Deployer:", create2Deployer);
+        console2.log("Deployer (msg.sender):", msg.sender);
         console2.log("Flags:", flags);
         
         // Deploy using CREATE2
