@@ -225,9 +225,21 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 minOutputAmount,
         uint256 bestPriceTimeout
     ) internal returns (uint256 batchId) {
+        // Input validation
         require(targetPrices.length == targetAmounts.length, "Array length mismatch");
-        require(targetPrices.length > 0 && targetPrices.length <= 10, "Invalid price levels");
+        require(targetPrices.length > 0, "Empty order arrays");
+        require(targetPrices.length <= 10, "Invalid price levels");
         require(deadline > block.timestamp, "Invalid deadline");
+        require(currency0 != address(0) && currency1 != address(0), "Invalid token address");
+        require(currency0 != currency1, "Same token addresses");
+        
+        // Validate amounts are not zero
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < targetAmounts.length; i++) {
+            require(targetAmounts[i] > 0, "Invalid amount");
+            totalAmount += targetAmounts[i];
+        }
+        require(totalAmount > 0, "Invalid order");
 
         // Auto-initialize pool with our hook if it doesn't exist
         PoolKey memory key = PoolKey({
@@ -250,12 +262,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
         // Convert prices to ticks
         int24[] memory targetTicks = new int24[](targetPrices.length);
-        uint256 totalAmount = 0;
         
         for (uint256 i = 0; i < targetPrices.length; i++) {
-            require(targetAmounts[i] > 0, "Invalid amount");
-            totalAmount += targetAmounts[i];
-            
             uint160 sqrtPrice = uint160(targetPrices[i]);
             int24 tick = TickMath.getTickAtSqrtPrice(sqrtPrice);
             targetTicks[i] = getLowerUsableTick(tick, key.tickSpacing);
@@ -455,8 +463,10 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         BatchOrderInfo storage batchInfo = batchOrdersInfo[batchOrderId];
         require(batchInfo.user == msg.sender, "Not authorized");
         require(batchInfo.isActive, "Order not active");
-        require(block.timestamp <= batchInfo.expirationTime, "Order expired");
-
+        
+        // Allow cancellation of expired orders - they should be treatable as cancelled
+        bool isExpired = block.timestamp > batchInfo.expirationTime;
+        
         // Calculate refund amount
         uint256 claimBalance = balanceOf[msg.sender][batchOrderId];
         if (claimBalance == 0) revert NothingToClaim();
@@ -486,7 +496,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         Currency token = batchInfo.zeroForOne ? batchInfo.poolKey.currency0 : batchInfo.poolKey.currency1;
         token.transfer(msg.sender, claimBalance);
 
-        emit BatchCancelled(batchOrderId, msg.sender, claimBalance);
+        emit BatchOrderCancelled(batchOrderId, msg.sender, isExpired);
     }
 
     /**
@@ -1723,7 +1733,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     // Events for new TakeProfitsHook-style functionality
     event BatchOrderExecuted(uint256 indexed batchOrderId, int24 tick, uint256 inputAmount, uint256 outputAmount);
     event TokensRedeemed(uint256 indexed batchOrderId, address indexed user, uint256 amount);
-    event BatchOrderCancelled(uint256 indexed batchOrderId, address indexed user);
+    event BatchOrderCancelled(uint256 indexed batchOrderId, address indexed user, bool wasExpired);
 
     /**
      * @notice Converts a user-provided key to the internal key with dynamic fee flag
