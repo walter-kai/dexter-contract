@@ -119,7 +119,7 @@ contract SecurityTest is Test {
         
         // Test deadline exactly at current timestamp (should fail since > is required)
         uint256 currentTime = block.timestamp;
-        vm.expectRevert("Invalid deadline");
+        vm.expectRevert("Order creation deadline exceeded");
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
             prices, amounts, currentTime, 500, 0, 300

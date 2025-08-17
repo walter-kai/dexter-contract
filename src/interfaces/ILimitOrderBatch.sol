@@ -68,6 +68,8 @@ interface ILimitOrderBatch {
 
     event Debug(string message, uint256 value);
 
+    event GasPriceTracked(uint128 gasPrice, uint128 newAverage, uint104 count);
+
     // ===== FUNCTIONS =====
     
     function createBatchOrder(BatchParams calldata params) 

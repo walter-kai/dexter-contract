@@ -17,13 +17,13 @@ contract DeployBatch is Script {
     address constant ANVIL_ACCOUNT_2 = 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC;
     
     // Use the correct flags that match your hook permissions
-    // Based on LimitOrderBatch.getHookPermissions():
-    // - beforeInitialize: true (bit 15)
-    // - afterInitialize: true (bit 14) 
+    // Based on LimitOrderBatch.getHookPermissions() and Hooks library:
+    // - beforeInitialize: true (bit 13)
+    // - afterInitialize: true (bit 12) 
     // - beforeSwap: true (bit 7)
     // - afterSwap: true (bit 6)
-    uint160 constant BEFORE_INITIALIZE_FLAG = uint160(1 << 15);
-    uint160 constant AFTER_INITIALIZE_FLAG = uint160(1 << 14);
+    uint160 constant BEFORE_INITIALIZE_FLAG = uint160(1 << 13);
+    uint160 constant AFTER_INITIALIZE_FLAG = uint160(1 << 12);
     uint160 constant BEFORE_SWAP_FLAG = uint160(1 << 7);
     uint160 constant AFTER_SWAP_FLAG = uint160(1 << 6);
 
@@ -50,31 +50,54 @@ contract DeployBatch is Script {
         
         LimitOrderBatch limitOrderBatch;
         
-        // Always use CREATE2 deployment with proper hook address validation
-        // This is required for Uniswap v4 hooks regardless of environment
+        // Use HookMiner to find a valid hook address, but deploy with Forge's CREATE2
         uint160 flags = BEFORE_INITIALIZE_FLAG | AFTER_INITIALIZE_FLAG | BEFORE_SWAP_FLAG | AFTER_SWAP_FLAG;
 
         // Prepare constructor arguments for LimitOrderBatch hook
         bytes memory constructorArgs = abi.encode(address(poolManager), feeRecipient);
         
-        // Mine a salt that will produce a hook address with the correct flags
-        // For forge script deployments, use the broadcaster address (msg.sender)
+        console2.log("=== DEPLOYMENT DEBUG ===");
+        console2.log("msg.sender:", msg.sender);
+        console2.log("Required flags:", flags);
+        
+        // Use HookMiner to find a valid hook address using the standard CREATE2 deployer
+        address create2Deployer = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        
         (address hookAddress, bytes32 salt) = HookMiner.find(
-            msg.sender, // Use the broadcaster address, not the script contract
+            create2Deployer,
             flags,
             type(LimitOrderBatch).creationCode,
             constructorArgs
         );
         
-        console2.log("=== DEPLOYMENT DEBUG ===");
-        console2.log("Hook address:", hookAddress);
+        console2.log("HookMiner found address:", hookAddress);
         console2.log("Salt:", vm.toString(salt));
-        console2.log("Deployer (msg.sender):", msg.sender);
-        console2.log("Flags:", flags);
         
-        // Deploy using CREATE2
-        limitOrderBatch = new LimitOrderBatch{salt: salt}(IPoolManager(poolManager), feeRecipient);
-        require(address(limitOrderBatch) == hookAddress, "Hook address mismatch");
+        // Deploy using the same CREATE2 deployer that HookMiner used
+        bytes memory creationCode = abi.encodePacked(
+            type(LimitOrderBatch).creationCode,
+            constructorArgs
+        );
+        
+        // Deploy the contract manually using the CREATE2 deployer
+        bytes memory deploymentData = abi.encodePacked(salt, creationCode);
+        
+        (bool success, ) = create2Deployer.call(deploymentData);
+        require(success, "CREATE2 deployment failed");
+        
+        // The contract should be deployed at the predicted address
+        address deployedAddress = hookAddress;
+        
+        require(deployedAddress == hookAddress, string(abi.encodePacked(
+            "Address mismatch! Expected: ", 
+            vm.toString(hookAddress),
+            " Got: ",
+            vm.toString(deployedAddress)
+        )));
+        
+        limitOrderBatch = LimitOrderBatch(payable(deployedAddress));
+        
+        console2.log("Successfully deployed at:", address(limitOrderBatch));
 
         vm.stopBroadcast();
     }
