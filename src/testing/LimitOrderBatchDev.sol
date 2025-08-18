@@ -95,7 +95,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     /**
      * @notice Redeem tokens (testing compatibility wrapper)
      */
-    function redeem(uint256 batchOrderId, uint256 inputAmountToClaimFor) external override {
+    function redeem(uint256 batchOrderId, uint256 inputAmountToClaimFor) external {
         // Forward the call with the original sender
         require(balanceOf[msg.sender][batchOrderId] >= inputAmountToClaimFor, "Insufficient balance");
         require(claimableOutputTokens[batchOrderId] > 0, "Nothing to claim");
@@ -425,7 +425,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     // Override queue functions to use internal key conversion for testing compatibility
-    function getQueueStatus(PoolKey calldata key) external view override returns (
+    function getQueueStatus(PoolKey calldata key) external view returns (
         uint256 queueLength,
         uint256 currentIndex,
         uint256[] memory orders
