@@ -234,9 +234,12 @@ contract LimitOrderBatchTest is Test {
         
         // Test getBatchOrderDetails function
         (address detailUser, address detailCurrency0, address detailCurrency1, 
-         uint256 detailTotalAmount, uint256 detailExecutedAmount, uint256[] memory detailTargetPrices, 
+         uint256 detailTotalAmount, uint256 detailExecutedAmount, uint256 detailUnexecutedAmount,
+         uint256 detailClaimableOutputAmount, uint256[] memory detailTargetPrices, 
          uint256[] memory detailTargetAmounts, uint256 expirationTime, bool detailIsActive, 
-         bool detailIsFullyExecuted, uint256 executedLevels, bool detailZeroForOne) = hook.getBatchOrderDetails(batchOrderId);
+         bool detailIsFullyExecuted, uint256 executedLevels, bool detailZeroForOne, 
+         uint128 currentGasPrice, uint128 averageGasPrice, uint24 currentDynamicFee, 
+         uint256 totalBatchesCreated) = hook.getBatchOrderDetails(batchOrderId);
          
         assertEq(detailUser, address(this), "Detail user should be test contract");
         assertEq(detailCurrency0, address(token0), "Detail currency0 should be token0");
@@ -273,7 +276,7 @@ contract LimitOrderBatchTest is Test {
     function testBatchStatistics() public {
         // Check initial statistics
         uint256 initialTotalBatches = hook.getBatchStatistics();
-        assertEq(initialTotalBatches, 1, "Initial total batches should be 1 (nextBatchOrderId - 1)");
+        assertEq(initialTotalBatches, 0, "Initial total batches should be 0 (nextBatchOrderId starts at 1)");
         
         // Create several batch orders
         uint256[] memory batchIds = new uint256[](3);
@@ -284,7 +287,7 @@ contract LimitOrderBatchTest is Test {
         
         // Check updated statistics
         uint256 finalTotalBatches = hook.getBatchStatistics();
-        assertEq(finalTotalBatches, 4, "Total batches should be 4 after creating 3 orders");
+        assertEq(finalTotalBatches, 3, "Total batches should be 3 after creating 3 orders");
         assertEq(hook.nextBatchOrderId(), 4, "Next batch order ID should be 4");
     }
 
@@ -494,7 +497,7 @@ contract LimitOrderBatchTest is Test {
         
         // Validate batch statistics after multiple orders
         uint256 finalBatchCount = hook.getBatchStatistics();
-        assertEq(finalBatchCount, 4, "Should have 4 total batches after creating 3 orders (nextBatchOrderId starts at 1)");
+        assertEq(finalBatchCount, 3, "Should have 3 total batches after creating 3 orders");
     }
 
     function testBestExecutionQueue() public {

@@ -386,10 +386,10 @@ contract BatchOrderExecutionTest is Test {
         
         // Verify timeout values are stored correctly by checking the orders were created
         (
-            address user1, , , , , , , , bool isActive1, , , 
+            address user1, , , , , , , , , , bool isActive1, , , , , , , 
         ) = hook.getBatchOrderDetails(batchId1);
         (
-            address user2Addr, , , , , , , , bool isActive2, , , 
+            address user2Addr, , , , , , , , , , bool isActive2, , , , , , , 
         ) = hook.getBatchOrderDetails(batchId2);
         
         assertEq(user1, user, "First order should belong to user");

@@ -91,8 +91,8 @@ contract MockSwapRouter {
             }
             
             // Return proper deltas
-            int128 amount0Delta = -int128(int256(amountIn));
-            int128 amount1Delta = int128(int256(mockAmountOut));
+            int128 amount0Delta = int128(int256(amountIn));  // Positive for input
+            int128 amount1Delta = -int128(int256(mockAmountOut)); // Negative for output
             return toBalanceDelta(amount0Delta, amount1Delta);
         } else {
             // Swapping currency1 for currency0
@@ -118,9 +118,9 @@ contract MockSwapRouter {
                 tokenOut.transfer(msg.sender, mockAmountOut);
             }
             
-            // Return proper deltas
-            int128 amount0Delta = int128(int256(mockAmountOut));
-            int128 amount1Delta = -int128(int256(amountIn));
+            // Return proper deltas  
+            int128 amount0Delta = -int128(int256(mockAmountOut)); // Negative for output
+            int128 amount1Delta = int128(int256(amountIn));  // Positive for input
             return toBalanceDelta(amount0Delta, amount1Delta);
         }
     }
@@ -271,18 +271,18 @@ contract MockPoolManager {
         
         // Return proper deltas for a successful swap
         if (swapParams.zeroForOne) {
-            // amount0 is negative (we're giving it), amount1 is positive (we're receiving it)
-            int128 amount0Delta = -int128(int256(amountIn));
-            int128 amount1Delta = int128(int256(mockAmountOut));
-            emit Debug("DEBUG: MockPoolManager swap - amount0Delta", uint256(uint128(-amount0Delta)));
-            emit Debug("DEBUG: MockPoolManager swap - amount1Delta", uint256(uint128(amount1Delta)));
+            // amount0 is positive (input), amount1 is negative (output)
+            int128 amount0Delta = int128(int256(amountIn));
+            int128 amount1Delta = -int128(int256(mockAmountOut));
+            emit Debug("DEBUG: MockPoolManager swap - amount0Delta", uint256(uint128(amount0Delta)));
+            emit Debug("DEBUG: MockPoolManager swap - amount1Delta", uint256(uint128(-amount1Delta)));
             return toBalanceDelta(amount0Delta, amount1Delta);
         } else {
-            // amount1 is negative (we're giving it), amount0 is positive (we're receiving it)
-            int128 amount0Delta = int128(int256(mockAmountOut));
-            int128 amount1Delta = -int128(int256(amountIn));
-            emit Debug("DEBUG: MockPoolManager swap - amount0Delta", uint256(uint128(amount0Delta)));
-            emit Debug("DEBUG: MockPoolManager swap - amount1Delta (negative)", uint256(uint128(-amount1Delta)));
+            // amount1 is positive (input), amount0 is negative (output)
+            int128 amount0Delta = -int128(int256(mockAmountOut));
+            int128 amount1Delta = int128(int256(amountIn));
+            emit Debug("DEBUG: MockPoolManager swap - amount0Delta", uint256(uint128(-amount0Delta)));
+            emit Debug("DEBUG: MockPoolManager swap - amount1Delta (negative)", uint256(uint128(amount1Delta)));
             
             // Debug the actual BalanceDelta created
             BalanceDelta result = toBalanceDelta(amount0Delta, amount1Delta);

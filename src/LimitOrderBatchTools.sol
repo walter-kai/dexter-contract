@@ -39,46 +39,54 @@ contract LimitOrderBatchTools {
     mapping(PoolId => PriceAnalytics) public priceAnalytics;
     mapping(uint256 => AdvancedBatchMetrics) public advancedMetrics;
     
-    // Best execution queue structure
+    // Best execution queue structure - optimized for gas efficiency
     struct BestExecutionQueue {
         uint256[] queuedOrderIds;
         mapping(uint256 => uint256) orderPositions; // orderId => position in queue
-        uint256 currentIndex;
-        uint256 lastProcessedTimestamp;
-        int24 bestExecutionTick;
-        uint256 bestExecutionTimeout;
+        uint64 lastProcessedTimestamp;     // 8 bytes
+        uint64 bestExecutionTimeout;      // 8 bytes  
+        uint32 currentIndex;              // 4 bytes
+        int24 bestExecutionTick;          // 3 bytes
+        // Total: 23 bytes (fits in one slot with 9 bytes padding)
     }
     
-    // Pool initialization tracking
+    // Pool initialization tracking - packed for gas efficiency
     struct PoolInitializationTracker {
-        bool isInitialized;
-        uint160 initialSqrtPriceX96;
-        int24 initialTick;
-        uint256 initializationTimestamp;
-        uint256 firstOrderTimestamp;
-        uint256 totalOrdersProcessed;
+        uint160 initialSqrtPriceX96;      // 20 bytes
+        uint64 initializationTimestamp;   // 8 bytes
+        uint32 totalOrdersProcessed;      // 4 bytes
+        // Total: 32 bytes (exactly one slot)
+        
+        uint64 firstOrderTimestamp;       // 8 bytes
+        int24 initialTick;                // 3 bytes
+        bool isInitialized;               // 1 byte
+        // Total: 12 bytes (fits in one slot with 20 bytes padding)
     }
     
-    // Price analytics and trend tracking
+    // Price analytics - optimized struct
     struct PriceAnalytics {
         int24[] recentTicks;
         uint256[] recentTimestamps;
-        uint256 lastAnalysisTimestamp;
-        int24 trendDirection; // Positive for uptrend, negative for downtrend
-        uint256 volatilityScore;
-        uint256 averageTickMovement;
+        uint64 lastAnalysisTimestamp;     // 8 bytes
+        uint32 volatilityScore;           // 4 bytes
+        uint32 averageTickMovement;       // 4 bytes
+        int24 trendDirection;             // 3 bytes
+        // Total: 19 bytes (fits in one slot with 13 bytes padding)
     }
     
-    // Advanced batch metrics
+    // Advanced batch metrics - packed for efficiency
     struct AdvancedBatchMetrics {
-        uint256 creationGasPrice;
-        uint256 creationTimestamp;
-        uint256 expectedExecutionTime;
-        uint256 actualExecutionTime;
-        uint256 bestPriceAchieved;
-        uint256 slippageRealized;
-        uint256 gasSavingsRealized;
-        bool usedBestExecution;
+        uint64 creationTimestamp;         // 8 bytes
+        uint64 expectedExecutionTime;     // 8 bytes
+        uint64 actualExecutionTime;       // 8 bytes
+        uint32 creationGasPrice;          // 4 bytes
+        uint32 bestPriceAchieved;         // 4 bytes
+        // Total: 32 bytes (exactly one slot)
+        
+        uint32 slippageRealized;          // 4 bytes
+        uint32 gasSavingsRealized;        // 4 bytes
+        bool usedBestExecution;           // 1 byte
+        // Total: 9 bytes (fits in one slot with 23 bytes padding)
     }
 
     // ========== CONSTANTS ==========
@@ -147,8 +155,8 @@ contract LimitOrderBatchTools {
         queue.queuedOrderIds.push(orderId);
         queue.orderPositions[orderId] = queue.queuedOrderIds.length - 1;
         queue.bestExecutionTick = currentTick;
-        queue.bestExecutionTimeout = timeout > 0 ? timeout : QUEUE_TIMEOUT;
-        queue.lastProcessedTimestamp = block.timestamp;
+        queue.bestExecutionTimeout = uint64(timeout > 0 ? timeout : QUEUE_TIMEOUT);
+        queue.lastProcessedTimestamp = uint64(block.timestamp);
         
         emit OrderQueuedForBestExecution(orderId, poolId, currentTick);
     }
@@ -174,15 +182,18 @@ contract LimitOrderBatchTools {
         
         if (shouldExecute) {
             executedOrders = new uint256[](queue.queuedOrderIds.length);
-            for (uint256 i = 0; i < queue.queuedOrderIds.length; i++) {
-                executedOrders[i] = queue.queuedOrderIds[i];
-                delete queue.orderPositions[queue.queuedOrderIds[i]];
+            uint256 length = queue.queuedOrderIds.length;
+            unchecked {
+                for (uint256 i; i < length; ++i) {
+                    executedOrders[i] = queue.queuedOrderIds[i];
+                    delete queue.orderPositions[queue.queuedOrderIds[i]];
+                }
             }
             
             // Clear queue
             delete queue.queuedOrderIds;
             queue.currentIndex = 0;
-            queue.lastProcessedTimestamp = block.timestamp;
+            queue.lastProcessedTimestamp = uint64(block.timestamp);
             
             emit QueueTimeoutProcessed(executedOrders[0], executedOrders.length);
         }
@@ -218,15 +229,18 @@ contract LimitOrderBatchTools {
         if (_isQueueTimeout(queue)) {
             clearedCount = queue.queuedOrderIds.length;
             
-            // Clear all positions
-            for (uint256 i = 0; i < queue.queuedOrderIds.length; i++) {
-                delete queue.orderPositions[queue.queuedOrderIds[i]];
+            // Clear all positions - optimized loop
+            uint256 length = queue.queuedOrderIds.length;
+            unchecked {
+                for (uint256 i; i < length; ++i) {
+                    delete queue.orderPositions[queue.queuedOrderIds[i]];
+                }
             }
             
             // Reset queue
             delete queue.queuedOrderIds;
             queue.currentIndex = 0;
-            queue.lastProcessedTimestamp = block.timestamp;
+            queue.lastProcessedTimestamp = uint64(block.timestamp);
         }
         
         return clearedCount;
@@ -250,7 +264,7 @@ contract LimitOrderBatchTools {
             tracker.isInitialized = true;
             tracker.initialSqrtPriceX96 = sqrtPriceX96;
             tracker.initialTick = tick;
-            tracker.initializationTimestamp = block.timestamp;
+            tracker.initializationTimestamp = uint64(block.timestamp);
             
             emit PoolInitializationTracked(poolId, tick, sqrtPriceX96);
         }
@@ -264,7 +278,7 @@ contract LimitOrderBatchTools {
         PoolInitializationTracker storage tracker = poolTrackers[poolId];
         
         if (tracker.firstOrderTimestamp == 0) {
-            tracker.firstOrderTimestamp = block.timestamp;
+            tracker.firstOrderTimestamp = uint64(block.timestamp);
         }
         tracker.totalOrdersProcessed++;
     }
@@ -291,10 +305,12 @@ contract LimitOrderBatchTools {
         
         // Add new tick to history
         if (analytics.recentTicks.length >= ANALYTICS_WINDOW) {
-            // Shift array to maintain window size
-            for (uint256 i = 0; i < ANALYTICS_WINDOW - 1; i++) {
-                analytics.recentTicks[i] = analytics.recentTicks[i + 1];
-                analytics.recentTimestamps[i] = analytics.recentTimestamps[i + 1];
+            // Shift array to maintain window size - optimized loop
+            unchecked {
+                for (uint256 i; i < ANALYTICS_WINDOW - 1; ++i) {
+                    analytics.recentTicks[i] = analytics.recentTicks[i + 1];
+                    analytics.recentTimestamps[i] = analytics.recentTimestamps[i + 1];
+                }
             }
             analytics.recentTicks[ANALYTICS_WINDOW - 1] = newTick;
             analytics.recentTimestamps[ANALYTICS_WINDOW - 1] = block.timestamp;
@@ -305,7 +321,7 @@ contract LimitOrderBatchTools {
         
         // Update trend analysis
         _updateTrendAnalysis(analytics);
-        analytics.lastAnalysisTimestamp = block.timestamp;
+        analytics.lastAnalysisTimestamp = uint64(block.timestamp);
     }
     
     /**
@@ -337,13 +353,13 @@ contract LimitOrderBatchTools {
     ) external onlyCore {
         AdvancedBatchMetrics storage metrics = advancedMetrics[orderId];
         
-        metrics.actualExecutionTime = block.timestamp;
-        metrics.bestPriceAchieved = executionTick;
+        metrics.actualExecutionTime = uint64(block.timestamp);
+        metrics.bestPriceAchieved = uint32(executionTick);
         metrics.usedBestExecution = usedBestExecution;
         
         // Calculate gas savings if best execution was used
         if (usedBestExecution) {
-            metrics.gasSavingsRealized = _calculateGasSavings(orderId, gasUsed);
+            metrics.gasSavingsRealized = uint32(_calculateGasSavings(orderId, gasUsed));
         }
         
         // Calculate price improvement
@@ -364,10 +380,10 @@ contract LimitOrderBatchTools {
     ) {
         AdvancedBatchMetrics storage metrics = advancedMetrics[orderId];
         return (
-            metrics.creationGasPrice,
-            metrics.expectedExecutionTime,
-            metrics.actualExecutionTime,
-            metrics.gasSavingsRealized,
+            uint256(metrics.creationGasPrice),
+            uint256(metrics.expectedExecutionTime),
+            uint256(metrics.actualExecutionTime),
+            uint256(metrics.gasSavingsRealized),
             metrics.usedBestExecution
         );
     }
@@ -391,7 +407,7 @@ contract LimitOrderBatchTools {
         PriceAnalytics storage analytics = priceAnalytics[poolId];
         
         // Analyze volatility and trend
-        uint256 volatility = analytics.volatilityScore;
+        uint256 volatility = uint256(analytics.volatilityScore);
         int24 trend = analytics.trendDirection;
         
         // High volatility + favorable trend = use queue with shorter timeout
@@ -420,7 +436,7 @@ contract LimitOrderBatchTools {
     }
     
     function _isQueueTimeout(BestExecutionQueue storage queue) internal view returns (bool) {
-        return block.timestamp >= queue.lastProcessedTimestamp + queue.bestExecutionTimeout;
+        return block.timestamp >= uint256(queue.lastProcessedTimestamp) + uint256(queue.bestExecutionTimeout);
     }
     
     function _updateTrendAnalysis(PriceAnalytics storage analytics) internal {
@@ -432,7 +448,7 @@ contract LimitOrderBatchTools {
         
         int24 totalMovement = end - start;
         uint256 absTotalMovement = totalMovement >= 0 ? uint256(int256(totalMovement)) : uint256(int256(-totalMovement));
-        analytics.averageTickMovement = absTotalMovement / len;
+        analytics.averageTickMovement = uint32(absTotalMovement / len);
         
         if (totalMovement > TREND_THRESHOLD) {
             analytics.trendDirection = 1; // Uptrend
@@ -443,7 +459,7 @@ contract LimitOrderBatchTools {
         }
         
         // Calculate volatility
-        analytics.volatilityScore = _calculateVolatility(analytics);
+        analytics.volatilityScore = uint32(_calculateVolatility(analytics));
     }
     
     function _calculateVolatility(PriceAnalytics storage analytics) internal view returns (uint256) {
@@ -452,10 +468,12 @@ contract LimitOrderBatchTools {
         uint256 sumSquaredDiffs = 0;
         uint256 len = analytics.recentTicks.length;
         
-        for (uint256 i = 1; i < len; i++) {
-            int24 diff = analytics.recentTicks[i] - analytics.recentTicks[i-1];
-            uint256 absDiff = diff >= 0 ? uint256(int256(diff)) : uint256(int256(-diff));
-            sumSquaredDiffs += absDiff * absDiff;
+        unchecked {
+            for (uint256 i = 1; i < len; ++i) {
+                int24 diff = analytics.recentTicks[i] - analytics.recentTicks[i-1];
+                uint256 absDiff = diff >= 0 ? uint256(int256(diff)) : uint256(int256(-diff));
+                sumSquaredDiffs += absDiff * absDiff;
+            }
         }
         
         return sumSquaredDiffs / (len - 1);
@@ -468,13 +486,15 @@ contract LimitOrderBatchTools {
         uint256 consistentMoves = 0;
         uint256 totalMoves = 0;
         
-        for (uint256 i = 1; i < analytics.recentTicks.length; i++) {
-            int24 move = analytics.recentTicks[i] - analytics.recentTicks[i-1];
-            totalMoves++;
-            
-            if ((analytics.trendDirection > 0 && move > 0) ||
-                (analytics.trendDirection < 0 && move < 0)) {
-                consistentMoves++;
+        unchecked {
+            for (uint256 i = 1; i < analytics.recentTicks.length; ++i) {
+                int24 move = analytics.recentTicks[i] - analytics.recentTicks[i-1];
+                totalMoves++;
+                
+                if ((analytics.trendDirection > 0 && move > 0) ||
+                    (analytics.trendDirection < 0 && move < 0)) {
+                    consistentMoves++;
+                }
             }
         }
         
@@ -512,14 +532,17 @@ contract LimitOrderBatchTools {
         PoolId poolId = key.toId();
         BestExecutionQueue storage queue = bestExecutionQueues[poolId];
         
-        // Clear all positions
-        for (uint256 i = 0; i < queue.queuedOrderIds.length; i++) {
-            delete queue.orderPositions[queue.queuedOrderIds[i]];
+        // Clear all positions - optimized loop
+        uint256 length = queue.queuedOrderIds.length;
+        unchecked {
+            for (uint256 i; i < length; ++i) {
+                delete queue.orderPositions[queue.queuedOrderIds[i]];
+            }
         }
         
         // Reset queue
         delete queue.queuedOrderIds;
         queue.currentIndex = 0;
-        queue.lastProcessedTimestamp = block.timestamp;
+        queue.lastProcessedTimestamp = uint64(block.timestamp);
     }
 }

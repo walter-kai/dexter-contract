@@ -64,7 +64,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
      * @notice Backwards-compatible createBatchOrder for testing (PoolKey variant)
      * @dev 4-parameter version for test compatibility
      */
-    function createBatchOrder(PoolKey calldata key, int24 tick, uint256 amount, bool zeroForOne) external payable returns (uint256 batchId) {
+    function createBatchOrder(PoolKey calldata key, int24 tick, uint256 amount, bool zeroForOne) external payable override returns (uint256 batchId) {
         // Convert single tick to arrays
         uint256[] memory prices = new uint256[](1);
         uint256[] memory amounts = new uint256[](1);
@@ -229,10 +229,10 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         returns (bool success) {
         BatchInfo storage info = batchOrders[batchId];
         require(info.isActive, "Batch order not active");
-        require(priceLevel < info.targetTicks.length, "Invalid price level");
+        require(priceLevel < info.ticksLength, "Invalid price level");
         
         // Check if this level has already been executed
-        int24 targetTick = info.targetTicks[priceLevel];
+        int24 targetTick = batchTargetTicks[batchId][priceLevel];
         PoolId poolId = info.poolKey.toId();
         uint256 pendingAmount = pendingBatchOrders[poolId][targetTick][info.zeroForOne];
         
@@ -241,7 +241,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         }
         
         // Calculate execution amount for this level
-        uint256 levelAmount = info.targetAmounts[priceLevel];
+        uint256 levelAmount = batchTargetAmounts[batchId][priceLevel];
         uint256 executeAmount = pendingAmount < levelAmount ? pendingAmount : levelAmount;
         
         // Remove from pending orders

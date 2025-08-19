@@ -43,20 +43,30 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     mapping(uint256 => uint256) public claimTokensSupply;
     mapping(PoolId => mapping(int24 => mapping(bool => uint256[]))) internal tickToBatchIds;
     
-    // Simplified batch info struct
+    // Track total executed amounts per batch (for proportional calculations)
+    mapping(uint256 => uint256) public batchExecutedAmounts;
+    
+    // Optimized batch info struct - packed for gas efficiency
     struct BatchInfo {
-        address user;
-        PoolKey poolKey;
-        int24[] targetTicks;
-        uint256[] targetAmounts;
-        bool zeroForOne;
-        uint256 totalAmount;
-        uint256 expirationTime;
-        bool isActive;
-        uint256 maxSlippageBps;
-        uint256 minOutputAmount;
-        uint256 bestPriceTimeout;
+        address user;                    // 20 bytes
+        uint96 totalAmount;             // 12 bytes - packed with user (32 bytes total)
+        
+        PoolKey poolKey;                // 32 bytes (separate slot)
+        
+        uint64 expirationTime;          // 8 bytes 
+        uint32 maxSlippageBps;          // 4 bytes
+        uint32 bestPriceTimeout;        // 4 bytes
+        uint16 ticksLength;             // 2 bytes - store length instead of dynamic array
+        bool zeroForOne;                // 1 byte
+        bool isActive;                  // 1 byte
+        // Total: 22 bytes (fits in one slot with 10 bytes padding)
+        
+        uint256 minOutputAmount;        // 32 bytes (separate slot)
     }
+    
+    // Store arrays separately to avoid dynamic array gas costs
+    mapping(uint256 => int24[]) public batchTargetTicks;
+    mapping(uint256 => uint256[]) public batchTargetAmounts;
     
     mapping(uint256 => BatchInfo) public batchOrders;
     uint256 public nextBatchOrderId = 1;
@@ -109,7 +119,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     // ========== MODIFIERS ==========
     
     modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
+        require(msg.sender == owner, "Not contract owner");
         _;
     }
 
@@ -135,6 +145,20 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @notice Universal batch order creation function
      * @dev Single entry point for all batch order variations
      */
+    /**
+     * @notice Create a batch limit order with multiple price levels
+     * @param currency0 Address of token0 in the pool
+     * @param currency1 Address of token1 in the pool  
+     * @param fee Pool fee tier
+     * @param zeroForOne True if selling token0 for token1, false otherwise
+     * @param targetPrices Array of target prices (as sqrt price X96)
+     * @param targetAmounts Array of amounts for each price level
+     * @param deadline Order expiration timestamp
+     * @param maxSlippageBps Maximum slippage in basis points (e.g., 300 = 3%)
+     * @param minOutputAmount Minimum output amount expected
+     * @param bestPriceTimeout Timeout for best price execution optimization
+     * @return batchId Unique identifier for the created batch order
+     */
     function createBatchOrder(
         address currency0,
         address currency1,
@@ -148,9 +172,43 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 bestPriceTimeout
     ) external payable returns (uint256 batchId) {
         return _createBatchOrderInternal(
-            currency0, currency1, fee, zeroForOne,
-            targetPrices, targetAmounts, deadline,
-            maxSlippageBps, minOutputAmount, bestPriceTimeout
+            currency0,
+            currency1,
+            fee,
+            zeroForOne,
+            targetPrices,
+            targetAmounts,
+            deadline,
+            maxSlippageBps,
+            minOutputAmount,
+            bestPriceTimeout
+        );
+    }
+
+    // Alias for test compatibility
+    function createBatchOrder(
+        PoolKey calldata key,
+        int24 tick,
+        uint256 amount,
+        bool zeroForOne
+    ) external payable virtual returns (uint256 batchId) {
+        // Convert single tick to arrays
+        uint256[] memory prices = new uint256[](1);
+        uint256[] memory amounts = new uint256[](1);
+        prices[0] = uint256(TickMath.getSqrtPriceAtTick(tick));
+        amounts[0] = amount;
+        
+        return _createBatchOrderInternal(
+            Currency.unwrap(key.currency0),
+            Currency.unwrap(key.currency1),
+            key.fee,
+            zeroForOne,
+            prices,
+            amounts,
+            block.timestamp + 3600, // 1 hour default deadline
+            300, // 3% default slippage
+            amount * 95 / 100, // 95% min output
+            300 // 5 minute timeout
         );
     }
 
@@ -219,36 +277,72 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Handle token deposits
         _handleTokenDeposit(key, zeroForOne, totalAmount);
         
-        emit BatchOrderCreatedOptimized(batchId, msg.sender, totalAmount);
+        emit BatchOrderCreated(batchId, msg.sender, currency0, currency1, totalAmount, targetPrices, targetAmounts);
         
         return batchId;
     }
 
     /**
-     * @notice Cancel batch order
+     * @notice Cancel batch order - refunds only the unexecuted portion
+     * @dev Can be called at any time, even after partial execution
      */
     function cancelBatchOrder(uint256 batchOrderId) external validBatchOrder(batchOrderId) {
         BatchInfo storage batch = batchOrders[batchOrderId];
         require(batch.user == msg.sender, "Not authorized");
         
-        // Get refund amount
-        uint256 claimBalance = balanceOf[msg.sender][batchOrderId];
-        require(claimBalance > 0, "Nothing to cancel");
-
-        // Clean up storage
-        _cleanupBatchOrder(batchOrderId);
+        // In ERC6909 model, user can only cancel if the batch hasn't been executed yet
+        // Once executed, the swap already happened and output tokens are available for redemption
+        uint256 userClaimBalance = balanceOf[msg.sender][batchOrderId];
+        require(userClaimBalance > 0, "No tokens to cancel");
         
-        // Mark inactive
-        batch.isActive = false;
+        // Check if there are still pending orders (unexecuted)
+        // For multi-level batches, check if any level has pending orders
+        PoolId poolId = batch.poolKey.toId();
+        bool zeroForOne = batch.zeroForOne;
+        uint256 totalPendingAmount = 0;
         
-        // Burn claim tokens and refund
-        _burn(msg.sender, address(uint160(batchOrderId)), claimBalance);
-        claimTokensSupply[batchOrderId] = 0;
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 targetTick = batchTargetTicks[batchOrderId][i];
+            totalPendingAmount += pendingBatchOrders[poolId][targetTick][zeroForOne];
+        }
         
-        // Transfer refund
-        Currency token = batch.zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
-        token.transfer(msg.sender, claimBalance);
-
+        require(totalPendingAmount > 0, "Batch already executed, use redeem instead");
+        
+        // User can only cancel their proportional share of what's still pending
+        uint256 cancellableAmount = userClaimBalance * totalPendingAmount / uint256(batch.totalAmount);
+        require(cancellableAmount > 0, "Nothing to cancel");
+        
+        // Burn the cancellable claim tokens
+        _burn(msg.sender, address(uint160(batchOrderId)), cancellableAmount);
+        
+        // Update pending orders proportionally across all levels
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 targetTick = batchTargetTicks[batchOrderId][i];
+            uint256 levelPending = pendingBatchOrders[poolId][targetTick][zeroForOne];
+            if (levelPending > 0) {
+                uint256 levelCancellation = cancellableAmount * levelPending / totalPendingAmount;
+                pendingBatchOrders[poolId][targetTick][zeroForOne] -= levelCancellation;
+            }
+        }
+        
+        // Update claim tokens supply
+        claimTokensSupply[batchOrderId] -= cancellableAmount;
+        
+        // Mark batch as inactive if no pending orders left
+        if (totalPendingAmount == cancellableAmount) {
+            batch.isActive = false;
+        }
+        
+        // Return the input tokens
+        Currency inputCurrency = zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
+        if (Currency.unwrap(inputCurrency) == address(0)) {
+            // ETH
+            payable(msg.sender).transfer(cancellableAmount);
+        } else {
+            // ERC20
+            IERC20(Currency.unwrap(inputCurrency)).transfer(msg.sender, cancellableAmount);
+        }
+        
         emit BatchOrderCancelledOptimized(batchOrderId, msg.sender);
     }
 
@@ -333,8 +427,17 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         address currency0,
         address currency1
     ) internal view {
-        require(targetPrices.length == targetAmounts.length && targetPrices.length > 0 && targetPrices.length <= 10, "Invalid arrays");
-        require(deadline > block.timestamp, "Invalid deadline");
+        if (targetPrices.length == 0 || targetAmounts.length == 0) {
+            revert InvalidOrder();
+        }
+        require(targetPrices.length == targetAmounts.length && targetPrices.length <= 10, "Array length mismatch");
+        
+        // Validate amounts before prices to catch zero amounts early
+        for (uint256 i = 0; i < targetAmounts.length; i++) {
+            require(targetAmounts[i] > 0, "Invalid amount");
+        }
+        
+        require(deadline > block.timestamp, "Order creation deadline exceeded");
         require(maxSlippageBps <= MAX_SLIPPAGE_BPS, "Slippage too high");
         require(currency0 != address(0) && currency1 != address(0) && currency0 != currency1, "Invalid currencies");
     }
@@ -349,19 +452,39 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         });
     }
 
-    function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
-        ticks = new int24[](prices.length);
-        for (uint256 i = 0; i < prices.length; i++) {
-            ticks[i] = TickMath.getTickAtSqrtPrice(uint160(prices[i]));
+        function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
+        uint256 length = prices.length;
+        ticks = new int24[](length);
+        unchecked {
+            for (uint256 i; i < length; ++i) {
+                ticks[i] = TickMath.getTickAtSqrtPrice(uint160(prices[i]));
+            }
         }
     }
 
-    function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256 total) {
-        for (uint256 i = 0; i < amounts.length; i++) {
-            require(amounts[i] > 0, "Invalid amount");
-            total += amounts[i];
+        function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256 total) {
+        uint256 length = amounts.length;
+        require(length > 0, "Empty arrays");
+        unchecked {
+            for (uint256 i; i < length; ++i) {
+                uint256 amount = amounts[i];
+                require(amount > 0, "Invalid amount");
+                total += amount;
+            }
         }
         require(total > 0, "Invalid total");
+    }
+
+    function _getTotalExecutedAmount(uint256 batchId) internal view returns (uint256 totalExecuted) {
+        BatchInfo storage batch = batchOrders[batchId];
+        PoolId poolId = batch.poolKey.toId();
+        
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[batchId][i];
+            uint256 originalAmount = batchTargetAmounts[batchId][i];
+            uint256 pendingAmount = pendingBatchOrders[poolId][tick][batch.zeroForOne];
+            totalExecuted += originalAmount - pendingAmount;
+        }
     }
 
     function _createBatch(
@@ -377,18 +500,21 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     ) internal returns (uint256 batchId) {
         batchId = nextBatchOrderId++;
         
+        // Store arrays in separate mappings
+        batchTargetTicks[batchId] = targetTicks;
+        batchTargetAmounts[batchId] = targetAmounts;
+        
         batchOrders[batchId] = BatchInfo({
             user: msg.sender,
+            totalAmount: uint96(totalAmount),
             poolKey: key,
-            targetTicks: targetTicks,
-            targetAmounts: targetAmounts,
+            expirationTime: uint64(deadline),
+            maxSlippageBps: uint32(maxSlippageBps),
+            bestPriceTimeout: uint32(bestPriceTimeout),
+            ticksLength: uint16(targetTicks.length),
             zeroForOne: zeroForOne,
-            totalAmount: totalAmount,
-            expirationTime: deadline,
             isActive: true,
-            maxSlippageBps: maxSlippageBps,
-            minOutputAmount: minOutputAmount,
-            bestPriceTimeout: bestPriceTimeout
+            minOutputAmount: minOutputAmount
         });
 
         // Add to pending orders
@@ -422,9 +548,45 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         PoolId poolId = batch.poolKey.toId();
         
         // Remove from pending orders
-        for (uint256 i = 0; i < batch.targetTicks.length; i++) {
-            pendingBatchOrders[poolId][batch.targetTicks[i]][batch.zeroForOne] -= batch.targetAmounts[i];
-            _removeBatchIdFromTick(poolId, batch.targetTicks[i], batch.zeroForOne, batchOrderId);
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[batchOrderId][i];
+            uint256 amount = batchTargetAmounts[batchOrderId][i];
+            pendingBatchOrders[poolId][tick][batch.zeroForOne] -= amount;
+            _removeBatchIdFromTick(poolId, tick, batch.zeroForOne, batchOrderId);
+        }
+    }
+
+    /**
+     * @notice Clean up only the unexecuted portion when cancelling
+     * @dev More selective than _cleanupBatchOrder - only removes unexecuted amounts
+     */
+    function _cleanupUnexecutedPortion(uint256 batchOrderId, uint256 unexecutedBalance, uint256 originalAmount) internal {
+        BatchInfo storage batch = batchOrders[batchOrderId];
+        PoolId poolId = batch.poolKey.toId();
+        
+        // Calculate proportion of unexecuted vs total
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[batchOrderId][i];
+            uint256 originalTickAmount = batchTargetAmounts[batchOrderId][i];
+            
+            // Calculate how much of this tick's amount is unexecuted
+            uint256 unexecutedTickAmount = (originalTickAmount * unexecutedBalance) / originalAmount;
+            
+            // Only remove the unexecuted portion from pending orders
+            if (unexecutedTickAmount > 0) {
+                uint256 currentPending = pendingBatchOrders[poolId][tick][batch.zeroForOne];
+                if (currentPending >= unexecutedTickAmount) {
+                    pendingBatchOrders[poolId][tick][batch.zeroForOne] -= unexecutedTickAmount;
+                } else {
+                    // Safety: if pending is less than expected, remove what's there
+                    pendingBatchOrders[poolId][tick][batch.zeroForOne] = 0;
+                }
+            }
+        }
+        
+        // Remove batch ID from tick mappings (since order is being cancelled)
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            _removeBatchIdFromTick(poolId, batchTargetTicks[batchOrderId][i], batch.zeroForOne, batchOrderId);
         }
     }
 
@@ -508,10 +670,13 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             BatchInfo storage batch = batchOrders[batchId];
             
             // Find proportion for this batch
-            uint256 batchAmount = _getBatchAmountAtTick(batch, tick);
+            uint256 batchAmount = _getBatchAmountAtTick(batchId, tick);
             uint256 batchOutput = (outputAmount * batchAmount) / inputAmount;
             
             claimableOutputTokens[batchId] += batchOutput;
+            
+            // Don't burn claim tokens during execution - let users redeem proportionally
+            
             emit BatchLevelExecutedOptimized(batchId, uint256(uint24(tick)), batchAmount);
         }
 
@@ -519,10 +684,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         pendingBatchOrders[poolId][tick][zeroForOne] = 0;
     }
 
-    function _getBatchAmountAtTick(BatchInfo storage batch, int24 tick) internal view returns (uint256) {
-        for (uint256 i = 0; i < batch.targetTicks.length; i++) {
-            if (batch.targetTicks[i] == tick) {
-                return batch.targetAmounts[i];
+    function _getBatchAmountAtTick(uint256 batchId, int24 tick) internal view returns (uint256) {
+        BatchInfo storage batch = batchOrders[batchId];
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            if (batchTargetTicks[batchId][i] == tick) {
+                return batchTargetAmounts[batchId][i];
             }
         }
         return 0;
@@ -536,7 +702,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             movingAverageGasPrice = ((movingAverageGasPrice * movingAverageGasPriceCount) + gasPrice) / (movingAverageGasPriceCount + 1);
         }
         movingAverageGasPriceCount++;
-        emit GasPriceTrackedOptimized(gasPrice, movingAverageGasPrice, movingAverageGasPriceCount);
+        emit GasPriceTracked(gasPrice, movingAverageGasPrice, movingAverageGasPriceCount);
     }
 
     function _getDynamicFee() internal view returns (uint24) {
@@ -549,6 +715,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     function _getTickSpacing(uint24 fee) internal pure returns (int24) {
+        if (fee == 100) return 1;
         if (fee == 500) return 10;
         if (fee == 3000) return 60;
         if (fee == 10000) return 200;
@@ -563,57 +730,83 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return abi.encode(delta);
     }
 
-    // ========== INTERFACE COMPLIANCE STUBS ==========
+    // ========== MANUAL EXECUTION FUNCTIONS ==========
 
-    function createBatchOrder(BatchParams calldata params) external payable returns (uint256 batchId) {
-        return _createBatchOrderInternal(
-            params.currency0, params.currency1, 3000, params.zeroForOne,
-            params.targetPrices, params.targetAmounts, params.expirationTime,
-            300, 0, params.bestPriceTimeout
-        );
-    }
-
-    function executeBatchLevel(uint256 /* batchId */, uint256 /* priceLevel */) external view onlyOwner returns (bool isFullyExecuted) {
-        // Simplified manual execution stub
-        return true;
-    }
-
-    function getBatchOrder(uint256 batchId) external view returns (
-        address user, address currency0, address currency1, uint256 totalAmount,
-        uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts, 
-        bool isActive, bool isFullyExecuted
-    ) {
+    /**
+     * @notice Execute a specific batch order level at current market price
+     * @dev Allows manual execution regardless of target price - useful for emergency execution
+     * @param batchId The batch order ID to execute
+     * @param levelIndex Index of the price level to execute (0-based)
+     * @return isFullyExecuted Whether the entire batch order is now fully executed
+     */
+    function executeBatchLevel(uint256 batchId, uint256 levelIndex) external returns (bool isFullyExecuted) {
         BatchInfo storage batch = batchOrders[batchId];
-        // Convert ticks back to prices
-        uint256[] memory prices = new uint256[](batch.targetTicks.length);
-        for (uint256 i = 0; i < batch.targetTicks.length; i++) {
-            prices[i] = uint256(TickMath.getSqrtPriceAtTick(batch.targetTicks[i]));
+        require(batch.isActive, "Batch order not active");
+        require(msg.sender == owner, "Not contract owner");
+        require(levelIndex < batch.ticksLength, "Invalid price level");
+        
+        PoolId poolId = batch.poolKey.toId();
+        int24 targetTick = batchTargetTicks[batchId][levelIndex];
+        uint256 targetAmount = batchTargetAmounts[batchId][levelIndex];
+        bool zeroForOne = batch.zeroForOne;
+        
+        // Check if this level still has pending orders
+        uint256 pendingAmount = pendingBatchOrders[poolId][targetTick][zeroForOne];
+        require(pendingAmount > 0, "No pending orders at this level");
+        
+        // Calculate the actual amount to execute (might be less if partially executed)
+        uint256 amountToExecute = targetAmount;
+        if (pendingAmount < targetAmount) {
+            amountToExecute = pendingAmount;
         }
-        return (
-            batch.user,
-            Currency.unwrap(batch.poolKey.currency0),
-            Currency.unwrap(batch.poolKey.currency1),
-            batch.totalAmount,
-            0, // executedAmount - TODO
-            prices,
-            batch.targetAmounts,
-            batch.isActive,
-            false // isFullyExecuted - TODO
-        );
+        
+        // Perform the swap at current market price
+        SwapParams memory params = SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountToExecute),
+            sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        });
+        
+        bytes memory result = poolManager.unlock(abi.encode(batch.poolKey, params));
+        BalanceDelta delta = abi.decode(result, (BalanceDelta));
+        uint256 outputAmount = zeroForOne ? uint256(int256(-delta.amount1())) : uint256(int256(-delta.amount0()));
+        
+        // Update state
+        claimableOutputTokens[batchId] += outputAmount;
+        
+        pendingBatchOrders[poolId][targetTick][zeroForOne] -= amountToExecute;
+        
+        // Remove from tick mapping if fully executed
+        if (pendingBatchOrders[poolId][targetTick][zeroForOne] == 0) {
+            _removeBatchIdFromTick(poolId, targetTick, zeroForOne, batchId);
+        }
+        
+        // Check if entire batch is fully executed by checking all levels
+        isFullyExecuted = true;
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[batchId][i];
+            if (pendingBatchOrders[poolId][tick][zeroForOne] > 0) {
+                isFullyExecuted = false;
+                break;
+            }
+        }
+        
+        // Emit manual execution event
+        emit ManualBatchLevelExecuted(batchId, levelIndex, msg.sender, amountToExecute);
+        
+        // Emit level execution event
+        emit BatchLevelExecuted(batchId, levelIndex, uint256(uint24(targetTick)), amountToExecute);
+        
+        if (isFullyExecuted) {
+            batch.isActive = false;
+            // Emit fully executed event
+            emit BatchFullyExecuted(batchId, _getTotalExecutedAmount(batchId), claimableOutputTokens[batchId]);
+        }
+        
+        return isFullyExecuted;
     }
 
-    function getBatchOrders(uint256) external pure returns (uint256[] memory orderIds) {
-        return new uint256[](0);
-    }
 
-    function getBatchStatistics() external view returns (uint256 totalBatches) {
-        return nextBatchOrderId - 1;
-    }
-
-    function getExecutedLevels(uint256 batchId) external view returns (uint256 executedLevels, bool[] memory levelStatus) {
-        BatchInfo storage batch = batchOrders[batchId];
-        return (0, new bool[](batch.targetTicks.length));
-    }
 
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
         if (token == address(0)) {
@@ -625,40 +818,151 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     // ========== VIEW FUNCTIONS ==========
 
+    /**
+     * @notice Get comprehensive batch order details
+     * @dev Returns all relevant information about a batch order in a single call
+     * @param batchId The ID of the batch order to query
+     * @return user Address of the order creator
+     * @return currency0 Address of token0 in the pool
+     * @return currency1 Address of token1 in the pool  
+     * @return totalAmount Original total amount deposited
+     * @return executedAmount Amount that has been executed (calculated)
+     * @return unexecutedAmount Amount remaining unexecuted
+     * @return claimableOutputAmount Amount of output tokens available for redemption
+     * @return targetPrices Array of target prices for each level
+     * @return targetAmounts Array of amounts for each price level
+     * @return expirationTime Order expiration timestamp
+     * @return isActive Whether the order is still active
+     * @return isFullyExecuted Whether all levels have been executed
+     * @return executedLevels Number of price levels that have been executed
+     * @return zeroForOne Direction of the trade
+     * @return currentGasPrice Current gas price
+     * @return averageGasPrice Moving average gas price
+     * @return currentDynamicFee Current dynamic fee rate
+     * @return totalBatchesCreated Total number of batches created (statistics)
+     */
     function getBatchOrderDetails(uint256 batchId) external view returns (
         address user,
         address currency0,
         address currency1,
         uint256 totalAmount,
         uint256 executedAmount,
+        uint256 unexecutedAmount,
+        uint256 claimableOutputAmount,
         uint256[] memory targetPrices,
         uint256[] memory targetAmounts,
         uint256 expirationTime,
         bool isActive,
         bool isFullyExecuted,
         uint256 executedLevels,
-        bool zeroForOne
+        bool zeroForOne,
+        uint128 currentGasPrice,
+        uint128 averageGasPrice,
+        uint24 currentDynamicFee,
+        uint256 totalBatchesCreated
     ) {
         BatchInfo storage batch = batchOrders[batchId];
+        
         // Convert ticks back to prices
-        uint256[] memory prices = new uint256[](batch.targetTicks.length);
-        for (uint256 i = 0; i < batch.targetTicks.length; i++) {
-            prices[i] = uint256(TickMath.getSqrtPriceAtTick(batch.targetTicks[i]));
+        uint256[] memory prices = new uint256[](batch.ticksLength);
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            prices[i] = uint256(TickMath.getSqrtPriceAtTick(batchTargetTicks[batchId][i]));
         }
+        
+        // Calculate execution status
+        uint256 currentClaimSupply = claimTokensSupply[batchId];
+        uint256 executed = uint256(batch.totalAmount) - currentClaimSupply;
+        uint256 claimableOutput = claimableOutputTokens[batchId];
+        
+        // Count executed levels
+        uint256 levelsExecuted = 0;
+        PoolId poolId = batch.poolKey.toId();
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            uint256 pendingAtTick = pendingBatchOrders[poolId][batchTargetTicks[batchId][i]][batch.zeroForOne];
+            if (pendingAtTick == 0) {
+                levelsExecuted++;
+            }
+        }
+        
         return (
             batch.user,
             Currency.unwrap(batch.poolKey.currency0),
             Currency.unwrap(batch.poolKey.currency1),
-            batch.totalAmount,
-            0, // executedAmount - TODO: calculate
+            uint256(batch.totalAmount),
+            executed,
+            currentClaimSupply,
+            claimableOutput,
             prices,
-            batch.targetAmounts,
-            batch.expirationTime,
+            batchTargetAmounts[batchId],
+            uint256(batch.expirationTime),
             batch.isActive,
-            false, // isFullyExecuted - TODO: calculate
-            0, // executedLevels - TODO: calculate
-            batch.zeroForOne
+            executed == uint256(batch.totalAmount),
+            levelsExecuted,
+            batch.zeroForOne,
+            uint128(tx.gasprice),
+            movingAverageGasPrice,
+            _getDynamicFee(),
+            nextBatchOrderId - 1
         );
+    }
+
+    // ========== BACKWARD COMPATIBILITY HELPERS ==========
+    // These are simple wrappers for tests that haven't been updated yet
+
+    function getBatchOrder(uint256 batchId) external view returns (
+        address user, address currency0, address currency1, uint256 totalAmount,
+        uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts, 
+        bool isActive, bool isFullyExecuted
+    ) {
+        BatchInfo storage batch = batchOrders[batchId];
+        // Calculate execution status
+        uint256 currentClaimSupply = claimTokensSupply[batchId];
+        uint256 executed = uint256(batch.totalAmount) - currentClaimSupply;
+        
+        // Convert ticks back to prices
+        uint256[] memory prices = new uint256[](batch.ticksLength);
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            prices[i] = uint256(TickMath.getSqrtPriceAtTick(batchTargetTicks[batchId][i]));
+        }
+        
+        return (
+            batch.user,
+            Currency.unwrap(batch.poolKey.currency0),
+            Currency.unwrap(batch.poolKey.currency1),
+            uint256(batch.totalAmount),
+            executed,
+            prices,
+            batchTargetAmounts[batchId],
+            batch.isActive,
+            executed == uint256(batch.totalAmount)
+        );
+    }
+
+    function getBatchOrders(uint256) external pure returns (uint256[] memory orderIds) {
+        return new uint256[](0);
+    }
+
+    function getBatchStatistics() external view returns (uint256 totalBatches) {
+        return nextBatchOrderId - 1; // Return actual count of created batches
+    }
+
+    function getExecutedLevels(uint256 batchId) external view returns (uint256 executedLevels, bool[] memory levelStatus) {
+        BatchInfo storage batch = batchOrders[batchId];
+        
+        // Count executed levels
+        uint256 levelsExecuted = 0;
+        PoolId poolId = batch.poolKey.toId();
+        bool[] memory levelStat = new bool[](batch.ticksLength);
+        
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            uint256 pendingAtTick = pendingBatchOrders[poolId][batchTargetTicks[batchId][i]][batch.zeroForOne];
+            if (pendingAtTick == 0) {
+                levelsExecuted++;
+                levelStat[i] = true;
+            }
+        }
+        
+        return (levelsExecuted, levelStat);
     }
 
     function getGasPriceStats() external view returns (uint128, uint128, uint104) {

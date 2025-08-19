@@ -333,7 +333,7 @@ contract SecurityTest is Test {
         hook.cancelBatchOrder(batchId);
         
         // Verify order is cancelled
-        (,,,,,,,, bool isActiveAfterCancel,, uint256 executedLevelsAfter,) = hook.getBatchOrderDetails(batchId);
+        (,,,,,,,,,, bool isActiveAfterCancel, bool isFullyExecuted, uint256 executedLevelsAfter,,,,,) = hook.getBatchOrderDetails(batchId);
         assertFalse(isActiveAfterCancel, "Expired order should be inactive after cancellation");
     }
 

@@ -72,80 +72,72 @@ interface ILimitOrderBatch {
 
     // ===== FUNCTIONS =====
     
-    function createBatchOrder(BatchParams calldata params) 
-        external 
-        payable 
-        returns (uint256 batchId);
+    function createBatchOrder(
+        address currency0,
+        address currency1,
+        uint24 fee,
+        bool zeroForOne,
+        uint256[] calldata targetPrices,
+        uint256[] calldata targetAmounts,
+        uint256 deadline,
+        uint256 maxSlippageBps,
+        uint256 minOutputAmount,
+        uint256 bestPriceTimeout
+    ) external payable returns (uint256 batchId);
 
-    /// @notice Manually execute a specific batch level (owner only)
-    /// @dev Allows owner to execute orders at favorable prices for optimal execution
+    /// @notice Manually execute a specific batch level at current market price
+    /// @dev Allows execution regardless of target price - useful for emergency execution
     /// @param batchId The batch order ID to execute
-    /// @param priceLevel The specific price level to execute
+    /// @param levelIndex Index of the price level to execute (0-based)
     /// @return isFullyExecuted Whether the entire batch is now fully executed
-    function executeBatchLevel(uint256 batchId, uint256 priceLevel) 
+    function executeBatchLevel(uint256 batchId, uint256 levelIndex) 
         external 
         returns (bool isFullyExecuted);
 
     function cancelBatchOrder(uint256 batchId) external;
 
-    function getBatchOrder(uint256 batchId) 
-        external 
-        view 
-        returns (
-            address user,
-            address currency0,
-            address currency1,
-            uint256 totalAmount,
-            uint256 executedAmount,
-            uint256[] memory targetPrices,
-            uint256[] memory targetAmounts,
-            bool isActive,
-            bool isFullyExecuted
-        );
-
     // ===== VIEW FUNCTIONS =====
 
-    /// @notice Get all order IDs for a batch (compatibility function)
-    /// @return orderIds Array of order IDs in the batch
-    function getBatchOrders(uint256 /* batchId */) external pure returns (uint256[] memory orderIds);
-
-    /// @notice Get detailed batch order information including expiration
+    /// @notice Get comprehensive batch order details including all relevant information
     /// @param batchId The batch order ID
     /// @return user Address of the user who created the order
     /// @return currency0 First currency address
     /// @return currency1 Second currency address
     /// @return totalAmount Total amount to be swapped
     /// @return executedAmount Amount already executed
+    /// @return unexecutedAmount Amount remaining unexecuted
+    /// @return claimableOutputAmount Amount of output tokens available for redemption
     /// @return targetPrices Array of target prices
     /// @return targetAmounts Array of target amounts
     /// @return expirationTime Order expiration timestamp
     /// @return isActive Whether order is active
     /// @return isFullyExecuted Whether order is fully executed
-    /// @return executedLevels Bitmask of executed levels
+    /// @return executedLevels Number of executed levels
+    /// @return zeroForOne Direction of the trade
+    /// @return currentGasPrice Current gas price
+    /// @return averageGasPrice Moving average gas price
+    /// @return currentDynamicFee Current dynamic fee rate
+    /// @return totalBatchesCreated Total number of batches created
     function getBatchOrderDetails(uint256 batchId) external view returns (
         address user,
         address currency0,
         address currency1,
         uint256 totalAmount,
         uint256 executedAmount,
+        uint256 unexecutedAmount,
+        uint256 claimableOutputAmount,
         uint256[] memory targetPrices,
         uint256[] memory targetAmounts,
         uint256 expirationTime,
         bool isActive,
         bool isFullyExecuted,
         uint256 executedLevels,
-        bool zeroForOne
+        bool zeroForOne,
+        uint128 currentGasPrice,
+        uint128 averageGasPrice,
+        uint24 currentDynamicFee,
+        uint256 totalBatchesCreated
     );
-
-    /// @notice Get which levels have been executed for a batch order
-    /// @param batchId The batch order ID
-    /// @return executedLevels Bitmask of executed levels
-    /// @return levelStatus Array of boolean values indicating which levels are executed
-    function getExecutedLevels(uint256 batchId) external view returns (uint256 executedLevels, bool[] memory levelStatus);
-
-    /// @notice Get batch statistics
-    /// @return totalBatches Total number of batches created
-    function getBatchStatistics() external view returns (uint256 totalBatches);
 
     // ===== ADMIN FUNCTIONS =====
 
