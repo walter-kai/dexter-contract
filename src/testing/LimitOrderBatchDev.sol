@@ -31,7 +31,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     using FixedPointMathLib for uint256;
 
     constructor(IPoolManager _poolManager, address _feeRecipient) 
-        LimitOrderBatch(_poolManager, _feeRecipient) 
+        LimitOrderBatch(_poolManager, _feeRecipient, msg.sender, address(0)) // Use msg.sender as owner, no tools contract for dev version
     {
         // Testing version constructor
     }
@@ -126,9 +126,9 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             FEE_BASIS_POINTS,
             BASIS_POINTS_DENOMINATOR,
             BASE_FEE,
-            _getDynamicFee(),
+            BASE_FEE, // Simplified - no dynamic fees in core
             uint128(tx.gasprice),
-            movingAverageGasPrice
+            0 // Gas tracking moved to tools contract
         );
     }
 

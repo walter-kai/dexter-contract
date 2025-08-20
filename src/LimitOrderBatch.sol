@@ -21,10 +21,19 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "@uniswap/v4-core/lib/solmate/src/utils/FixedPointMathLib.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 
+// Forward declaration for tools contract interface
+interface ILimitOrderBatchTools {
+    function queueForBestExecution(uint256 orderId, PoolKey calldata key, int24 currentTick, uint256 timeout) external;
+    function processBestExecutionQueue(PoolKey calldata key, int24 currentTick) external returns (uint256[] memory);
+    function updatePriceAnalytics(PoolKey calldata key, int24 newTick) external;
+    function calculateAdvancedMetrics(uint256 orderId, bool usedBestExecution) external;
+    function trackPoolInitialization(PoolKey calldata key, int24 tick) external;
+}
+
 /**
  * @title LimitOrderBatch - Simplified and Gas-Optimized Version
  * @notice Batch limit order system optimized for contract size and gas efficiency
- * @dev Refactored to eliminate duplicate code and reduce contract size
+ * @dev Refactored to eliminate duplicate code and reduce contract size with modular tools integration
  */
 contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCallback {
     using SafeERC20 for IERC20;
@@ -71,11 +80,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     mapping(uint256 => BatchInfo) public batchOrders;
     uint256 public nextBatchOrderId = 1;
 
-    // Gas price tracking (simplified)
-    uint128 public movingAverageGasPrice;
-    uint104 public movingAverageGasPriceCount;
-    
-    // Best execution queue
+    // Best execution queue (simplified version)
     struct QueuedOrder {
         uint256 batchOrderId;
         int24 originalTick;
@@ -99,6 +104,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     
     address public immutable FEE_RECIPIENT;
     address public owner;
+    ILimitOrderBatchTools public toolsContract;
 
     // ========== ERRORS ==========
     
@@ -107,6 +113,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     error NotEnoughToClaim();
     error MustUseDynamicFee();
     error SlippageExceeded();
+    error ToolsAlreadySet();
 
     // ========== EVENTS ==========
     
@@ -115,6 +122,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     event BatchOrderCancelledOptimized(uint256 indexed batchId, address indexed user);
     event TokensRedeemedOptimized(uint256 indexed batchId, address indexed user, uint256 amount);
     event GasPriceTrackedOptimized(uint128 gasPrice, uint128 newAverage, uint104 count);
+    event ToolsContractSet(address indexed toolsContract);
 
     // ========== MODIFIERS ==========
     
@@ -131,12 +139,31 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     // ========== CONSTRUCTOR ==========
     
-    constructor(IPoolManager _poolManager, address _feeRecipient) 
+    constructor(IPoolManager _poolManager, address _feeRecipient, address _owner, address _toolsContract) 
         BaseHook(_poolManager) 
     {
         require(_feeRecipient != address(0), "Invalid fee recipient");
-        owner = msg.sender;
+        require(_owner != address(0), "Invalid owner");
+        owner = _owner;
         FEE_RECIPIENT = _feeRecipient;
+        
+        // Set tools contract if provided (can be zero initially)
+        if (_toolsContract != address(0)) {
+            toolsContract = ILimitOrderBatchTools(_toolsContract);
+        }
+    }
+
+    // ========== TOOLS INTEGRATION ==========
+    
+    /**
+     * @notice Set the tools contract address (can only be done once if not set in constructor)
+     * @param _toolsContract Address of the LimitOrderBatchTools contract
+     */
+    function setToolsContract(address _toolsContract) external onlyOwner {
+        require(address(toolsContract) == address(0), "Tools already set");
+        require(_toolsContract != address(0), "Invalid tools contract");
+        toolsContract = ILimitOrderBatchTools(_toolsContract);
+        emit ToolsContractSet(_toolsContract);
     }
 
     // ========== CORE FUNCTIONS ==========
@@ -259,9 +286,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Consolidated validation
         _validateOrderInputs(targetPrices, targetAmounts, deadline, maxSlippageBps, currency0, currency1);
         
-        // Update gas tracking
-        _updateGasPrice();
-        
         // Create pool key
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
         
@@ -276,6 +300,16 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         // Handle token deposits
         _handleTokenDeposit(key, zeroForOne, totalAmount);
+        
+        // Integrate with tools contract for advanced features (simplified)
+        if (address(toolsContract) != address(0) && bestPriceTimeout > 0) {
+            // Only queue for best execution if timeout is specified
+            try toolsContract.queueForBestExecution(batchId, key, _getCurrentTick(key), bestPriceTimeout) {
+                // Best execution queued successfully
+            } catch {
+                // Continue without best execution if tools contract fails
+            }
+        }
         
         emit BatchOrderCreated(batchId, msg.sender, currency0, currency1, totalAmount, targetPrices, targetAmounts);
         
@@ -370,6 +404,69 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         emit TokensRedeemedOptimized(batchOrderId, msg.sender, outputAmount);
     }
 
+    // ========== TOOLS CONTRACT INTEGRATION ==========
+    
+    /**
+     * @notice Execute specific order (called by tools contract for best execution)
+     * @param batchOrderId The batch order ID to execute
+     */
+    function executeSpecificOrder(uint256 batchOrderId) external {
+        require(msg.sender == address(toolsContract), "Only tools contract");
+        require(batchOrderId > 0 && batchOrderId < nextBatchOrderId, "Invalid batch ID");
+        
+        BatchInfo storage batch = batchOrders[batchOrderId];
+        require(batch.isActive, "Order not active");
+        
+        // Execute the order using internal logic
+        PoolKey memory key = batch.poolKey;
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        
+        // Execute at current market conditions
+        _executeOrderAtCurrentPrice(batchOrderId, key, currentTick);
+    }
+    
+    /**
+     * @notice Internal function to execute an order at current market price
+     */
+    function _executeOrderAtCurrentPrice(uint256 batchOrderId, PoolKey memory key, int24 currentTick) internal {
+        BatchInfo storage batch = batchOrders[batchOrderId];
+        PoolId poolId = key.toId();
+        
+        // Calculate total amount to execute
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 targetTick = batchTargetTicks[batchOrderId][i];
+            uint256 tickAmount = batchTargetAmounts[batchOrderId][i];
+            
+            // Check if this level should be executed at current price
+            bool shouldExecute = batch.zeroForOne ? (currentTick <= targetTick) : (currentTick >= targetTick);
+            if (shouldExecute) {
+                totalAmount += tickAmount;
+                // Remove from pending
+                pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= tickAmount;
+            }
+        }
+        
+        if (totalAmount > 0) {
+            // Perform the swap
+            SwapParams memory params = SwapParams({
+                zeroForOne: batch.zeroForOne,
+                amountSpecified: -int256(totalAmount),
+                sqrtPriceLimitX96: batch.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            });
+
+            bytes memory result = poolManager.unlock(abi.encode(key, params));
+            BalanceDelta delta = abi.decode(result, (BalanceDelta));
+            uint256 outputAmount = batch.zeroForOne ? uint256(int256(-delta.amount1())) : uint256(int256(-delta.amount0()));
+
+            // Update claimable tokens
+            claimableOutputTokens[batchOrderId] += outputAmount;
+            batchExecutedAmounts[batchOrderId] += totalAmount;
+            
+            emit BatchLevelExecutedOptimized(batchOrderId, uint256(uint24(currentTick)), totalAmount);
+        }
+    }
+
     // ========== HOOK IMPLEMENTATIONS ==========
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -398,19 +495,28 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick) internal override returns (bytes4) {
         lastTicks[key.toId()] = tick;
+        
+        // Simplified tools integration for pool initialization
+        if (address(toolsContract) != address(0)) {
+            try toolsContract.trackPoolInitialization(key, tick) {
+                // Pool initialization tracked
+            } catch {
+                // Continue without tracking if tools contract fails
+            }
+        }
+        
         return this.afterInitialize.selector;
     }
 
     function _beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata) 
-        internal view override returns (bytes4, BeforeSwapDelta, uint24) {
-        uint24 fee = _getDynamicFee();
-        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+        internal pure override returns (bytes4, BeforeSwapDelta, uint24) {
+        // Use fixed fee for simplified version - tools contract can override for dynamic fees
+        uint24 fee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 
     function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata) 
         internal override returns (bytes4, int128) {
-        _updateGasPrice();
-        
         if (sender == address(this)) return (this.afterSwap.selector, 0);
 
         _processOrders(key);
@@ -450,6 +556,12 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             tickSpacing: _getTickSpacing(fee),
             hooks: IHooks(address(this))
         });
+    }
+
+    function _getCurrentTick(PoolKey memory key) internal view returns (int24) {
+        PoolId poolId = key.toId();
+        (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, poolId);
+        return tick;
     }
 
         function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
@@ -622,6 +734,15 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         if (currentTick != lastTick) {
             _executeOrdersInRange(key, lastTick, currentTick);
             lastTicks[key.toId()] = currentTick;
+            
+            // Simplified tools integration - only process best execution queue
+            if (address(toolsContract) != address(0)) {
+                try toolsContract.processBestExecutionQueue(key, currentTick) {
+                    // Best execution processed
+                } catch {
+                    // Continue without best execution if tools contract fails
+                }
+            }
         }
     }
 
@@ -692,26 +813,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             }
         }
         return 0;
-    }
-
-    function _updateGasPrice() internal {
-        uint128 gasPrice = uint128(tx.gasprice);
-        if (movingAverageGasPriceCount == 0) {
-            movingAverageGasPrice = gasPrice;
-        } else {
-            movingAverageGasPrice = ((movingAverageGasPrice * movingAverageGasPriceCount) + gasPrice) / (movingAverageGasPriceCount + 1);
-        }
-        movingAverageGasPriceCount++;
-        emit GasPriceTracked(gasPrice, movingAverageGasPrice, movingAverageGasPriceCount);
-    }
-
-    function _getDynamicFee() internal view returns (uint24) {
-        if (movingAverageGasPriceCount == 0) return BASE_FEE;
-        
-        uint128 gasPrice = uint128(tx.gasprice);
-        if (gasPrice > (movingAverageGasPrice * 11) / 10) return BASE_FEE / 2;
-        if (gasPrice < (movingAverageGasPrice * 9) / 10) return BASE_FEE * 2;
-        return BASE_FEE;
     }
 
     function _getTickSpacing(uint24 fee) internal pure returns (int24) {
@@ -819,27 +920,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     // ========== VIEW FUNCTIONS ==========
 
     /**
-     * @notice Get comprehensive batch order details
-     * @dev Returns all relevant information about a batch order in a single call
-     * @param batchId The ID of the batch order to query
-     * @return user Address of the order creator
-     * @return currency0 Address of token0 in the pool
-     * @return currency1 Address of token1 in the pool  
-     * @return totalAmount Original total amount deposited
-     * @return executedAmount Amount that has been executed (calculated)
-     * @return unexecutedAmount Amount remaining unexecuted
-     * @return claimableOutputAmount Amount of output tokens available for redemption
-     * @return targetPrices Array of target prices for each level
-     * @return targetAmounts Array of amounts for each price level
-     * @return expirationTime Order expiration timestamp
-     * @return isActive Whether the order is still active
-     * @return isFullyExecuted Whether all levels have been executed
-     * @return executedLevels Number of price levels that have been executed
-     * @return zeroForOne Direction of the trade
-     * @return currentGasPrice Current gas price
-     * @return averageGasPrice Moving average gas price
-     * @return currentDynamicFee Current dynamic fee rate
-     * @return totalBatchesCreated Total number of batches created (statistics)
+     * @notice Get basic batch order information (simplified for core contract)
+     * @dev For detailed information, use LimitOrderBatchTools.getBatchOrderDetails()
      */
     function getBatchOrderDetails(uint256 batchId) external view returns (
         address user,
@@ -863,47 +945,39 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     ) {
         BatchInfo storage batch = batchOrders[batchId];
         
-        // Convert ticks back to prices
-        uint256[] memory prices = new uint256[](batch.ticksLength);
-        for (uint256 i = 0; i < batch.ticksLength; i++) {
-            prices[i] = uint256(TickMath.getSqrtPriceAtTick(batchTargetTicks[batchId][i]));
-        }
+        // Basic information only - detailed calculations moved to tools contract
+        user = batch.user;
+        currency0 = Currency.unwrap(batch.poolKey.currency0);
+        currency1 = Currency.unwrap(batch.poolKey.currency1);
+        totalAmount = uint256(batch.totalAmount);
         
-        // Calculate execution status
+        // Simple calculations
         uint256 currentClaimSupply = claimTokensSupply[batchId];
-        uint256 executed = uint256(batch.totalAmount) - currentClaimSupply;
-        uint256 claimableOutput = claimableOutputTokens[batchId];
+        executedAmount = totalAmount - currentClaimSupply;
+        unexecutedAmount = currentClaimSupply;
+        claimableOutputAmount = claimableOutputTokens[batchId];
         
-        // Count executed levels
-        uint256 levelsExecuted = 0;
-        PoolId poolId = batch.poolKey.toId();
+        // Arrays (tools contract provides more detailed versions)
+        targetPrices = new uint256[](batch.ticksLength);
+        targetAmounts = batchTargetAmounts[batchId];
+        
+        // Basic tick to price conversion
         for (uint256 i = 0; i < batch.ticksLength; i++) {
-            uint256 pendingAtTick = pendingBatchOrders[poolId][batchTargetTicks[batchId][i]][batch.zeroForOne];
-            if (pendingAtTick == 0) {
-                levelsExecuted++;
-            }
+            targetPrices[i] = uint256(TickMath.getSqrtPriceAtTick(batchTargetTicks[batchId][i]));
         }
         
-        return (
-            batch.user,
-            Currency.unwrap(batch.poolKey.currency0),
-            Currency.unwrap(batch.poolKey.currency1),
-            uint256(batch.totalAmount),
-            executed,
-            currentClaimSupply,
-            claimableOutput,
-            prices,
-            batchTargetAmounts[batchId],
-            uint256(batch.expirationTime),
-            batch.isActive,
-            executed == uint256(batch.totalAmount),
-            levelsExecuted,
-            batch.zeroForOne,
-            uint128(tx.gasprice),
-            movingAverageGasPrice,
-            _getDynamicFee(),
-            nextBatchOrderId - 1
-        );
+        // Basic status
+        expirationTime = uint256(batch.expirationTime);
+        isActive = batch.isActive;
+        isFullyExecuted = (executedAmount == totalAmount);
+        executedLevels = 0; // Detailed calculation moved to tools
+        zeroForOne = batch.zeroForOne;
+        
+        // Basic gas info (detailed tracking in tools)
+        currentGasPrice = uint128(tx.gasprice);
+        averageGasPrice = 0; // Moved to tools contract
+        currentDynamicFee = BASE_FEE; // Simplified
+        totalBatchesCreated = nextBatchOrderId - 1;
     }
 
     // ========== BACKWARD COMPATIBILITY HELPERS ==========
@@ -966,11 +1040,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     function getGasPriceStats() external view returns (uint128, uint128, uint104) {
-        return (uint128(tx.gasprice), movingAverageGasPrice, movingAverageGasPriceCount);
+        return (uint128(tx.gasprice), 0, 0); // Gas tracking moved to tools contract
     }
 
     function getCurrentDynamicFee() external view returns (uint24) {
-        return _getDynamicFee();
+        return BASE_FEE; // Dynamic fee calculation moved to tools contract
     }
 
     // ========== FALLBACKS ==========

@@ -8,10 +8,19 @@
     "test:verbose": "forge test -vvv",
     "build": "forge build",
     "remap": "forge remappings > remappings.txt",
-    "deploy:swap:main": "./deploy/deploy-with-ledger.sh script/DeploySwapToken.s.sol mainnet",
-    "deploy:swap:anvil": "./deploy/deploy-with-ledger.sh script/DeploySwapToken.s.sol anvil",
-    "deploy:batch:anvil": "source .env && forge script script/DeployBatch.s.sol:DeployBatch --rpc-url http://localhost:8545 --broadcast --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --skip-simulation",
-    "deploy:batch:main": "./deploy/deploy-with-ledger.sh script/DeployBatch.s.sol mainnet",
+    
+    "deploy:core:anvil": "source .env && forge script script/DeployCore.s.sol:DeployCore --rpc-url http://localhost:8545 --broadcast --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --skip-simulation",
+    "deploy:core:main": "./deploy/deploy-with-ledger.sh script/DeployCore.s.sol mainnet",
+    "deploy:core:sepolia": "source .env && forge script script/DeployCore.s.sol:DeployCore --rpc-url $SEPOLIA_RPC_URL --broadcast --private-key $PRIVATE_KEY --verify --etherscan-api-key $ETHERSCAN_API_KEY",
+    
+    "deploy:tools:anvil": "source .env && forge script script/DeployTools.s.sol:DeployTools --rpc-url http://localhost:8545 --broadcast --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --skip-simulation",
+    "deploy:tools:main": "./deploy/deploy-with-ledger.sh script/DeployTools.s.sol mainnet", 
+    "deploy:tools:sepolia": "source .env && forge script script/DeployTools.s.sol:DeployTools --rpc-url $SEPOLIA_RPC_URL --broadcast --private-key $PRIVATE_KEY --verify --etherscan-api-key $ETHERSCAN_API_KEY",
+    
+    "deploy:both:anvil": "source .env && forge script script/DeployUnified.s.sol:DeployUnified --rpc-url http://localhost:8545 --broadcast --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --skip-simulation",
+    "deploy:both:main": "./deploy/deploy-with-ledger.sh script/DeployUnified.s.sol mainnet",
+    "deploy:both:sepolia": "source .env && forge script script/DeployUnified.s.sol:DeployUnified --rpc-url $SEPOLIA_RPC_URL --broadcast --private-key $PRIVATE_KEY --verify --etherscan-api-key $ETHERSCAN_API_KEY",
+    
     "deploy:ledger": "./deploy/deploy-with-ledger.sh"
   },
   "keywords": [
