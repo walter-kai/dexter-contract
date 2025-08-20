@@ -31,6 +31,24 @@ Dexter represents a sophisticated limit order system engineered specifically for
 | **LimitOrderBatchTools** | 5.7KB | Advanced features & analytics | ✅ Complete |
 | **Interfaces** | Minimal | Clean API specifications | ✅ Standardized |
 
+#### **LimitOrderBatch (Core Contract) Features:**
+- **Multi-Level Batch Orders**: Create orders spanning multiple price levels in a single transaction
+- **Native V4 Hook Integration**: Seamless execution via `beforeSwap`, `afterSwap`, and `beforeInitialize` hooks
+- **ERC-6909 Claim Tokens**: Gas-efficient claim token system for executed orders
+- **Dynamic Fee Optimization**: Real-time fee adjustment based on gas price conditions (0.15%-0.6%)
+- **MEV Protection**: Slippage guards, deadline enforcement, and commitment-reveal schemes
+- **Emergency Functions**: Cancel orders, manual execution, and emergency withdrawal capabilities
+- **Gas Price Tracking**: Moving average calculation for intelligent fee optimization
+- **Atomic Execution**: All-or-nothing batch processing with proper rollback mechanisms
+
+#### **LimitOrderBatchTools (Extension Contract) Features:**
+- **Best Execution Queue**: Intelligent order queuing for price improvement opportunities
+- **Advanced Analytics**: Comprehensive price analytics, volatility scoring, and trend detection
+- **Pool Initialization Tracking**: Monitor pool lifecycle and order performance metrics
+- **Performance Metrics**: Track execution quality, gas savings, and slippage realization
+- **Queue Management**: Automated processing and cleanup of expired queued orders
+- **Optimization Algorithms**: Price improvement detection and automated best execution
+
 This modular approach enables:
 - **Independent upgrades** of advanced features without affecting core functionality
 - **Gas optimization** by keeping essential functions in a size-optimized core contract
@@ -139,6 +157,75 @@ struct QueuedOrder {
 - **Configurable Timeouts**: User-controlled wait times (0-300 seconds)
 - **Automatic Fallback**: Execute at original price after timeout
 - **Value Capture**: Average 0.1% better execution price
+
+---
+
+## 📋 Detailed Feature Breakdown
+
+### LimitOrderBatch (Core Contract - 23.7KB)
+
+**Essential Batch Order Management:**
+- **`createBatchOrder()`**: Create multi-level batch orders with configurable price points and amounts
+- **`createBatchOrderFromPoolKey()`**: Direct pool-specific batch order creation for advanced users
+- **`cancelBatchOrder()`**: Cancel active orders with automatic refund processing
+- **`redeemBatchOrder()`**: Claim executed order proceeds using ERC-6909 tokens
+- **`executeBatchLevel()`**: Manual execution of specific price levels for emergency scenarios
+- **`executeSpecificOrder()`**: Force execution of individual orders regardless of market conditions
+
+**Native Uniswap V4 Hook Implementation:**
+- **`beforeInitialize()`**: Dynamic fee pool setup and initial gas price calibration
+- **`beforeSwap()`**: Real-time fee calculation and order matching preparation
+- **`afterSwap()`**: Automatic order execution triggered by pool swaps
+- **`afterAddLiquidity()`**: Pool state monitoring for optimal execution timing
+
+**Gas-Optimized Core Features:**
+- **ERC-6909 Multi-Token Standard**: Efficient claim token management for batch redemptions
+- **Packed Storage Structures**: Gas-optimized batch info storage (32-byte aligned)
+- **Dynamic Fee Engine**: Real-time fee adjustment based on network congestion (0.15%-0.6% range)
+- **Moving Average Gas Tracking**: Intelligent baseline calculation for fee optimization
+- **Emergency Withdrawal System**: Secure recovery mechanism for stuck funds
+
+**Security & Protection Mechanisms:**
+- **Slippage Protection**: Hardcoded 5% maximum slippage limits
+- **Deadline Enforcement**: Time-bounded execution preventing delayed attacks
+- **Reentrancy Guards**: OpenZeppelin protection across all external calls
+- **Access Control**: Multi-level permission system for administrative functions
+- **Input Validation**: Comprehensive parameter checking and sanitization
+
+### LimitOrderBatchTools (Extension Contract - 5.7KB)
+
+**Advanced Best Execution Engine:**
+- **`queueForBestExecution()`**: Queue orders for 1-tick price improvement with configurable timeouts
+- **`processBestExecutionQueue()`**: Automated processing of queued orders when conditions are met
+- **`getQueueStatus()`**: Real-time queue monitoring with detailed status information
+- **`clearExpiredQueuedOrders()`**: Automated cleanup of expired queue entries
+- **Best Execution Analytics**: Track price improvement success rates and savings
+
+**Comprehensive Pool Analytics:**
+- **`updatePriceAnalytics()`**: Real-time price movement analysis and trend detection
+- **`trackPoolInitialization()`**: Monitor new pool deployment and initial trading activity
+- **`recordFirstOrder()`**: Track first limit order placement in newly initialized pools
+- **Volatility Scoring**: Advanced volatility calculation based on recent price movements
+- **Trend Detection**: Intelligent trend analysis with configurable sensitivity thresholds
+
+**Advanced Performance Metrics:**
+- **`calculateAdvancedMetrics()`**: Comprehensive execution quality analysis
+- **Gas Savings Tracking**: Real-time calculation of gas efficiency improvements
+- **Slippage Realization**: Track actual vs expected slippage across all executions
+- **Execution Time Analysis**: Monitor order execution latency and optimization opportunities
+- **Best Price Achievement**: Track success rate of price improvement strategies
+
+**Pool Lifecycle Management:**
+- **Pool Initialization Tracking**: Complete pool lifecycle monitoring from deployment
+- **Order Performance Correlation**: Analyze order success rates vs pool maturity
+- **Liquidity Impact Analysis**: Track how batch orders affect pool liquidity
+- **Historical Performance Database**: Maintain comprehensive execution history
+
+**Optimization Algorithms:**
+- **Price Improvement Detection**: Intelligent analysis of price movement patterns
+- **Queue Timeout Optimization**: Dynamic adjustment of best execution timeouts
+- **Gas Price Correlation**: Advanced gas price vs execution success analysis
+- **Batch Size Optimization**: Recommendations for optimal batch configurations
 
 ---
 
