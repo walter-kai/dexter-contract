@@ -238,7 +238,7 @@ contract SecurityTest is Test {
         uint256[] memory emptyPrices = new uint256[](0);
         uint256[] memory emptyAmounts = new uint256[](0);
         
-        vm.expectRevert("Empty order arrays");
+        vm.expectRevert(abi.encodeWithSignature("InvalidOrder()"));
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
             emptyPrices, emptyAmounts, block.timestamp + 3600, 500, 0, 300
