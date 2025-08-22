@@ -31,9 +31,29 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     using FixedPointMathLib for uint256;
 
     constructor(IPoolManager _poolManager, address _feeRecipient) 
-        LimitOrderBatch(_poolManager, _feeRecipient, msg.sender, address(0)) // Use msg.sender as owner, no tools contract for dev version
+        LimitOrderBatch(_poolManager, _feeRecipient, msg.sender) // Use msg.sender as owner
     {
         // Testing version constructor
+    }
+
+    /**
+     * @notice Backwards-compatible createBatchOrder for testing
+     * @dev 7-parameter version for test compatibility 
+     */
+    function createBatchOrder(
+        address currency0,
+        address currency1,
+        uint24 fee,
+        bool zeroForOne,
+        uint256[] calldata targetPrices,
+        uint256[] calldata targetAmounts,
+        uint256 expirationTime
+    ) external payable override returns (uint256 batchId) {
+        // Call the parent with simplified parameters
+        return _createBatchOrderInternal(
+            currency0, currency1, fee, zeroForOne,
+            targetPrices, targetAmounts, expirationTime
+        );
     }
 
     /**
@@ -50,13 +70,10 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         uint256 expirationTime,
         uint256 bestPriceTimeout
     ) external payable returns (uint256 batchId) {
-        // Call the parent with default values for missing parameters
+        // Call the parent with simplified parameters
         return _createBatchOrderInternal(
             currency0, currency1, fee, zeroForOne,
-            targetPrices, targetAmounts, expirationTime,
-            300, // default 3% slippage
-            0,   // default no minimum output
-            bestPriceTimeout
+            targetPrices, targetAmounts, expirationTime
         );
     }
 
@@ -64,7 +81,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
      * @notice Backwards-compatible createBatchOrder for testing (PoolKey variant)
      * @dev 4-parameter version for test compatibility
      */
-    function createBatchOrder(PoolKey calldata key, int24 tick, uint256 amount, bool zeroForOne) external payable override returns (uint256 batchId) {
+    function createBatchOrder(PoolKey calldata key, int24 tick, uint256 amount, bool zeroForOne) external payable returns (uint256 batchId) {
         // Convert single tick to arrays
         uint256[] memory prices = new uint256[](1);
         uint256[] memory amounts = new uint256[](1);
@@ -78,10 +95,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             zeroForOne,
             prices,
             amounts,
-            block.timestamp + 3600, // 1 hour default deadline
-            300, // 3% default slippage
-            amount * 95 / 100, // 95% min output
-            300 // 5 minute timeout
+            block.timestamp + 3600
         );
     }
 
@@ -428,10 +442,101 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     function getQueueStatus(PoolKey calldata key) external view returns (
         uint256 queueLength,
         uint256 currentIndex,
-        uint256[] memory orders
+        uint256[] memory queuedOrders
     ) {
-        // Simplified implementation - return empty data
-        return (0, 0, new uint256[](0));
+        PoolId poolId = key.toId();
+        BestExecutionQueue storage queue = bestExecutionQueues[poolId];
+        return (
+            queue.queuedOrderIds.length,
+            queue.currentIndex,
+            queue.queuedOrderIds
+        );
+    }
+
+    // Additional function for tools integration tests
+    function getQueueDetails(PoolKey calldata key) external view returns (
+        uint256[] memory queuedOrders,
+        uint256 currentIndex,
+        uint64 lastProcessedTimestamp
+    ) {
+        PoolId poolId = key.toId();
+        BestExecutionQueue storage queue = bestExecutionQueues[poolId];
+        return (
+            queue.queuedOrderIds,
+            queue.currentIndex,
+            queue.lastProcessedTimestamp
+        );
+    }
+
+    // View functions for testing tools functionality
+    function getPoolTracker(PoolId poolId) external view returns (
+        uint160 initialSqrtPriceX96,
+        uint64 initializationTimestamp,
+        uint32 totalOrdersProcessed,
+        uint64 firstOrderTimestamp,
+        int24 initialTick,
+        bool isInitialized
+    ) {
+        PoolInitializationTracker storage tracker = poolTrackers[poolId];
+        return (
+            tracker.initialSqrtPriceX96,
+            tracker.initializationTimestamp,
+            tracker.totalOrdersProcessed,
+            tracker.firstOrderTimestamp,
+            tracker.initialTick,
+            tracker.isInitialized
+        );
+    }
+
+    function getPriceAnalytics(PoolId poolId) external view returns (
+        int24[] memory recentTicks,
+        uint256[] memory recentTimestamps,
+        uint64 lastAnalysisTimestamp,
+        uint32 volatilityScore,
+        uint32 averageTickMovement,
+        int24 trendDirection
+    ) {
+        PriceAnalytics storage analytics = priceAnalytics[poolId];
+        return (
+            analytics.recentTicks,
+            analytics.recentTimestamps,
+            analytics.lastAnalysisTimestamp,
+            analytics.volatilityScore,
+            analytics.averageTickMovement,
+            analytics.trendDirection
+        );
+    }
+
+    function getAdvancedMetrics(uint256 orderId) external view returns (
+        uint64 creationTimestamp,
+        uint64 expectedExecutionTime,
+        uint64 actualExecutionTime,
+        uint32 creationGasPrice,
+        uint32 bestPriceAchieved,
+        uint32 slippageRealized,
+        uint32 gasSavingsRealized,
+        bool usedBestExecution
+    ) {
+        AdvancedBatchMetrics storage metrics = advancedMetrics[orderId];
+        return (
+            metrics.creationTimestamp,
+            metrics.expectedExecutionTime,
+            metrics.actualExecutionTime,
+            metrics.creationGasPrice,
+            metrics.bestPriceAchieved,
+            metrics.slippageRealized,
+            metrics.gasSavingsRealized,
+            metrics.usedBestExecution
+        );
+    }
+
+    // Test helper functions to expose internal calculations
+    function testCalculateGasSavings(uint256 orderId, uint256 gasUsed) external pure returns (uint256) {
+        return gasUsed > 100000 ? gasUsed - 100000 : 0;
+    }
+
+    function testCalculatePriceImprovement(uint256 orderId, uint256 executionTick) external pure returns (uint256) {
+        return 0; // Simplified implementation
     }
 
     // Override batch order execution to use internal key for pending orders

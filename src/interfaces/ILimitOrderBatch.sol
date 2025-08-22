@@ -7,19 +7,6 @@ pragma solidity ^0.8.20;
  */
 interface ILimitOrderBatch {
     
-    // ===== STRUCTS =====
-    
-    /// @notice Parameters for creating a batch order with multiple price levels
-    struct BatchParams {
-        address currency0;
-        address currency1;
-        bool zeroForOne;
-        uint256[] targetPrices;     // Array of trigger prices
-        uint256[] targetAmounts;    // Array of amounts for each price level
-        uint256 expirationTime;
-        uint256 bestPriceTimeout; // Seconds to wait for better price, 0 = disabled
-    }
-
     // ===== EVENTS =====
     
     event BatchOrderCreated(
@@ -79,72 +66,33 @@ interface ILimitOrderBatch {
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
-        uint256 deadline,
-        uint256 maxSlippageBps,
-        uint256 minOutputAmount,
-        uint256 bestPriceTimeout
+        uint256 deadline
     ) external payable returns (uint256 batchId);
-
-    /// @notice Manually execute a specific batch level at current market price
-    /// @dev Allows execution regardless of target price - useful for emergency execution
-    /// @param batchId The batch order ID to execute
-    /// @param levelIndex Index of the price level to execute (0-based)
-    /// @return isFullyExecuted Whether the entire batch is now fully executed
-    function executeBatchLevel(uint256 batchId, uint256 levelIndex) 
-        external 
-        returns (bool isFullyExecuted);
 
     function cancelBatchOrder(uint256 batchId) external;
 
     // ===== VIEW FUNCTIONS =====
 
-    /// @notice Get comprehensive batch order details including all relevant information
-    /// @param batchId The batch order ID
-    /// @return user Address of the user who created the order
-    /// @return currency0 First currency address
-    /// @return currency1 Second currency address
-    /// @return totalAmount Total amount to be swapped
-    /// @return executedAmount Amount already executed
-    /// @return unexecutedAmount Amount remaining unexecuted
-    /// @return claimableOutputAmount Amount of output tokens available for redemption
-    /// @return targetPrices Array of target prices
-    /// @return targetAmounts Array of target amounts
-    /// @return expirationTime Order expiration timestamp
-    /// @return isActive Whether order is active
-    /// @return isFullyExecuted Whether order is fully executed
-    /// @return executedLevels Number of executed levels
-    /// @return zeroForOne Direction of the trade
-    /// @return currentGasPrice Current gas price
-    /// @return averageGasPrice Moving average gas price
-    /// @return currentDynamicFee Current dynamic fee rate
-    /// @return totalBatchesCreated Total number of batches created
-    function getBatchOrderDetails(uint256 batchId) external view returns (
+    /// @notice Get comprehensive batch and contract info in one call
+    function getBatchInfo(uint256 batchId) external view returns (
         address user,
         address currency0,
-        address currency1,
+        address currency1, 
         uint256 totalAmount,
         uint256 executedAmount,
-        uint256 unexecutedAmount,
-        uint256 claimableOutputAmount,
-        uint256[] memory targetPrices,
-        uint256[] memory targetAmounts,
-        uint256 expirationTime,
+        uint256 claimableAmount,
         bool isActive,
         bool isFullyExecuted,
-        uint256 executedLevels,
+        uint256 expirationTime,
         bool zeroForOne,
-        uint128 currentGasPrice,
-        uint128 averageGasPrice,
-        uint24 currentDynamicFee,
-        uint256 totalBatchesCreated
+        uint256 totalBatches,
+        uint24 currentFee
     );
 
     // ===== ADMIN FUNCTIONS =====
 
-    /// @notice Emergency withdraw function - converts ERC-6909 tokens back to underlying ERC20/ETH
-    /// @param token The underlying token address (address(0) for ETH)
-    /// @param amount The amount of ERC-6909 tokens to convert and withdraw
-    function emergencyWithdraw(address token, uint256 amount) external;
-
-
+    /// @notice Manually execute a specific batch level at current market price
+    function executeBatchLevel(uint256 batchId, uint256 levelIndex) 
+        external 
+        returns (bool isFullyExecuted);
 }

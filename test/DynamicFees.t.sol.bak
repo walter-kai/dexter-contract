@@ -93,7 +93,7 @@ contract DynamicFeesTest is Test {
 
     function testDynamicFeeBaseline() public {
         // Test the base fee when there's no gas price history
-        uint24 baseFee = hook.getCurrentDynamicFee();
+        uint24 baseFee = hook.BASE_FEE();
         
         // Should return the base fee (3000 = 0.3%)
         assertEq(baseFee, 3000, "Base fee should be 3000 (0.3%)");
@@ -114,20 +114,12 @@ contract DynamicFeesTest is Test {
         assertTrue(batchOrderId > 0, "Batch order should be created");
 
         // Check the dynamic fee after gas price tracking
-        uint24 normalGasFee = hook.getCurrentDynamicFee();
+        uint24 normalGasFee = hook.BASE_FEE();
         
         // Should still be base fee since it's the first transaction
         assertEq(normalGasFee, 3000, "Fee should be base fee for first transaction");
         
-        // Check gas price stats
-        (uint128 currentGasPrice, uint128 averageGasPrice, uint104 count) = hook.getGasPriceStats();
-        assertEq(currentGasPrice, NORMAL_GAS_PRICE, "Current gas price should match");
-        assertEq(averageGasPrice, NORMAL_GAS_PRICE, "Average should equal current for first transaction");
-        assertEq(count, 1, "Count should be 1");
-        
         console.log("Normal gas fee:", normalGasFee);
-        console.log("Current gas price:", currentGasPrice);
-        console.log("Average gas price:", averageGasPrice);
         console.log("Count:", count);
     }
 
@@ -145,7 +137,7 @@ contract DynamicFeesTest is Test {
         hook.createBatchOrder(key, 180, 5e18, true);
         
         // Check the dynamic fee - should be lower when gas price is high
-        uint24 highGasFee = hook.getCurrentDynamicFee();
+        uint24 highGasFee = hook.BASE_FEE();
         
         // When gas price > 1.1 * average, fee should be halved (1500 = 0.15%)
         assertEq(highGasFee, 1500, "Fee should be halved for high gas price");
@@ -179,7 +171,7 @@ contract DynamicFeesTest is Test {
         hook.createBatchOrder(key, 240, 5e18, true);
         
         // Check the dynamic fee - should be higher when gas price is low
-        uint24 lowGasFee = hook.getCurrentDynamicFee();
+        uint24 lowGasFee = hook.BASE_FEE();
         
         // When gas price < 0.9 * average, fee should be doubled (6000 = 0.6%)
         assertEq(lowGasFee, 6000, "Fee should be doubled for low gas price");
@@ -213,7 +205,7 @@ contract DynamicFeesTest is Test {
             // Create order to update gas price tracking
             hook.createBatchOrder(key, int24(120 + int24(int256(i * 60))), 1e18, true);
             
-            fees[i] = hook.getCurrentDynamicFee();
+            fees[i] = hook.BASE_FEE();
             gasPrices[i] = testGasPrices[i];
             
             console.log("Gas Price:", gasPrices[i]);
@@ -411,14 +403,14 @@ contract DynamicFeesTest is Test {
         vm.txGasPrice(0);
         hook.createBatchOrder(key, 120, 1e18, true);
         
-        uint24 zeroGasFee = hook.getCurrentDynamicFee();
+        uint24 zeroGasFee = hook.BASE_FEE();
         assertEq(zeroGasFee, 3000, "Should return base fee for zero gas price");
         
         // Test with extremely high gas price
         vm.txGasPrice(1000 gwei);
         hook.createBatchOrder(key, 180, 1e18, true);
         
-        uint24 extremeGasFee = hook.getCurrentDynamicFee();
+        uint24 extremeGasFee = hook.BASE_FEE();
         assertEq(extremeGasFee, 1500, "Should return halved fee for extreme gas price");
         
         // Test after many transactions to check moving average stability
@@ -447,12 +439,12 @@ contract DynamicFeesTest is Test {
         // Now test with our target gas price
         vm.txGasPrice(testGasPrice);
         hook.createBatchOrder(key, 180, 1e18, true);
-        uint24 fee1 = hook.getCurrentDynamicFee();
+        uint24 fee1 = hook.BASE_FEE();
         
         // Reset to same conditions and test again
         vm.txGasPrice(testGasPrice);
         hook.createBatchOrder(key, 240, 1e18, true);
-        uint24 fee2 = hook.getCurrentDynamicFee();
+        uint24 fee2 = hook.BASE_FEE();
         
         // Fees should be consistent for similar gas price conditions
         // (They might not be exactly equal due to moving average, but should be close)

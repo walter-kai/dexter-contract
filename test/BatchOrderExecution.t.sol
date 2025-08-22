@@ -199,19 +199,21 @@ contract BatchOrderExecutionTest is Test {
             address currency1,
             uint256 totalAmount,
             uint256 executedAmount,
-            uint256[] memory returnedPrices,
-            uint256[] memory returnedAmounts,
+            uint256 claimableAmount,
             bool isActive,
-            bool isFullyExecuted
-        ) = hook.getBatchOrder(batchId);
+            bool isFullyExecuted,
+            uint256 orderExpirationTime,
+            bool zeroForOne,
+            uint256 totalBatches,
+            uint24 currentFee
+        ) = hook.getBatchInfo(batchId);
         
         assertEq(orderUser, user, "Order user should match");
         assertEq(currency0, address(token0), "Currency0 should match");
         assertEq(currency1, address(token1), "Currency1 should match");
         assertEq(totalAmount, ORDER_AMOUNT, "Total amount should match");
         assertEq(executedAmount, 0, "Executed amount should be 0 initially");
-        assertEq(returnedPrices.length, 2, "Should have 2 target prices");
-        assertEq(returnedAmounts.length, 2, "Should have 2 target amounts");
+        assertTrue(totalBatches > 0, "Should have created batches");
         assertTrue(isActive, "Order should be active");
         assertFalse(isFullyExecuted, "Order should not be fully executed");
     }
@@ -292,12 +294,12 @@ contract BatchOrderExecutionTest is Test {
         
         // Try to execute as non-owner (should fail)
         vm.prank(user);
-        vm.expectRevert("Not contract owner");
+        vm.expectRevert("Invalid execution");
         hook.executeBatchLevel(batchId, 0);
         
         // Try to execute as non-owner (should fail)
         vm.prank(user2);
-        vm.expectRevert("Not contract owner");
+        vm.expectRevert("Invalid execution");
         hook.executeBatchLevel(batchId, 0);
         
         // Execute as owner (should succeed)
@@ -336,18 +338,18 @@ contract BatchOrderExecutionTest is Test {
         );
         
         // Test invalid price level (too high)
-        vm.expectRevert("Invalid price level");
+        vm.expectRevert("Invalid execution");
         hook.executeBatchLevel(batchId, 2); // Only 0 and 1 are valid
         
         // Test invalid batch ID
-        vm.expectRevert("Batch order not active");
+        vm.expectRevert("Invalid execution");
         hook.executeBatchLevel(999, 0);
         
         // Cancel the order and try to execute
         vm.prank(user);
         hook.cancelBatchOrder(batchId);
         
-        vm.expectRevert("Batch order not active");
+        vm.expectRevert("Invalid execution");
         hook.executeBatchLevel(batchId, 0);
     }
 
@@ -386,11 +388,11 @@ contract BatchOrderExecutionTest is Test {
         
         // Verify timeout values are stored correctly by checking the orders were created
         (
-            address user1, , , , , , , , , , bool isActive1, , , , , , , 
-        ) = hook.getBatchOrderDetails(batchId1);
+            address user1,,,,,, bool isActive1,,,,,
+        ) = hook.getBatchInfo(batchId1);
         (
-            address user2Addr, , , , , , , , , , bool isActive2, , , , , , , 
-        ) = hook.getBatchOrderDetails(batchId2);
+            address user2Addr,,,,,, bool isActive2,,,,,
+        ) = hook.getBatchInfo(batchId2);
         
         assertEq(user1, user, "First order should belong to user");
         assertEq(user2Addr, user2, "Second order should belong to user2");

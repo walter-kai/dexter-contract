@@ -545,4 +545,40 @@ contract LimitOrderBatchTools {
         queue.currentIndex = 0;
         queue.lastProcessedTimestamp = uint64(block.timestamp);
     }
+
+    // ========== DYNAMIC FEE API (simple EMA-based) ==========
+
+    // Gas price tracking for dynamic fee calculation
+    uint128 public averageGasPrice;
+    uint64 public gasPriceUpdatedAt;
+
+    // Configuration
+    uint24 public constant BASE_FEE = 3000; // 0.3%
+    uint256 public constant FEE_DOUBLE_THRESHOLD_PCT = 150; // if gas > 150% of avg -> double
+    uint256 public constant FEE_ONE_POINT_FIVE_THRESHOLD_PCT = 120; // >120% -> 1.5x
+
+    /**
+     * @notice Update EWMA gas price from an external caller (keeper or core)
+     */
+    function updateGasPrice(uint128 gasPrice) external onlyOwner {
+        if (averageGasPrice == 0) {
+            averageGasPrice = gasPrice;
+        } else {
+            // EMA with alpha = 0.1 (10% new)
+            averageGasPrice = uint128((uint256(averageGasPrice) * 90 + uint256(gasPrice) * 10) / 100);
+        }
+        gasPriceUpdatedAt = uint64(block.timestamp);
+    }
+
+    /**
+     * @notice Simple dynamic fee getter used by core contract
+     */
+    function getDynamicFee(PoolKey calldata) external view returns (uint24) {
+        if (averageGasPrice == 0) return BASE_FEE;
+        uint256 currentGas = tx.gasprice;
+        uint256 pct = (currentGas * 100) / uint256(averageGasPrice);
+        if (pct >= FEE_DOUBLE_THRESHOLD_PCT) return uint24(BASE_FEE * 2);
+        if (pct >= FEE_ONE_POINT_FIVE_THRESHOLD_PCT) return uint24((BASE_FEE * 3) / 2);
+        return BASE_FEE;
+    }
 }

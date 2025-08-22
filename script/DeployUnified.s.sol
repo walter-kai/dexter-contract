@@ -92,37 +92,20 @@ contract DeployUnified is Script {
         LimitOrderBatch coreContract = new LimitOrderBatch{salt: salt}(
             poolManager,
             feeRecipient,
-            msg.sender, // Owner address (the broadcaster)
-            address(0)  // Tools contract address - will be set later
+            msg.sender  // Owner address (the broadcaster)
         );
         
         require(address(coreContract) == hookAddress, "Hook address mismatch!");
         result.coreContract = address(coreContract);
         console2.log(unicode"✅ Core contract deployed at:", address(coreContract));
         
-        // Step 4: Deploy tools contract with reference to core
-        LimitOrderBatchTools toolsContract = new LimitOrderBatchTools(
-            address(coreContract),
-            poolManager
-        );
-        
-        result.toolsContract = address(toolsContract);
-        console2.log(unicode"✅ Tools contract deployed at:", address(toolsContract));
-        
-        // Step 5: Link core contract to tools
-        coreContract.setToolsContract(address(toolsContract));
-        console2.log(unicode"✅ Contracts linked successfully");
+        // Tools functionality is now integrated - no separate deployment needed
+        result.toolsContract = address(coreContract); // Same address since integrated  
+        console2.log(unicode"✅ Tools functionality integrated in core contract");
         result.linked = true;
+        console2.log(unicode"✅ No separate linking needed - tools are integrated");
         
-        // Step 6: Verify the bidirectional connection
-        address coreFromTools = toolsContract.CORE_CONTRACT();
-        address toolsFromCore = address(coreContract.toolsContract());
-        
-        require(toolsFromCore == address(toolsContract), "Core->Tools link failed");
-        require(coreFromTools == address(coreContract), "Tools->Core link failed");
-        console2.log(unicode"✅ Bidirectional linking verified");
-        
-        // Step 7: Verify hook permissions
+        // Verify hook permissions
         Hooks.Permissions memory permissions = coreContract.getHookPermissions();
         require(permissions.beforeInitialize, "beforeInitialize not set");
         require(permissions.afterInitialize, "afterInitialize not set");
@@ -135,20 +118,18 @@ contract DeployUnified is Script {
         console2.log("Core contract size:", type(LimitOrderBatch).creationCode.length, "bytes");
         console2.log("Tools contract size:", type(LimitOrderBatchTools).creationCode.length, "bytes");
         console2.log("Total system size:", 
-            type(LimitOrderBatch).creationCode.length + type(LimitOrderBatchTools).creationCode.length, 
-            "bytes");
+            type(LimitOrderBatch).creationCode.length, 
+            "bytes (tools integrated)");
         
         console2.log("=== Integration Verification ===");
-        console2.log("Core -> Tools:", toolsFromCore);
-        console2.log("Tools -> Core:", coreFromTools);
+        console2.log("Tools: Integrated in core contract");
         console2.log("Hook Address Match:", address(coreContract) == hookAddress ? unicode"✅" : unicode"❌");
         console2.log("Permission Flags:", flags);
         
         console2.log("=== Deployment Summary ===");
-        console2.log(unicode"🎯 Core Contract (LimitOrderBatch):", address(coreContract));
-        console2.log(unicode"🔧 Tools Contract (LimitOrderBatchTools):", address(toolsContract));
+        console2.log(unicode"🎯 Core Contract (with integrated tools):", address(coreContract));
         console2.log(unicode"⚡ Hook Permissions:", flags);
-        console2.log(unicode"🔗 Integration Status: ACTIVE");
+        console2.log(unicode"🔗 Integration Status: ACTIVE (tools integrated)");
         console2.log(unicode"💰 Fee Recipient:", feeRecipient);
         console2.log(unicode"🏊 Pool Manager:", address(poolManager));
         
@@ -174,58 +155,31 @@ contract DeployUnified is Script {
         
         address feeRecipient = vm.envAddress("FEE_RECIPIENT_ADDRESS");
         
-        // Deploy core contract directly
+        // Deploy core contract directly with integrated tools
         LimitOrderBatch coreContract = new LimitOrderBatch(
             poolManager,
             feeRecipient,
-            msg.sender, // Owner address (the broadcaster)
-            address(0)  // No tools contract initially
+            msg.sender  // Owner address (the broadcaster)
         );
-        
-        // Deploy tools contract
-        LimitOrderBatchTools toolsContract = new LimitOrderBatchTools(
-            address(coreContract),
-            poolManager
-        );
-        
-        // Link them
-        coreContract.setToolsContract(address(toolsContract));
         
         result.coreContract = address(coreContract);
-        result.toolsContract = address(toolsContract);
+        result.toolsContract = address(coreContract); // Same as core since integrated
         result.linked = true;
         result.hookFlags = BEFORE_INITIALIZE_FLAG | AFTER_INITIALIZE_FLAG | BEFORE_SWAP_FLAG | AFTER_SWAP_FLAG;
         
-        console2.log("Core Contract:", address(coreContract));
-        console2.log("Tools Contract:", address(toolsContract));
+        console2.log("Core Contract (with integrated tools):", address(coreContract));
+        console2.log("Tools: Integrated");
         console2.log("Linked:", result.linked);
         
         vm.stopBroadcast();
         return result;
     }
     
-    // Link existing contracts (if deployed separately)
+    // Link function no longer needed - tools are integrated in core contract
     function linkExistingContracts(address coreAddress, address toolsAddress) external {
-        vm.startBroadcast();
-        
-        console2.log("=== Linking Existing Contracts ===");
-        console2.log("Core Contract:", coreAddress);
-        console2.log("Tools Contract:", toolsAddress);
-        
-        require(coreAddress != address(0) && toolsAddress != address(0), "Invalid addresses");
-        require(coreAddress.code.length > 0 && toolsAddress.code.length > 0, "Contracts not deployed");
-        
-        LimitOrderBatch coreContract = LimitOrderBatch(payable(coreAddress));
-        LimitOrderBatchTools toolsContract = LimitOrderBatchTools(toolsAddress);
-        
-        // Verify tools contract points to core
-        require(toolsContract.CORE_CONTRACT() == coreAddress, "Tools contract not linked to core");
-        
-        // Link core to tools
-        coreContract.setToolsContract(toolsAddress);
-        
-        console2.log(unicode"✅ Contracts linked successfully");
-        
-        vm.stopBroadcast();
+        console2.log("=== Linking Not Required ===");
+        console2.log("INFO: Tools are now integrated in core contract - no separate linking needed");
+        console2.log("Core contract address:", coreAddress);
+        console2.log("Tools: Integrated");
     }
 }

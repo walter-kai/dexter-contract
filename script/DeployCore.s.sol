@@ -82,8 +82,7 @@ contract DeployCore is Script {
         LimitOrderBatch deployedContract = new LimitOrderBatch{salt: salt}(
             poolManager,
             feeRecipient,
-            msg.sender, // Owner address (the broadcaster)
-            address(0)  // Tools contract will be set later
+            msg.sender  // Owner address (the broadcaster)
         );
         
         require(address(deployedContract) == hookAddress, "Address mismatch!");
@@ -104,7 +103,7 @@ contract DeployCore is Script {
         console2.log("Address:", address(deployedContract));
         console2.log("Owner:", deployedContract.owner());
         console2.log("Fee Recipient:", deployedContract.FEE_RECIPIENT());
-        console2.log("Tools Contract:", address(deployedContract.toolsContract()));
+        console2.log("Tools: Integrated");
         console2.log("Contract Size:", type(LimitOrderBatch).creationCode.length, "bytes");
         
         vm.stopBroadcast();
@@ -132,8 +131,7 @@ contract DeployCore is Script {
         LimitOrderBatch coreContract = new LimitOrderBatch(
             poolManager,
             feeRecipient,
-            msg.sender, // Owner address (the broadcaster)
-            address(0)  // No tools contract
+            msg.sender  // Owner address (the broadcaster)
         );
         
         console2.log("Core Contract:", address(coreContract));

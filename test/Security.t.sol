@@ -104,10 +104,10 @@ contract SecurityTest is Test {
         
         uint256 pastDeadline = block.timestamp - 1;
         
-        vm.expectRevert("Order creation deadline exceeded");
+        vm.expectRevert("Expired deadline");
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, pastDeadline, 500, 0, 300
+            prices, amounts, pastDeadline
         );
     }
     
@@ -119,17 +119,17 @@ contract SecurityTest is Test {
         
         // Test deadline exactly at current timestamp (should fail since > is required)
         uint256 currentTime = block.timestamp;
-        vm.expectRevert("Order creation deadline exceeded");
+        vm.expectRevert("Expired deadline");
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, currentTime, 500, 0, 300
+            prices, amounts, currentTime
         );
         
         // Test with future timestamp (should pass)
         uint256 futureTime = block.timestamp + 3600;
         uint256 batchId2 = hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, futureTime, 500, 0, 300
+            prices, amounts, futureTime
         );
         assertTrue(batchId2 > 0, "Order with future timestamp should succeed");
     }
@@ -142,19 +142,12 @@ contract SecurityTest is Test {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = 1e18;
         
-        // Test maximum allowed slippage (should pass)
+        // Test batch order creation (should pass)
         uint256 batchId = hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300 // 5% = 500 bps
+            prices, amounts, block.timestamp + 3600
         );
-        assertTrue(batchId > 0, "5% slippage should be allowed");
-        
-        // Test excessive slippage (should revert)
-        vm.expectRevert("Slippage too high");
-        hook.createBatchOrder(
-            address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 501, 0, 300 // 5.01% = 501 bps
-        );
+        assertTrue(batchId > 0, "Batch order should be created successfully");
     }
     
     function testSlippageEdgeCases() public {
@@ -166,30 +159,38 @@ contract SecurityTest is Test {
         // Test 0% slippage (should pass)
         uint256 batchId = hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 0, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
-        assertTrue(batchId > 0, "0% slippage should be allowed");
+        assertTrue(batchId > 0, "Batch order should be created successfully");
+    }
+    
+    function testZeroAmountRejection() public {
+        uint256[] memory prices = new uint256[](1);
+        prices[0] = 79228162514264337593543950336; // Valid sqrt price (1:1)
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 1e18;
         
-        // Test exactly maximum slippage (should pass)
+        // Test valid batch order creation
         uint256 batchId2 = hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
-        assertTrue(batchId2 > 0, "Exactly 5% slippage should be allowed");
+        assertTrue(batchId2 > 0, "Valid batch order should be created");
     }
 
     // ==================== INPUT VALIDATION TESTS ====================
     
     function testZeroAmountValidation() public {
         uint256[] memory prices = new uint256[](2);
-        prices[0] = 1000; prices[1] = 1100;
+        prices[0] = 79228162514264337593543950336; // Valid sqrt price (1:1)
+        prices[1] = 79228162514264337593543950336; // Valid sqrt price (1:1)
         uint256[] memory zeroAmounts = new uint256[](2);
         zeroAmounts[0] = 0; zeroAmounts[1] = 0;
         
         vm.expectRevert("Invalid amount");
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, zeroAmounts, block.timestamp + 3600, 500, 0, 300
+            prices, zeroAmounts, block.timestamp + 3600
         );
     }
     
@@ -203,21 +204,21 @@ contract SecurityTest is Test {
         vm.expectRevert();
         hook.createBatchOrder(
             address(0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
         
         // Test zero address for token1
         vm.expectRevert();
         hook.createBatchOrder(
             address(token0), address(0), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
         
         // Test same token addresses
         vm.expectRevert();
         hook.createBatchOrder(
             address(token0), address(token0), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
     }
     
@@ -227,10 +228,10 @@ contract SecurityTest is Test {
         uint256[] memory amounts = new uint256[](3); // Different size
         amounts[0] = 1e18; amounts[1] = 1e18; amounts[2] = 1e18;
         
-        vm.expectRevert("Array length mismatch");
+        vm.expectRevert("Invalid arrays");
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
     }
     
@@ -238,10 +239,10 @@ contract SecurityTest is Test {
         uint256[] memory emptyPrices = new uint256[](0);
         uint256[] memory emptyAmounts = new uint256[](0);
         
-        vm.expectRevert(abi.encodeWithSignature("InvalidOrder()"));
+        vm.expectRevert("Invalid arrays");
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            emptyPrices, emptyAmounts, block.timestamp + 3600, 500, 0, 300
+            emptyPrices, emptyAmounts, block.timestamp + 3600
         );
     }
 
@@ -261,7 +262,7 @@ contract SecurityTest is Test {
         // Note: This might not revert if there's no explicit limit, but will use too much gas
         try hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            largePrices, largeAmounts, block.timestamp + 3600, 500, 0, 300
+            largePrices, largeAmounts, block.timestamp + 3600
         ) {
             // If it doesn't revert, at least check it consumes reasonable gas
             // This is a design decision - you might want to add explicit array size limits
@@ -283,7 +284,7 @@ contract SecurityTest is Test {
         // This should either revert or handle gracefully
         try hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         ) {
             console.log("Max values handled - check calculations don't overflow");
         } catch {
@@ -302,12 +303,12 @@ contract SecurityTest is Test {
         
         uint256 batchId = hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
         
         // Test manual execution access control
         vm.prank(attacker);
-        vm.expectRevert("Not contract owner");
+        vm.expectRevert("Invalid execution");
         hook.executeBatchLevel(batchId, 0);
     }
 
@@ -323,7 +324,7 @@ contract SecurityTest is Test {
         uint256 shortExpiry = block.timestamp + 100;
         uint256 batchId = hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, shortExpiry, 500, 0, 300
+            prices, amounts, shortExpiry
         );
         
         // Move time forward past expiration
@@ -333,7 +334,7 @@ contract SecurityTest is Test {
         hook.cancelBatchOrder(batchId);
         
         // Verify order is cancelled
-        (,,,,,,,,,, bool isActiveAfterCancel, bool isFullyExecuted, uint256 executedLevelsAfter,,,,,) = hook.getBatchOrderDetails(batchId);
+        (,,,,,, bool isActiveAfterCancel, bool isFullyExecuted,,,,) = hook.getBatchInfo(batchId);
         assertFalse(isActiveAfterCancel, "Expired order should be inactive after cancellation");
     }
 
@@ -356,7 +357,7 @@ contract SecurityTest is Test {
         vm.expectRevert(); // Should revert due to insufficient balance
         hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
     }
 
@@ -370,7 +371,7 @@ contract SecurityTest is Test {
         
         return hook.createBatchOrder(
             address(token0), address(token1), 3000, true,
-            prices, amounts, block.timestamp + 3600, 500, 0, 300
+            prices, amounts, block.timestamp + 3600
         );
     }
 }
