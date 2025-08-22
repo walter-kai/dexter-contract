@@ -10,8 +10,9 @@ import "../src/LimitOrderBatch.sol";
 
 /**
  * @title DeployCore
- * @notice Deployment script for the core LimitOrderBatch contract only
+ * @notice Deployment script for the integrated LimitOrderBatch contract
  * @dev Uses hook mining to deploy at the correct address with proper permissions
+ *      Now includes integrated tools functionality (best execution, analytics, metrics)
  */
 contract DeployCore is Script {
     
@@ -31,7 +32,7 @@ contract DeployCore is Script {
     function run() external returns (address coreContract) {
         vm.startBroadcast();
         
-        console2.log("=== Deploying Dexter Core Contract ===");
+        console2.log("=== Deploying Dexter Integrated Contract ===");
         
         // Get the correct PoolManager address based on the chain
         IPoolManager poolManager;
@@ -55,12 +56,11 @@ contract DeployCore is Script {
         // Calculate hook flags
         uint160 flags = BEFORE_INITIALIZE_FLAG | AFTER_INITIALIZE_FLAG | BEFORE_SWAP_FLAG | AFTER_SWAP_FLAG;
         
-        // Prepare constructor arguments (tools contract = address(0) initially)
+        // Prepare constructor arguments for integrated contract (3 parameters)
         bytes memory constructorArgs = abi.encode(
             address(poolManager), 
             feeRecipient,
-            msg.sender, // Owner address (the broadcaster)
-            address(0)  // No tools contract initially
+            msg.sender  // Owner address (the broadcaster)
         );
         
         console2.log("Required flags:", flags);
@@ -87,8 +87,8 @@ contract DeployCore is Script {
         
         require(address(deployedContract) == hookAddress, "Address mismatch!");
         
-        console2.log(unicode"✅ Core contract deployed at:", address(deployedContract));
-        console2.log(unicode"✅ Ready for tools contract integration");
+        console2.log(unicode"✅ Integrated contract deployed at:", address(deployedContract));
+        console2.log(unicode"✅ Tools functionality integrated");
         
         // Verify hook permissions
         Hooks.Permissions memory permissions = deployedContract.getHookPermissions();
@@ -99,11 +99,11 @@ contract DeployCore is Script {
         console2.log(unicode"✅ Hook permissions verified");
         
         // Display contract info
-        console2.log("=== Core Contract Info ===");
+        console2.log("=== Integrated Contract Info ===");
         console2.log("Address:", address(deployedContract));
         console2.log("Owner:", deployedContract.owner());
         console2.log("Fee Recipient:", deployedContract.FEE_RECIPIENT());
-        console2.log("Tools: Integrated");
+        console2.log("Tools: Integrated (Best Execution, Analytics, Metrics)");
         console2.log("Contract Size:", type(LimitOrderBatch).creationCode.length, "bytes");
         
         vm.stopBroadcast();
@@ -114,7 +114,7 @@ contract DeployCore is Script {
     function deploySimple() external returns (address) {
         vm.startBroadcast();
         
-        console2.log("=== Simple Core Deployment (No Hook Mining) ===");
+        console2.log("=== Simple Integrated Deployment (No Hook Mining) ===");
         
         // Get PoolManager and fee recipient
         IPoolManager poolManager;
@@ -128,15 +128,15 @@ contract DeployCore is Script {
         
         address feeRecipient = vm.envAddress("FEE_RECIPIENT_ADDRESS");
         
-        LimitOrderBatch coreContract = new LimitOrderBatch(
+        LimitOrderBatch integratedContract = new LimitOrderBatch(
             poolManager,
             feeRecipient,
             msg.sender  // Owner address (the broadcaster)
         );
         
-        console2.log("Core Contract:", address(coreContract));
+        console2.log("Integrated Contract:", address(integratedContract));
         
         vm.stopBroadcast();
-        return address(coreContract);
+        return address(integratedContract);
     }
 }
