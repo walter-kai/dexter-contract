@@ -15,7 +15,7 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
 
-import "../src/testing/LimitOrderBatchDev.sol";
+import "../src/GasPriceFeesHook.sol";
 import "./mocks/MockContracts.sol";
 
 contract DynamicFeesTest is Test {
@@ -23,10 +23,10 @@ contract DynamicFeesTest is Test {
     using CurrencyLibrary for Currency;
     using LPFeeLibrary for uint24;
 
-    // Event declarations - must match the ones in LimitOrderBatch.sol
+    // Event declarations - must match the ones in GasPriceFeesHook.sol
     event GasPriceTracked(uint128 gasPrice, uint128 averageGasPrice, uint104 count);
 
-    LimitOrderBatchDev hook;
+    GasPriceFeesHook hook;
     MockPoolManager poolManager;
     MockERC20 token0;
     MockERC20 token1;
@@ -50,7 +50,6 @@ contract DynamicFeesTest is Test {
         // Deploy the hook to an address with the correct flags for dynamic fees
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | 
-            Hooks.AFTER_INITIALIZE_FLAG | 
             Hooks.BEFORE_SWAP_FLAG |
             Hooks.AFTER_SWAP_FLAG
         );
@@ -58,11 +57,11 @@ contract DynamicFeesTest is Test {
         (address hookAddress, bytes32 salt) = HookMiner.find(
             address(this),
             flags,
-            type(LimitOrderBatchDev).creationCode,
-            abi.encode(address(poolManager), feeRecipient)
+            type(GasPriceFeesHook).creationCode,
+            abi.encode(address(poolManager))
         );
         
-        hook = new LimitOrderBatchDev{salt: salt}(IPoolManager(address(poolManager)), feeRecipient);
+        hook = new GasPriceFeesHook{salt: salt}(IPoolManager(address(poolManager)));
         require(address(hook) == hookAddress, "DynamicFeesTest: hook address mismatch");
 
         // Create the pool key with dynamic fees
@@ -93,10 +92,10 @@ contract DynamicFeesTest is Test {
 
     function testDynamicFeeBaseline() public {
         // Test the base fee when there's no gas price history
-        uint24 baseFee = hook.BASE_FEE();
+        uint24 baseFee = hook.getBaseFee();
         
-        // Should return the base fee (3000 = 0.3%)
-        assertEq(baseFee, 3000, "Base fee should be 3000 (0.3%)");
+        // Should return the base fee (5000 = 0.5%)
+        assertEq(baseFee, 5000, "Base fee should be 5000 (0.5%)");
         
         console.log("Base dynamic fee:", baseFee);
     }
@@ -105,42 +104,48 @@ contract DynamicFeesTest is Test {
         // Set normal gas price and trigger fee calculation
         vm.txGasPrice(NORMAL_GAS_PRICE);
         
-        // Place an order to trigger gas price tracking
-        int24 tick = 120;
-        uint256 amount = 10e18;
-        bool zeroForOne = true;
-
-        uint256 batchOrderId = hook.createBatchOrder(key, tick, amount, zeroForOne);
-        assertTrue(batchOrderId > 0, "Batch order should be created");
+        // Trigger gas price tracking via afterSwap
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
 
         // Check the dynamic fee after gas price tracking
-        uint24 normalGasFee = hook.BASE_FEE();
+        uint24 normalGasFee = hook.getCurrentFee();
         
         // Should still be base fee since it's the first transaction
-        assertEq(normalGasFee, 3000, "Fee should be base fee for first transaction");
+        assertEq(normalGasFee, 5000, "Fee should be base fee for first transaction");
         
         console.log("Normal gas fee:", normalGasFee);
-        console.log("Count:", count);
     }
 
     function testDynamicFeeWithHighGasPrice() public {
         // First establish a baseline with normal gas price
         vm.txGasPrice(NORMAL_GAS_PRICE);
         
-        // Create first order to establish baseline
-        hook.createBatchOrder(key, 120, 5e18, true);
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
+        // Create first swap to establish baseline
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
         // Now use high gas price
         vm.txGasPrice(HIGH_GAS_PRICE);
         
-        // Create another order to trigger high gas fee calculation
-        hook.createBatchOrder(key, 180, 5e18, true);
+        // Create another swap to trigger high gas fee calculation
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
         // Check the dynamic fee - should be lower when gas price is high
-        uint24 highGasFee = hook.BASE_FEE();
+        uint24 highGasFee = hook.getCurrentFee();
         
-        // When gas price > 1.1 * average, fee should be halved (1500 = 0.15%)
-        assertEq(highGasFee, 1500, "Fee should be halved for high gas price");
+        // When gas price > 1.1 * average, fee should be halved (2500 = 0.25%)
+        assertEq(highGasFee, 2500, "Fee should be halved for high gas price");
         
         // Check gas price stats
         (uint128 currentGasPrice, uint128 averageGasPrice, uint104 count) = hook.getGasPriceStats();
@@ -161,20 +166,26 @@ contract DynamicFeesTest is Test {
         // First establish a baseline with normal gas price
         vm.txGasPrice(NORMAL_GAS_PRICE);
         
-        // Create first order to establish baseline
-        hook.createBatchOrder(key, 120, 5e18, true);
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
+        // Create first swap to establish baseline
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
         // Now use low gas price
         vm.txGasPrice(LOW_GAS_PRICE);
         
-        // Create another order to trigger low gas fee calculation
-        hook.createBatchOrder(key, 240, 5e18, true);
+        // Create another swap to trigger low gas fee calculation
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
         // Check the dynamic fee - should be higher when gas price is low
-        uint24 lowGasFee = hook.BASE_FEE();
+        uint24 lowGasFee = hook.getCurrentFee();
         
-        // When gas price < 0.9 * average, fee should be doubled (6000 = 0.6%)
-        assertEq(lowGasFee, 6000, "Fee should be doubled for low gas price");
+        // When gas price < 0.9 * average, fee should be doubled (10000 = 1.0%)
+        assertEq(lowGasFee, 10000, "Fee should be doubled for low gas price");
         
         // Check gas price stats
         (uint128 currentGasPrice, uint128 averageGasPrice, uint104 count) = hook.getGasPriceStats();
@@ -199,13 +210,19 @@ contract DynamicFeesTest is Test {
         testGasPrices[3] = 60 gwei;  // High
         testGasPrices[4] = 120 gwei; // Very high
         
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
         for (uint256 i = 0; i < 5; i++) {
             vm.txGasPrice(testGasPrices[i]);
             
-            // Create order to update gas price tracking
-            hook.createBatchOrder(key, int24(120 + int24(int256(i * 60))), 1e18, true);
+            // Create swap to update gas price tracking
+            hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
             
-            fees[i] = hook.BASE_FEE();
+            fees[i] = hook.getCurrentFee();
             gasPrices[i] = testGasPrices[i];
             
             console.log("Gas Price:", gasPrices[i]);
@@ -229,20 +246,19 @@ contract DynamicFeesTest is Test {
     function testBeforeSwapDynamicFeeCalculation() public {
         // First, establish a baseline with normal gas price
         vm.txGasPrice(NORMAL_GAS_PRICE);
-        hook.createBatchOrder(key, 120, 5e18, true);
         
-        // Now set high gas price for the beforeSwap call
-        vm.txGasPrice(HIGH_GAS_PRICE);
-        
-        // Test beforeSwap hook which should calculate dynamic fee based on current vs average gas price
         SwapParams memory params = SwapParams({
             zeroForOne: true,
             amountSpecified: 1e18,
             sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
         });
         
-        // Mock a beforeSwap call
-        // This would typically be called by the pool manager
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+        
+        // Now set high gas price for the beforeSwap call
+        vm.txGasPrice(HIGH_GAS_PRICE);
+        
+        // Test beforeSwap hook which should calculate dynamic fee based on current vs average gas price
         (bytes4 selector, , uint24 feeOverride) = hook.testBeforeSwap(
             address(this),
             key,
@@ -261,7 +277,7 @@ contract DynamicFeesTest is Test {
         
         // Should be the halved fee for high gas price (HIGH_GAS_PRICE > NORMAL_GAS_PRICE * 1.1)
         // 100 gwei > 30 gwei * 1.1 = 100 > 33, which is true
-        assertEq(actualFee, 1500, "BeforeSwap should return halved fee for high gas price");
+        assertEq(actualFee, 2500, "BeforeSwap should return halved fee for high gas price");
         
         console.log("BeforeSwap fee override:", feeOverride);
         console.log("Actual fee (without flag):", actualFee);
@@ -320,11 +336,17 @@ contract DynamicFeesTest is Test {
         testPrices[2] = 40 gwei;
         testPrices[3] = 50 gwei;
         
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
         for (uint256 i = 0; i < 4; i++) {
             vm.txGasPrice(testPrices[i]);
             
-            // Create order to trigger gas price tracking
-            hook.createBatchOrder(key, int24(120 + int24(int256(i * 60))), 1e18, true);
+            // Create swap to trigger gas price tracking
+            hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
             
             (uint128 current, uint128 average, uint104 count) = hook.getGasPriceStats();
             
@@ -366,7 +388,13 @@ contract DynamicFeesTest is Test {
         vm.txGasPrice(HIGH_GAS_PRICE);
         
         // First establish baseline
-        hook.createBatchOrder(key, 120, 1e18, true);
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
         // Get logs
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -399,24 +427,30 @@ contract DynamicFeesTest is Test {
     }
 
     function testDynamicFeeEdgeCases() public {
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
         // Test with zero gas price (should handle gracefully)
         vm.txGasPrice(0);
-        hook.createBatchOrder(key, 120, 1e18, true);
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
-        uint24 zeroGasFee = hook.BASE_FEE();
-        assertEq(zeroGasFee, 3000, "Should return base fee for zero gas price");
+        uint24 zeroGasFee = hook.getCurrentFee();
+        assertEq(zeroGasFee, 5000, "Should return base fee for zero gas price");
         
         // Test with extremely high gas price
         vm.txGasPrice(1000 gwei);
-        hook.createBatchOrder(key, 180, 1e18, true);
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
-        uint24 extremeGasFee = hook.BASE_FEE();
-        assertEq(extremeGasFee, 1500, "Should return halved fee for extreme gas price");
+        uint24 extremeGasFee = hook.getCurrentFee();
+        assertEq(extremeGasFee, 2500, "Should return halved fee for extreme gas price");
         
         // Test after many transactions to check moving average stability
         for (uint256 i = 0; i < 10; i++) {
             vm.txGasPrice(30 gwei + uint128(i * 5 gwei)); // Gradually increasing gas prices
-            hook.createBatchOrder(key, int24(240 + int24(int256(i * 60))), 1e18, true);
+            hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         }
         
         (uint128 finalCurrent, uint128 finalAverage, uint104 finalCount) = hook.getGasPriceStats();
@@ -432,19 +466,25 @@ contract DynamicFeesTest is Test {
         // Test that the same gas price conditions produce the same fees
         uint128 testGasPrice = 50 gwei;
         
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        
         // Set gas price and create baseline
         vm.txGasPrice(30 gwei);
-        hook.createBatchOrder(key, 120, 1e18, true);
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
         
         // Now test with our target gas price
         vm.txGasPrice(testGasPrice);
-        hook.createBatchOrder(key, 180, 1e18, true);
-        uint24 fee1 = hook.BASE_FEE();
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+        uint24 fee1 = hook.getCurrentFee();
         
         // Reset to same conditions and test again
         vm.txGasPrice(testGasPrice);
-        hook.createBatchOrder(key, 240, 1e18, true);
-        uint24 fee2 = hook.BASE_FEE();
+        hook.testAfterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+        uint24 fee2 = hook.getCurrentFee();
         
         // Fees should be consistent for similar gas price conditions
         // (They might not be exactly equal due to moving average, but should be close)

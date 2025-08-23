@@ -13,6 +13,9 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 contract GasPriceFeesHook is BaseHook {
     using LPFeeLibrary for uint24;
 
+    // Events
+    event GasPriceTracked(uint128 gasPrice, uint128 averageGasPrice, uint104 count);
+
     // Keeping track of the moving average gas price
     uint128 public movingAverageGasPrice;
     // How many times has the moving average been updated?
@@ -26,7 +29,7 @@ contract GasPriceFeesHook is BaseHook {
 
     // Initialize BaseHook parent contract in the constructor
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {
-        updateMovingAverage();
+        // Don't call updateMovingAverage() in constructor to keep initial count at 0
     }
 
     // Required override function for BaseHook to let the PoolManager know which hooks are implemented
@@ -97,6 +100,11 @@ contract GasPriceFeesHook is BaseHook {
     function getFee() internal view returns (uint24) {
         uint128 gasPrice = uint128(tx.gasprice);
 
+        // If no transactions have been tracked yet, return base fee
+        if (movingAverageGasPriceCount == 0) {
+            return BASE_FEE;
+        }
+
         // if gasPrice > movingAverageGasPrice * 1.1, then half the fees
         if (gasPrice > (movingAverageGasPrice * 11) / 10) {
             return BASE_FEE / 2;
@@ -120,5 +128,42 @@ contract GasPriceFeesHook is BaseHook {
             (movingAverageGasPriceCount + 1);
 
         movingAverageGasPriceCount++;
+        
+        // Emit event for tracking
+        emit GasPriceTracked(gasPrice, movingAverageGasPrice, movingAverageGasPriceCount);
+    }
+
+    // Public getter functions for testing
+    function getGasPriceStats() external view returns (uint128 currentGasPrice, uint128 averageGasPrice, uint104 count) {
+        return (uint128(tx.gasprice), movingAverageGasPrice, movingAverageGasPriceCount);
+    }
+
+    function getBaseFee() external pure returns (uint24) {
+        return BASE_FEE;
+    }
+
+    // Test helper functions to expose internal functionality
+    function testBeforeSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata hookData
+    ) external view returns (bytes4 selector, BeforeSwapDelta delta, uint24 feeOverride) {
+        return _beforeSwap(sender, key, params, hookData);
+    }
+
+    function testAfterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) external returns (bytes4 selector, int128 hookDelta) {
+        return _afterSwap(sender, key, params, delta, hookData);
+    }
+
+    // Helper function to get current fee without affecting state
+    function getCurrentFee() external view returns (uint24) {
+        return getFee();
     }
 }

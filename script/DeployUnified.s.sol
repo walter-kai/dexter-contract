@@ -7,7 +7,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import "../src/LimitOrderBatch.sol";
-import "../src/LimitOrderBatchTools.sol";
+// import "../src/LimitOrderBatchTools.sol"; // TODO: File not found - commented out for now
 
 /**
  * @title DeployUnified
@@ -116,7 +116,7 @@ contract DeployUnified is Script {
         // Step 8: Display contract sizes and deployment summary
         console2.log("=== Contract Analysis ===");
         console2.log("Core contract size:", type(LimitOrderBatch).creationCode.length, "bytes");
-        console2.log("Tools contract size:", type(LimitOrderBatchTools).creationCode.length, "bytes");
+        // console2.log("Tools contract size:", type(LimitOrderBatchTools).creationCode.length, "bytes"); // TODO: Tools not available
         console2.log("Total system size:", 
             type(LimitOrderBatch).creationCode.length, 
             "bytes (tools integrated)");
