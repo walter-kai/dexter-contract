@@ -703,14 +703,25 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         bool isActive, bool isFullyExecuted
     ) {
         BatchInfo storage batch = batchOrders[batchId];
+        
+        // Get target ticks and amounts from storage
+        int24[] memory targetTicks = batchTargetTicks[batchId];
+        uint256[] memory amounts = batchTargetAmounts[batchId];
+        
+        // Convert ticks back to sqrt prices
+        uint256[] memory prices = new uint256[](targetTicks.length);
+        for (uint256 i = 0; i < targetTicks.length; i++) {
+            prices[i] = TickMath.getSqrtPriceAtTick(targetTicks[i]);
+        }
+        
         return (
             batch.user,
             Currency.unwrap(batch.poolKey.currency0),
             Currency.unwrap(batch.poolKey.currency1),
             uint256(batch.totalAmount),
             uint256(batch.totalAmount) - claimTokensSupply[batchId],
-            new uint256[](0), // Empty arrays for compatibility
-            new uint256[](0),
+            prices, // Return actual target prices
+            amounts, // Return actual target amounts
             batch.isActive,
             claimTokensSupply[batchId] == 0
         );
