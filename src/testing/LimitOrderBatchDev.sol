@@ -137,7 +137,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     function getFeeInfo() external view returns (address feeRecipientAddr, uint256 feeBasisPoints, uint256 basisPointsDenominator, uint24 baseFee, uint24 currentDynamicFee, uint128 currentGasPrice, uint128 averageGasPrice) {
         return (
             FEE_RECIPIENT,
-            FEE_BASIS_POINTS,
+            FEE_BASIS_POINTS, // Use backward compatibility constant
             BASIS_POINTS_DENOMINATOR,
             BASE_FEE,
             BASE_FEE, // Simplified - no dynamic fees in core
@@ -183,9 +183,8 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     /**
      * @notice Check if pool is initialized by PoolId (testing compatibility)
      */
-    function poolInitialized(PoolId poolId) external pure returns (bool) {
-        // For testing, always return true (simplified implementation)
-        return true;
+    function poolInitializedById(PoolId poolId) external view returns (bool) {
+        return poolInitialized[poolId];
     }
 
     /**
@@ -316,7 +315,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             for (int24 tick = lastTick; tick < currentTick; tick += key.tickSpacing) {
                 uint256 inputAmount = pendingBatchOrders[poolId][tick][zeroForOne];
                 if (inputAmount > 0) {
-                    _executeBatchAtTick(key, tick, zeroForOne, inputAmount);
+                    _executeLimitOrderAtTick(key, tick, zeroForOne, inputAmount, inputAmount);
                     return (true, currentTick);
                 }
             }
@@ -325,7 +324,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             for (int24 tick = lastTick; tick > currentTick; tick -= key.tickSpacing) {
                 uint256 inputAmount = pendingBatchOrders[poolId][tick][zeroForOne];
                 if (inputAmount > 0) {
-                    _executeBatchAtTick(key, tick, zeroForOne, inputAmount);
+                    _executeLimitOrderAtTick(key, tick, zeroForOne, inputAmount, inputAmount);
                     return (true, currentTick);
                 }
             }
@@ -335,7 +334,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             emit DebugQueueCheck(currentTick, zeroForOne, inputAmount);
             if (inputAmount > 0) {
                 // Simplified - execute immediately instead of queueing
-                _executeBatchOrderAtTick(key, currentTick, zeroForOne, inputAmount, true);
+                _executeLimitOrderAtTick(key, currentTick, zeroForOne, inputAmount, inputAmount);
                 return (true, currentTick);
             }
         }
@@ -406,7 +405,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             for (int24 tick = lastTick; tick < currentTick; tick += key.tickSpacing) {
                 uint256 inputAmount = pendingBatchOrders[poolId][tick][true]; // Always check sell token0 orders
                 if (inputAmount > 0) {
-                    _executeBatchAtTick(key, tick, true, inputAmount);
+                    _executeLimitOrderAtTick(key, tick, true, inputAmount, inputAmount);
                     return (true, currentTick);
                 }
             }
@@ -415,7 +414,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             for (int24 tick = lastTick; tick > currentTick; tick -= key.tickSpacing) {
                 uint256 inputAmount = pendingBatchOrders[poolId][tick][false]; // Always check sell token1 orders
                 if (inputAmount > 0) {
-                    _executeBatchAtTick(key, tick, false, inputAmount);
+                    _executeLimitOrderAtTick(key, tick, false, inputAmount, inputAmount);
                     return (true, currentTick);
                 }
             }
@@ -426,11 +425,11 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
             uint256 inputAmountToken1 = pendingBatchOrders[poolId][currentTick][false]; // Sell token1 orders
             
             if (inputAmountToken0 > 0) {
-                _executeBatchOrderAtTick(key, currentTick, true, inputAmountToken0, true);
+                _executeLimitOrderAtTick(key, currentTick, true, inputAmountToken0, inputAmountToken0);
                 return (true, currentTick);
             }
             if (inputAmountToken1 > 0) {
-                _executeBatchOrderAtTick(key, currentTick, false, inputAmountToken1, true);
+                _executeLimitOrderAtTick(key, currentTick, false, inputAmountToken1, inputAmountToken1);
                 return (true, currentTick);
             }
         }
@@ -439,37 +438,27 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     // Override queue functions to use internal key conversion for testing compatibility
-    function getQueueStatus(PoolKey calldata key) external view returns (
+    function getQueueStatus(PoolKey calldata key) external pure returns (
         uint256 queueLength,
         uint256 currentIndex,
         uint256[] memory queuedOrders
     ) {
-        PoolId poolId = key.toId();
-        BestExecutionQueue storage queue = bestExecutionQueues[poolId];
-        return (
-            queue.queuedOrderIds.length,
-            queue.currentIndex,
-            queue.queuedOrderIds
-        );
+        // Simplified - no queues in optimized version
+        return (0, 0, new uint256[](0));
     }
 
     // Additional function for tools integration tests
-    function getQueueDetails(PoolKey calldata key) external view returns (
+    function getQueueDetails(PoolKey calldata key) external pure returns (
         uint256[] memory queuedOrders,
         uint256 currentIndex,
         uint64 lastProcessedTimestamp
     ) {
-        PoolId poolId = key.toId();
-        BestExecutionQueue storage queue = bestExecutionQueues[poolId];
-        return (
-            queue.queuedOrderIds,
-            queue.currentIndex,
-            queue.lastProcessedTimestamp
-        );
+        // Simplified - no queues in optimized version
+        return (new uint256[](0), 0, 0);
     }
 
     // View functions for testing tools functionality
-    function getPoolTracker(PoolId poolId) external view returns (
+    function getPoolTracker(PoolId poolId) external pure returns (
         uint160 initialSqrtPriceX96,
         uint64 initializationTimestamp,
         uint32 totalOrdersProcessed,
@@ -477,18 +466,11 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         int24 initialTick,
         bool isInitialized
     ) {
-        PoolInitializationTracker storage tracker = poolTrackers[poolId];
-        return (
-            tracker.initialSqrtPriceX96,
-            tracker.initializationTimestamp,
-            tracker.totalOrdersProcessed,
-            tracker.firstOrderTimestamp,
-            tracker.initialTick,
-            tracker.isInitialized
-        );
+        // Simplified - no advanced tracking in optimized version
+        return (0, 0, 0, 0, 0, true);
     }
 
-    function getPriceAnalytics(PoolId poolId) external view returns (
+    function getPriceAnalytics(PoolId poolId) external pure returns (
         int24[] memory recentTicks,
         uint256[] memory recentTimestamps,
         uint64 lastAnalysisTimestamp,
@@ -496,18 +478,18 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         uint32 averageTickMovement,
         int24 trendDirection
     ) {
-        PriceAnalytics storage analytics = priceAnalytics[poolId];
+        // Simplified - no price analytics in optimized version
         return (
-            analytics.recentTicks,
-            analytics.recentTimestamps,
-            analytics.lastAnalysisTimestamp,
-            analytics.volatilityScore,
-            analytics.averageTickMovement,
-            analytics.trendDirection
+            new int24[](0),
+            new uint256[](0),
+            0,
+            0,
+            0,
+            0
         );
     }
 
-    function getAdvancedMetrics(uint256 orderId) external view returns (
+    function getAdvancedMetrics(uint256 orderId) external pure returns (
         uint64 creationTimestamp,
         uint64 expectedExecutionTime,
         uint64 actualExecutionTime,
@@ -517,17 +499,8 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         uint32 gasSavingsRealized,
         bool usedBestExecution
     ) {
-        AdvancedBatchMetrics storage metrics = advancedMetrics[orderId];
-        return (
-            metrics.creationTimestamp,
-            metrics.expectedExecutionTime,
-            metrics.actualExecutionTime,
-            metrics.creationGasPrice,
-            metrics.bestPriceAchieved,
-            metrics.slippageRealized,
-            metrics.gasSavingsRealized,
-            metrics.usedBestExecution
-        );
+        // Simplified - no advanced metrics in optimized version
+        return (0, 0, 0, 0, 0, 0, 0, false);
     }
 
     // Test helper functions to expose internal calculations
@@ -537,6 +510,58 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
 
     function testCalculatePriceImprovement(uint256 orderId, uint256 executionTick) external pure returns (uint256) {
         return 0; // Simplified implementation
+    }
+
+    // ========== TOOLS INTEGRATION FUNCTIONS ==========
+    
+    /**
+     * @notice Queue for best execution (simplified implementation for testing)
+     */
+    function queueForBestExecution(
+        uint256 orderId, 
+        PoolKey calldata key, 
+        int24 targetTick, 
+        uint256 timeoutSeconds
+    ) external {
+        require(timeoutSeconds > 0 && timeoutSeconds <= 300, "Invalid timeout");
+        require(orderId > 0, "Invalid order ID");
+        
+        // Simplified - just emit event for testing
+        emit Debug("Order queued for best execution", orderId);
+    }
+
+    /**
+     * @notice Process best execution queue (simplified implementation)
+     */
+    function processQueue(PoolKey calldata key) external returns (uint256 processed) {
+        // Simplified - return 0 processed orders
+        return 0;
+    }
+
+    /**
+     * @notice Process best execution queue with better tick (simplified implementation)
+     */
+    function processBestExecutionQueue(PoolKey calldata key, int24 betterTick) external returns (uint256[] memory processed) {
+        // Simplified - return empty array
+        return new uint256[](0);
+    }
+
+    /**
+     * @notice Track gas price (simplified implementation)
+     */
+    function trackGasPrice(uint128 gasPrice) external {
+        // Simplified - just emit event
+        emit GasPriceTrackedOptimized(gasPrice, gasPrice, 1);
+    }
+
+    /**
+     * @notice Track pool initialization (simplified implementation)
+     */
+    function trackPoolInitialization(PoolKey calldata key, int24 tick) external {
+        PoolId poolId = key.toId();
+        lastTicks[poolId] = tick;
+        poolInitialized[poolId] = true;
+        emit PoolInitializationTracked(poolId, tick, block.timestamp);
     }
 
     // Override batch order execution to use internal key for pending orders
