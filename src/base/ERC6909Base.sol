@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {IERC6909Claims} from "@uniswap/v4-core/src/interfaces/external/IERC6909Claims.sol";
+import {IERC6909Claims} from "@uniswap/v4-core/interfaces/external/IERC6909Claims.sol";
 
 /**
  * @title ERC6909Base

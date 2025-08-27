@@ -18,7 +18,7 @@ import {StateLibrary} from "@uniswap/v4-core/libraries/StateLibrary.sol";
 import {SwapParams} from "@uniswap/v4-core/types/PoolOperation.sol";
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/libraries/Hooks.sol";
-import {FixedPointMathLib} from "@uniswap/v4-core/lib/solmate/src/utils/FixedPointMathLib.sol";
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/libraries/LPFeeLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/libraries/FullMath.sol";
 import {FixedPoint96} from "@uniswap/v4-core/libraries/FixedPoint96.sol";

@@ -3,17 +3,17 @@ pragma solidity ^0.8.20;
 
 import {LimitOrderBatch} from "../LimitOrderBatch.sol";
 import {ILimitOrderBatchTesting} from "../interfaces/ILimitOrderBatchTesting.sol";
-import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {FixedPointMathLib} from "@uniswap/v4-core/lib/solmate/src/utils/FixedPointMathLib.sol";
+import {PoolKey} from "@uniswap/v4-core/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/types/PoolId.sol";
+import {Currency} from "@uniswap/v4-core/types/Currency.sol";
+import {IHooks} from "@uniswap/v4-core/interfaces/IHooks.sol";
+import {SwapParams} from "@uniswap/v4-core/types/PoolOperation.sol";
+import {BalanceDelta} from "@uniswap/v4-core/types/BalanceDelta.sol";
+import {BeforeSwapDelta} from "@uniswap/v4-core/types/BeforeSwapDelta.sol";
+import {StateLibrary} from "@uniswap/v4-core/libraries/StateLibrary.sol";
+import {IPoolManager} from "@uniswap/v4-core/interfaces/IPoolManager.sol";
+import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
 // Interface for MockPoolManager (testing only)
 interface IMockPoolManager {

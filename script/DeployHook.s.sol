@@ -3,9 +3,9 @@ pragma solidity ^0.8.20;
 
 import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
-import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/interfaces/IPoolManager.sol";
+import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
+import {Hooks} from "@uniswap/v4-core/libraries/Hooks.sol";
 import "../src/LimitOrderBatch.sol";
 
 /**
