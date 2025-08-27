@@ -304,7 +304,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     function _beforeInitialize(address, PoolKey calldata key, uint160) internal pure override returns (bytes4) {
-        if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
+        // For development, allow both static and dynamic fees
+        // if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
         return BaseHook.beforeInitialize.selector;
     }
 

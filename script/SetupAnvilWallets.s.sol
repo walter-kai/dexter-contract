@@ -13,6 +13,7 @@ contract SetupAnvilWallets is Script {
     
     // Mainnet addresses
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address constant USDC_WHALE = 0x5414d89a8bF7E99d732BC52f3e6A3Ef461c0C078; // ~48M USDC
     
     // Default Anvil accounts
@@ -33,7 +34,7 @@ contract SetupAnvilWallets is Script {
         console2.log("=== Setting up Anvil Wallets with USDC ===");
         
         IERC20 usdc = IERC20(USDC);
-        uint256 fundAmount = 1_000_000 * 10**6; // 1M USDC per account
+        uint256 fundAmount = 100_000 * 10**6; // 100K USDC per account (safer amount)
         
         // Check whale balance
         uint256 whaleBalance = usdc.balanceOf(USDC_WHALE);
@@ -42,12 +43,14 @@ contract SetupAnvilWallets is Script {
         uint256 totalNeeded = fundAmount * anvilAccounts.length;
         require(whaleBalance >= totalNeeded, "Insufficient whale balance");
         
-        // Start whale impersonation and fund accounts
-        vm.startPrank(USDC_WHALE);
+        // Note: This script must be run with the whale's address
+        // Use: forge script script/SetupAnvilWallets.s.sol:SetupAnvilWallets --rpc-url http://localhost:8545 --broadcast --unlocked 0x5414d89a8bF7E99d732BC52f3e6A3Ef461c0C078
         
         for (uint256 i = 0; i < anvilAccounts.length; i++) {
             address account = anvilAccounts[i];
             
+            // Use vm.prank to execute transfer as whale
+            vm.prank(USDC_WHALE);
             bool success = usdc.transfer(account, fundAmount);
             require(success, string(abi.encodePacked("Transfer failed for account ", vm.toString(i))));
             
@@ -55,8 +58,9 @@ contract SetupAnvilWallets is Script {
             console2.log("Account funded with USDC balance:", balance / 10**6);
         }
         
-        vm.stopPrank();
-        
         console2.log(unicode"✅ All 10 Anvil accounts funded with 1M USDC each");
+        console2.log("");
+        console2.log("USDC_ADDRESS=", vm.toString(USDC));
+        console2.log("WETH_ADDRESS=", vm.toString(WETH));
     }
 }

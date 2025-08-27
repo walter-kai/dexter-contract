@@ -37,6 +37,11 @@ contract DeployHookContract is Script {
             Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
         
+        console2.log("Required flags:", flags);
+        
+        // CREATE2_DEPLOYER address for Foundry scripts
+        address CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        
         // Prepare constructor arguments
         bytes memory constructorArgs = abi.encode(
             address(poolManager),
@@ -44,27 +49,27 @@ contract DeployHookContract is Script {
             deployer
         );
         
-        console2.log("Required flags:", flags);
-        
-        // Use HookMiner to find valid hook address
+        // Mine a salt that will produce a hook address with the correct flags
         (address hookAddress, bytes32 salt) = HookMiner.find(
-            address(this),
+            CREATE2_DEPLOYER,
             flags,
             type(LimitOrderBatch).creationCode,
             constructorArgs
         );
         
-        console2.log("Found hook address:", hookAddress);
-        console2.log("Salt:", vm.toString(salt));
+        console2.log("Found valid hook address:", hookAddress);
+        console2.log("Using salt:", vm.toString(salt));
         
-        // Deploy with CREATE2 at the mined address
+        // Deploy the hook using CREATE2 with the mined salt
         LimitOrderBatch limitOrderBatch = new LimitOrderBatch{salt: salt}(
             poolManager,
             feeRecipient,
             deployer
         );
         
-        require(address(limitOrderBatch) == hookAddress, "Address mismatch!");
+        // Verify the deployed address matches the mined address
+        require(address(limitOrderBatch) == hookAddress, "Hook address mismatch!");
+        console2.log("Deployed hook address:", address(limitOrderBatch));
         
         vm.stopBroadcast();
         
