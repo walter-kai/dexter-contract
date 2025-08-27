@@ -333,7 +333,7 @@ contract MockPoolManager {
     }
 
     // Mock getLiquidity function - needed for pool validation
-    function getLiquidity(bytes32 /* poolId */) external view returns (uint128) {
+    function getLiquidity(bytes32 /* poolId */) external pure returns (uint128) {
         // Return a mock liquidity value for testing
         return 1000000e18; // 1M units of liquidity
     }
@@ -341,7 +341,7 @@ contract MockPoolManager {
     event Debug(string message, uint256 value);
 
     // Add any other functions needed for pool interaction
-    function initialize(PoolKey memory /* key */, uint160 /* sqrtPriceX96 */) external returns (int24 tick) {
+    function initialize(PoolKey memory /* key */, uint160 /* sqrtPriceX96 */) external pure returns (int24 tick) {
         // Mock implementation - just return a default tick
         return 0;
     }

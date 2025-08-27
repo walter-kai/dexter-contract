@@ -68,7 +68,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
         uint256 expirationTime,
-        uint256 bestPriceTimeout
+        uint256 /* bestPriceTimeout */
     ) external payable returns (uint256 batchId) {
         // Call the parent with simplified parameters
         return _createBatchOrderInternal(
@@ -190,7 +190,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     /**
      * @notice Get pool initialization block (testing compatibility)
      */
-    function poolInitializationBlock(PoolId poolId) external pure returns (uint256) {
+    function poolInitializationBlock(PoolId /* poolId */) external pure returns (uint256) {
         // For testing, return a constant value (simplified implementation)
         return 1;
     }
@@ -218,7 +218,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         PoolKey calldata key,
         SwapParams calldata params,
         bytes calldata hookData
-    ) external view returns (bytes4, BeforeSwapDelta, uint24) {
+    ) external pure returns (bytes4, BeforeSwapDelta, uint24) {
         return _beforeSwap(sender, key, params, hookData);
     }
 
@@ -391,7 +391,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     // Override the main batch order execution function to use internal key conversion
     function tryExecutingBatchOrders(
         PoolKey calldata key,
-        bool zeroForOne
+        bool /* zeroForOne */
     ) internal returns (bool tryMore, int24 newTick) {
         // Use key directly
         PoolId poolId = key.toId();
@@ -438,7 +438,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     // Override queue functions to use internal key conversion for testing compatibility
-    function getQueueStatus(PoolKey calldata key) external pure returns (
+    function getQueueStatus(PoolKey calldata /* key */) external pure returns (
         uint256 queueLength,
         uint256 currentIndex,
         uint256[] memory queuedOrders
@@ -448,7 +448,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     // Additional function for tools integration tests
-    function getQueueDetails(PoolKey calldata key) external pure returns (
+    function getQueueDetails(PoolKey calldata /* key */) external pure returns (
         uint256[] memory queuedOrders,
         uint256 currentIndex,
         uint64 lastProcessedTimestamp
@@ -458,7 +458,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     // View functions for testing tools functionality
-    function getPoolTracker(PoolId poolId) external pure returns (
+    function getPoolTracker(PoolId /* poolId */) external pure returns (
         uint160 initialSqrtPriceX96,
         uint64 initializationTimestamp,
         uint32 totalOrdersProcessed,
@@ -470,7 +470,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         return (0, 0, 0, 0, 0, true);
     }
 
-    function getPriceAnalytics(PoolId poolId) external pure returns (
+    function getPriceAnalytics(PoolId /* poolId */) external pure returns (
         int24[] memory recentTicks,
         uint256[] memory recentTimestamps,
         uint64 lastAnalysisTimestamp,
@@ -489,7 +489,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         );
     }
 
-    function getAdvancedMetrics(uint256 orderId) external pure returns (
+    function getAdvancedMetrics(uint256 /* orderId */) external pure returns (
         uint64 creationTimestamp,
         uint64 expectedExecutionTime,
         uint64 actualExecutionTime,
@@ -504,11 +504,11 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     }
 
     // Test helper functions to expose internal calculations
-    function testCalculateGasSavings(uint256 orderId, uint256 gasUsed) external pure returns (uint256) {
+    function testCalculateGasSavings(uint256 /* orderId */, uint256 gasUsed) external pure returns (uint256) {
         return gasUsed > 100000 ? gasUsed - 100000 : 0;
     }
 
-    function testCalculatePriceImprovement(uint256 orderId, uint256 executionTick) external pure returns (uint256) {
+    function testCalculatePriceImprovement(uint256 /* orderId */, uint256 /* executionTick */) external pure returns (uint256) {
         return 0; // Simplified implementation
     }
 
@@ -519,8 +519,8 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
      */
     function queueForBestExecution(
         uint256 orderId, 
-        PoolKey calldata key, 
-        int24 targetTick, 
+        PoolKey calldata /* key */, 
+        int24 /* targetTick */, 
         uint256 timeoutSeconds
     ) external {
         require(timeoutSeconds > 0 && timeoutSeconds <= 300, "Invalid timeout");
@@ -533,7 +533,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     /**
      * @notice Process best execution queue (simplified implementation)
      */
-    function processQueue(PoolKey calldata key) external returns (uint256 processed) {
+    function processQueue(PoolKey calldata /* key */) external pure returns (uint256 processed) {
         // Simplified - return 0 processed orders
         return 0;
     }
@@ -541,7 +541,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     /**
      * @notice Process best execution queue with better tick (simplified implementation)
      */
-    function processBestExecutionQueue(PoolKey calldata key, int24 betterTick) external returns (uint256[] memory processed) {
+    function processBestExecutionQueue(PoolKey calldata /* key */, int24 /* betterTick */) external pure returns (uint256[] memory processed) {
         // Simplified - return empty array
         return new uint256[](0);
     }

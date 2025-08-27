@@ -303,7 +303,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         });
     }
 
-    function _beforeInitialize(address, PoolKey calldata key, uint160) internal pure override returns (bytes4) {
+    function _beforeInitialize(address /* sender */, PoolKey calldata /* key */, uint160 /* sqrtPriceX96 */) internal pure override returns (bytes4) {
         // For development, allow both static and dynamic fees
         // if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
         return BaseHook.beforeInitialize.selector;
@@ -475,8 +475,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     function _processOrdersWithDelta(
         PoolKey calldata key,
-        SwapParams calldata params,
-        BalanceDelta swapDelta
+        SwapParams calldata /* params */,
+        BalanceDelta /* swapDelta */
     ) internal returns (int128) {
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         int24 lastTick = lastTicks[key.toId()];
@@ -556,7 +556,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         PoolKey calldata key,
         int24 fromTick,
         int24 toTick,
-        bool zeroForOne,
+        bool /* zeroForOne */,
         uint256 totalAmount
     ) internal {
         PoolId poolId = key.toId();
@@ -590,7 +590,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         int24 tick,
         bool zeroForOne,
         uint256 inputAmount,
-        uint256 totalExecutedAmount
+        uint256 /* totalExecutedAmount */
     ) internal {
         uint256 gasStart = gasleft();
         

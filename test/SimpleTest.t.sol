@@ -82,12 +82,12 @@ contract SimpleTest is Test {
         vm.stopPrank();
     }
 
-    function test_CanDeployHook() public {
+    function test_CanDeployHook() public view {
         assertTrue(address(hook) != address(0));
         assertEq(hook.owner(), address(this));
     }
 
-    function test_HookPermissions() public {
+    function test_HookPermissions() public view {
         Hooks.Permissions memory permissions = hook.getHookPermissions();
         assertTrue(permissions.beforeInitialize);
         assertTrue(permissions.afterInitialize);
