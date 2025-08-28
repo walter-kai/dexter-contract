@@ -79,6 +79,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     
     // Basic pool tracking for initialization
     mapping(PoolId => bool) public poolInitialized;
+    
+    // Enhanced pool tracking
+    PoolId[] public allPoolIds;
+    mapping(PoolId => PoolKey) public poolIdToKey;
+    mapping(PoolId => uint256) public poolIndex; // Index in allPoolIds array
 
 
     // ========== CONSTANTS ==========
@@ -313,8 +318,17 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         lastTicks[key.toId()] = tick;
         
         // Simple pool initialization tracking
-        poolInitialized[key.toId()] = true;
-        emit PoolInitializationTracked(key.toId(), tick, block.timestamp);
+        PoolId poolId = key.toId();
+        if (!poolInitialized[poolId]) {
+            poolInitialized[poolId] = true;
+            
+            // Add to our tracking arrays
+            poolIndex[poolId] = allPoolIds.length;
+            allPoolIds.push(poolId);
+            poolIdToKey[poolId] = key;
+            
+            emit PoolInitializationTracked(poolId, tick, block.timestamp);
+        }
         
         return BaseHook.afterInitialize.selector;
     }
@@ -827,6 +841,63 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     // ========== CONSOLIDATED VIEW FUNCTION ==========
 
     /**
+     * @notice Get all pools hooked to this contract
+     * @return poolIds Array of all pool IDs
+     * @return poolKeys Array of corresponding pool keys
+     * @return ticks Array of current ticks for each pool
+     */
+    function getAllPools() external view returns (
+        PoolId[] memory poolIds,
+        PoolKey[] memory poolKeys,
+        int24[] memory ticks
+    ) {
+        uint256 length = allPoolIds.length;
+        poolIds = new PoolId[](length);
+        poolKeys = new PoolKey[](length);
+        ticks = new int24[](length);
+        
+        for (uint256 i = 0; i < length; i++) {
+            poolIds[i] = allPoolIds[i];
+            poolKeys[i] = poolIdToKey[allPoolIds[i]];
+            ticks[i] = lastTicks[allPoolIds[i]];
+        }
+        
+        return (poolIds, poolKeys, ticks);
+    }
+
+    /**
+     * @notice Get the number of pools hooked to this contract
+     * @return count Total number of pools
+     */
+    function getPoolCount() external view returns (uint256 count) {
+        return allPoolIds.length;
+    }
+
+    /**
+     * @notice Get pool info by index
+     * @param index Index in the pools array
+     * @return poolId The pool ID
+     * @return poolKey The pool key
+     * @return tick Current tick
+     * @return initialized Whether the pool is initialized
+     */
+    function getPoolByIndex(uint256 index) external view returns (
+        PoolId poolId,
+        PoolKey memory poolKey,
+        int24 tick,
+        bool initialized
+    ) {
+        require(index < allPoolIds.length, "Index out of bounds");
+        
+        poolId = allPoolIds[index];
+        poolKey = poolIdToKey[poolId];
+        tick = lastTicks[poolId];
+        initialized = poolInitialized[poolId];
+        
+        return (poolId, poolKey, tick, initialized);
+    }
+
+    /**
      * @notice Get comprehensive batch and contract info in one call - Interface compatibility version
      */
     function getBatchInfo(uint256 batchId) external view returns (
@@ -944,6 +1015,53 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             batch.isActive,
             claimTokensSupply[batchId] == 0
         );
+    }
+
+    /**
+     * @notice Find pools by currency pair
+     * @param currency0 First currency address
+     * @param currency1 Second currency address
+     * @return poolIds Array of pool IDs for the currency pair
+     * @return poolKeys Array of pool keys for the currency pair
+     * @return ticks Array of current ticks for the currency pair
+     * @return fees Array of fees for the currency pair
+     */
+    function getPoolsByCurrencyPair(address currency0, address currency1) external view returns (
+        PoolId[] memory poolIds,
+        PoolKey[] memory poolKeys,
+        int24[] memory ticks,
+        uint24[] memory fees
+    ) {
+        // First pass: count matching pools
+        uint256 matchCount = 0;
+        for (uint256 i = 0; i < allPoolIds.length; i++) {
+            PoolKey memory key = poolIdToKey[allPoolIds[i]];
+            if ((Currency.unwrap(key.currency0) == currency0 && Currency.unwrap(key.currency1) == currency1) ||
+                (Currency.unwrap(key.currency0) == currency1 && Currency.unwrap(key.currency1) == currency0)) {
+                matchCount++;
+            }
+        }
+        
+        // Second pass: collect matching pools
+        poolIds = new PoolId[](matchCount);
+        poolKeys = new PoolKey[](matchCount);
+        ticks = new int24[](matchCount);
+        fees = new uint24[](matchCount);
+        
+        uint256 currentIndex = 0;
+        for (uint256 i = 0; i < allPoolIds.length; i++) {
+            PoolKey memory key = poolIdToKey[allPoolIds[i]];
+            if ((Currency.unwrap(key.currency0) == currency0 && Currency.unwrap(key.currency1) == currency1) ||
+                (Currency.unwrap(key.currency0) == currency1 && Currency.unwrap(key.currency1) == currency0)) {
+                poolIds[currentIndex] = allPoolIds[i];
+                poolKeys[currentIndex] = key;
+                ticks[currentIndex] = lastTicks[allPoolIds[i]];
+                fees[currentIndex] = key.fee;
+                currentIndex++;
+            }
+        }
+        
+        return (poolIds, poolKeys, ticks, fees);
     }
 
     // ========== FALLBACKS ==========
