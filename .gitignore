@@ -46,3 +46,4 @@ forge-cache/
 # Package manager lock files (optional - some prefer to commit these)
 package-lock.json
 yarn.lock
+/lib
