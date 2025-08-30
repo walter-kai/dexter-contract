@@ -18,8 +18,9 @@ contract DeployHookContract is Script {
         uint256 deployerPrivateKey = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
         address deployer = vm.addr(deployerPrivateKey);
         
-        IPoolManager poolManager = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
-        address feeRecipient = 0x3Fef4207017024b01eFd67d3f4336df88F47A3F3;
+        // Read addresses from environment
+        IPoolManager poolManager = IPoolManager(vm.envOr("POOL_MANAGER_ADDRESS", address(0x000000000004444c5dc75cB358380D2e3dE08A90)));
+        address feeRecipient = vm.envOr("FEE_RECIPIENT_ADDRESS", address(0x3Fef4207017024b01eFd67d3f4336df88F47A3F3));
         
         console2.log("=== Deploying LimitOrderBatch Hook ===");
         console2.log("Deployer:", deployer);

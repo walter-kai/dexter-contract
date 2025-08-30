@@ -16,16 +16,19 @@ contract DeploySwapToken is Script {
         uint256 deployerPrivateKey = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
         address deployer = vm.addr(deployerPrivateKey);
         
-        IPoolManager poolManager = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
+        // Read addresses from environment
+        IPoolManager poolManager = IPoolManager(vm.envOr("POOL_MANAGER_ADDRESS", address(0x000000000004444c5dc75cB358380D2e3dE08A90)));
+        address hookAddress = vm.envAddress("LIMIT_ORDER_BATCH_ADDRESS");
         
         console2.log("=== Deploying SwapToken Router ===");
         console2.log("Deployer:", deployer);
         console2.log("Pool Manager:", address(poolManager));
+        console2.log("Hook Address:", hookAddress);
         
         vm.startBroadcast(deployerPrivateKey);
         
-        // Deploy SwapToken
-        SwapToken swapToken = new SwapToken(address(poolManager));
+        // Deploy SwapToken with hook address
+        SwapToken swapToken = new SwapToken(address(poolManager), hookAddress);
         
         vm.stopBroadcast();
         

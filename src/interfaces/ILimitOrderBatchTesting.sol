@@ -24,7 +24,7 @@ interface ILimitOrderBatchTesting {
         PoolKey calldata key,
         SwapParams calldata params,
         bytes calldata hookData
-    ) external view returns (bytes4, BeforeSwapDelta, uint24);
+    ) external returns (bytes4, BeforeSwapDelta, uint24);
 
     /**
      * @notice Test function to simulate afterSwap for testing purposes

@@ -12,12 +12,11 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 contract UniversalCreatePool is Script {
     using PoolIdLibrary for PoolKey;
 
-    IPoolManager constant POOL_MANAGER = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
-    
     function run() external {
         vm.startBroadcast();
         
         // Read environment variables for pool parameters
+        IPoolManager poolManager = IPoolManager(vm.envOr("POOL_MANAGER_ADDRESS", address(0x000000000004444c5dc75cB358380D2e3dE08A90)));
         address token0 = vm.envAddress("POOL_TOKEN0");
         address token1 = vm.envAddress("POOL_TOKEN1");
         uint24 fee = uint24(vm.envUint("POOL_FEE"));
@@ -56,7 +55,7 @@ contract UniversalCreatePool is Script {
         // Calculate initial price (1:1 ratio at tick 0)
         uint160 sqrtPriceX96 = 79228162514264337593543950336; // sqrt(1) * 2^96
         
-        try POOL_MANAGER.initialize(key, sqrtPriceX96) {
+        try poolManager.initialize(key, sqrtPriceX96) {
             PoolId poolId = key.toId();
             console2.log("Pool created successfully!");
             console2.log("Pool ID:", uint256(PoolId.unwrap(poolId)));

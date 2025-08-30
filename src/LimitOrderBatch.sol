@@ -6,7 +6,7 @@ import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ILimitOrderBatch} from "./interfaces/ILimitOrderBatch.sol";
 import {ERC6909Base} from "./base/ERC6909Base.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -45,6 +45,28 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     mapping(uint256 => uint256) public claimTokensSupply;
     mapping(PoolId => mapping(int24 => mapping(bool => uint256[]))) internal tickToBatchIds;
     
+    // Additional storage for limit order tracking
+    mapping(bytes32 => uint256) public limitOrderAmounts; // keccak256(poolId, tick, zeroForOne) => amount
+    mapping(bytes32 => address) public limitOrderUsers;   // keccak256(poolId, tick, zeroForOne) => user
+    
+    // ========== EVENTS ==========
+    
+    event LimitOrderPlaced(
+        PoolId indexed poolId,
+        int24 indexed tick,
+        bool zeroForOne,
+        uint256 amount,
+        address indexed user
+    );
+    
+    event LimitOrderExecuted(
+        PoolId indexed poolId,
+        int24 indexed tick,
+        bool zeroForOne,
+        uint256 amount,
+        address indexed user
+    );
+
     // Gas fee management
     mapping(uint256 => uint256) public preCollectedGasFees;
     mapping(uint256 => uint256) public actualGasCosts;
@@ -337,21 +359,96 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata) 
-        internal pure override returns (bytes4, BeforeSwapDelta, uint24) {
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata) 
+        internal override returns (bytes4, BeforeSwapDelta, uint24) {
+        // Skip hook processing if the sender is this contract (to avoid recursion)
+        if (sender == address(this)) {
+            uint24 baseFee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, baseFee);
+        }
+
+        // Process limit orders that can satisfy the swap
+        BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
+        
         // Use fixed fee for simplified version - tools contract can override for dynamic fees
         uint24 fee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
+        return (BaseHook.beforeSwap.selector, delta, fee);
     }
 
     function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata) 
         internal override returns (bytes4, int128) {
-        if (sender == address(this)) return (this.afterSwap.selector, 0);
+        // Skip hook processing if the sender is this contract (to avoid recursion)
+        if (sender == address(this)) return (BaseHook.afterSwap.selector, 0);
 
-        // Process limit orders with return deltas for gas optimization
-        int128 hookDelta = _processOrdersWithDelta(key, params, delta);
+        // Update last tick for tracking price movement
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        lastTicks[key.toId()] = currentTick;
         
-        return (this.afterSwap.selector, hookDelta);
+        return (BaseHook.afterSwap.selector, 0);
+    }
+
+    /**
+     * @notice Process limit orders before a swap to potentially satisfy swap demand
+     * @param key The pool key
+     * @param params The swap parameters
+     * @return delta The before swap delta representing limit order execution
+     */
+    function _processLimitOrdersBeforeSwap(PoolKey calldata key, SwapParams calldata params) 
+        internal returns (BeforeSwapDelta) {
+        
+        // Check if pool is initialized by checking if currentTick is accessible
+        // If this fails, it means the pool isn't initialized yet
+        int24 currentTick;
+        try this.getPoolCurrentTick(key.toId()) returns (int24 tick) {
+            currentTick = tick;
+        } catch {
+            // Pool not initialized, return zero delta to allow normal swap
+            return BeforeSwapDeltaLibrary.ZERO_DELTA;
+        }
+        
+        // Calculate the target tick based on sqrtPriceLimitX96
+        int24 targetTick = _getTargetTick(params.sqrtPriceLimitX96, params.zeroForOne);
+        
+        // Find limit orders between current tick and target tick
+        (uint256 totalLimitOrderAmount, bool hasOrders) = _findLimitOrdersInRange(
+            key.toId(), 
+            currentTick, 
+            targetTick, 
+            params.zeroForOne,
+            key.tickSpacing
+        );
+        
+        if (!hasOrders || totalLimitOrderAmount == 0) {
+            return BeforeSwapDeltaLibrary.ZERO_DELTA;
+        }
+        
+        // Calculate how much of the swap demand can be satisfied by limit orders
+        uint256 swapAmount = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+        uint256 limitOrderFulfillment = _min(totalLimitOrderAmount, swapAmount);
+        
+        if (limitOrderFulfillment == 0) {
+            return BeforeSwapDeltaLibrary.ZERO_DELTA;
+        }
+        
+        // Execute the limit orders that can fulfill this swap
+        _executeLimitOrdersInRange(
+            key, 
+            currentTick, 
+            targetTick, 
+            params.zeroForOne, 
+            limitOrderFulfillment
+        );
+        
+        // Create the before swap delta to represent the limit order execution
+        return _createBeforeSwapDelta(params.zeroForOne, limitOrderFulfillment);
+    }
+
+    /**
+     * @notice External function to safely get current tick (used for try-catch)
+     */
+    function getPoolCurrentTick(PoolId poolId) external view returns (int24) {
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, poolId);
+        return currentTick;
     }
 
     // ========== INTERNAL HELPER FUNCTIONS ==========
@@ -1018,7 +1115,157 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         );
     }
 
+    // ========== LIMIT ORDER PROCESSING HELPERS ==========
 
+    /**
+     * @notice Calculate target tick from sqrtPriceLimitX96
+     */
+    function _getTargetTick(uint160 sqrtPriceLimitX96, bool zeroForOne) internal pure returns (int24) {
+        if (sqrtPriceLimitX96 == 0) {
+            return zeroForOne ? TickMath.MIN_TICK : TickMath.MAX_TICK;
+        }
+        return TickMath.getTickAtSqrtPrice(sqrtPriceLimitX96);
+    }
+
+    /**
+     * @notice Find limit orders in the tick range that can be executed
+     */
+    function _findLimitOrdersInRange(
+        PoolId poolId,
+        int24 currentTick,
+        int24 targetTick,
+        bool zeroForOne,
+        int24 tickSpacing
+    ) internal view returns (uint256 totalAmount, bool hasOrders) {
+        totalAmount = 0;
+        hasOrders = false;
+
+        if (zeroForOne) {
+            // Selling token0 for token1 (price going down)
+            // Execute buy orders (opposite direction orders) that are at higher ticks
+            for (int24 tick = currentTick; tick >= targetTick; tick -= tickSpacing) {
+                uint256 amount = pendingBatchOrders[poolId][tick][false]; // false = buy orders
+                if (amount > 0) {
+                    totalAmount += amount;
+                    hasOrders = true;
+                }
+            }
+        } else {
+            // Buying token0 with token1 (price going up) 
+            // Execute sell orders (opposite direction orders) that are at lower ticks
+            for (int24 tick = currentTick; tick <= targetTick; tick += tickSpacing) {
+                uint256 amount = pendingBatchOrders[poolId][tick][true]; // true = sell orders
+                if (amount > 0) {
+                    totalAmount += amount;
+                    hasOrders = true;
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Execute limit orders in the specified range
+     */
+    function _executeLimitOrdersInRange(
+        PoolKey calldata key,
+        int24 currentTick,
+        int24 targetTick,
+        bool zeroForOne,
+        uint256 maxAmountToExecute
+    ) internal {
+        PoolId poolId = key.toId();
+        uint256 remainingAmount = maxAmountToExecute;
+        bool limitOrderDirection = !zeroForOne; // Opposite direction to the market swap
+
+        if (zeroForOne) {
+            // Market swap is selling token0, execute buy limit orders
+            for (int24 tick = currentTick; tick >= targetTick && remainingAmount > 0; tick -= key.tickSpacing) {
+                uint256 availableAmount = pendingBatchOrders[poolId][tick][limitOrderDirection];
+                if (availableAmount > 0) {
+                    uint256 executeAmount = _min(availableAmount, remainingAmount);
+                    _executeLimitOrdersAtTick(poolId, tick, limitOrderDirection, executeAmount);
+                    remainingAmount -= executeAmount;
+                }
+            }
+        } else {
+            // Market swap is buying token0, execute sell limit orders  
+            for (int24 tick = currentTick; tick <= targetTick && remainingAmount > 0; tick += key.tickSpacing) {
+                uint256 availableAmount = pendingBatchOrders[poolId][tick][limitOrderDirection];
+                if (availableAmount > 0) {
+                    uint256 executeAmount = _min(availableAmount, remainingAmount);
+                    _executeLimitOrdersAtTick(poolId, tick, limitOrderDirection, executeAmount);
+                    remainingAmount -= executeAmount;
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Execute limit orders at a specific tick
+     */
+    function _executeLimitOrdersAtTick(
+        PoolId poolId,
+        int24 tick,
+        bool zeroForOne,
+        uint256 amountToExecute
+    ) internal {
+        // Reduce pending amount
+        pendingBatchOrders[poolId][tick][zeroForOne] -= amountToExecute;
+        
+        // Find and update relevant batch orders
+        uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
+        uint256 remainingToExecute = amountToExecute;
+        
+        for (uint256 i = 0; i < batchIds.length && remainingToExecute > 0; i++) {
+            uint256 batchId = batchIds[i];
+            BatchInfo storage batch = batchOrders[batchId];
+            
+            if (!batch.isActive) continue;
+            
+            // Find this tick in the batch's target ticks
+            for (uint256 j = 0; j < batch.ticksLength; j++) {
+                if (batchTargetTicks[batchId][j] == tick) {
+                    uint256 batchAmountAtTick = batchTargetAmounts[batchId][j];
+                    uint256 executeFromBatch = _min(batchAmountAtTick, remainingToExecute);
+                    
+                    // Update batch state
+                    claimableOutputTokens[batchId] += executeFromBatch;
+                    remainingToExecute -= executeFromBatch;
+                    
+                    break;
+                }
+            }
+        }
+        
+        // Clean up if tick is now empty
+        if (pendingBatchOrders[poolId][tick][zeroForOne] == 0) {
+            delete tickToBatchIds[poolId][tick][zeroForOne];
+        }
+    }
+
+    /**
+     * @notice Create a BeforeSwapDelta representing limit order execution
+     */
+    function _createBeforeSwapDelta(bool zeroForOne, uint256 amount) internal pure returns (BeforeSwapDelta) {
+        if (zeroForOne) {
+            // Market swap wants to sell token0, limit orders provide token1
+            // The hook provides token1 output, so amount1 is negative (flowing out)
+            // The hook takes token0 input, so amount0 is positive (flowing in)
+            return toBeforeSwapDelta(int128(int256(amount)), -int128(int256(amount)));
+        } else {
+            // Market swap wants to buy token0, limit orders provide token0  
+            // The hook provides token0 output, so amount0 is negative (flowing out)
+            // The hook takes token1 input, so amount1 is positive (flowing in)
+            return toBeforeSwapDelta(-int128(int256(amount)), int128(int256(amount)));
+        }
+    }
+
+    /**
+     * @notice Utility function to get minimum of two values
+     */
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
 
     // ========== FALLBACKS ==========
 

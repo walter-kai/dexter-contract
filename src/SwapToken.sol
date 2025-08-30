@@ -15,30 +15,35 @@ import {ImmutableState} from "@uniswap/v4-periphery/base/ImmutableState.sol";
 
 /**
  * @title SwapToken
- * @notice A simplified swap router that properly handles ETH transfers
+ * @notice A V4-compatible swap router following Uniswap documentation patterns
  */
 contract SwapToken is ImmutableState, IUnlockCallback {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
 
-    // Debug events
+    // Store the hook address
+    address public immutable hookAddress;
+
+    // Events for debugging
+    event SwapExecuted(address indexed user, uint256 amountIn, uint256 amountOut);
     event Debug(string message, uint256 value);
-    event ETHBalanceCheck(string stage, uint256 balance);
-    event ETHTransferAttempt(address to, uint256 amount, bool success);
 
     error TransferFailed();
-    error InsufficientETH();
+    error InsufficientOutput();
     error InvalidToken();
 
     // Struct to hold swap data for the callback
-    struct SwapData {
-        PoolKey key;
-        SwapParams params;
-        address sender;
-        bool isETHOutput;
+    struct SwapCallbackData {
+        address tokenIn;
+        address tokenOut;
+        address payer;
+        uint256 amountIn;
+        uint256 minAmountOut;
     }
 
-    constructor(address _poolManager) ImmutableState(IPoolManager(_poolManager)) {}
+    constructor(address _poolManager, address _hookAddress) ImmutableState(IPoolManager(_poolManager)) {
+        hookAddress = _hookAddress;
+    }
 
     function swap(
         address currency0,
@@ -49,193 +54,144 @@ contract SwapToken is ImmutableState, IUnlockCallback {
         int256 amountSpecified,
         uint160 sqrtPriceLimitX96
     ) external payable returns (BalanceDelta delta) {
-        require(amountSpecified != 0, "Amount must not be zero");
-        
-        // Determine tokens
-        address tokenIn = zeroForOne ? currency0 : currency1;
-        address tokenOut = zeroForOne ? currency1 : currency0;
-        bool isETHOutput = (tokenOut == address(0));
-        
-        emit Debug("Starting swap", amountSpecified < 0 ? uint256(-amountSpecified) : uint256(amountSpecified));
-        emit Debug("Is ETH output", isETHOutput ? 1 : 0);
-        
-        // Handle input token transfers for exact input (negative amountSpecified)
-        // Note: Transfers will happen during settlement, so we don't pre-transfer here
-        if (amountSpecified < 0) {
-            uint256 amountIn = uint256(-amountSpecified);
-            
-            if (tokenIn == address(0)) {
-                // Native ETH input
-                require(msg.value >= amountIn, "Insufficient ETH sent");
-            } else {
-                // ERC20 token input - verify allowance but don't transfer yet
-                require(msg.value == 0, "ETH sent with ERC20 swap");
-                emit Debug("ERC20 swap amount", amountIn);
-            }
-        }
-
-        // Construct PoolKey - use the LimitOrderBatch hook address
+        // Create the pool key
         PoolKey memory key = PoolKey({
             currency0: Currency.wrap(currency0),
             currency1: Currency.wrap(currency1),
             fee: fee,
             tickSpacing: tickSpacing,
-            hooks: IHooks(0xB8308CaE46C322a4aECd7FC84C601f59e5A8B0C4)
+            hooks: IHooks(hookAddress)
         });
 
-        // Try to initialize the pool if it's not already initialized
-        // We'll attempt initialization and catch any reverts
-        try poolManager.initialize(key, 1447439070190732076203095993308308) {
-            emit Debug("Pool initialized successfully", 1447439070190732076203095993308308);
-        } catch {
-            // Pool is already initialized or initialization failed, continue with swap
-            emit Debug("Pool already initialized or init failed", 0);
+        // For exact input (negative amountSpecified)
+        if (amountSpecified < 0) {
+            uint256 amountIn = uint256(-amountSpecified);
+            _swapExactInputSingle(key, zeroForOne, amountIn, 0);
+            return BalanceDelta.wrap(0); // Return empty delta, actual result handled internally
+        } else {
+            // For exact output, we'll implement a simpler version
+            revert("Exact output not implemented");
+        }
+    }
+
+    function _swapExactInputSingle(
+        PoolKey memory key,
+        bool zeroForOne,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) internal returns (uint256 amountOut) {
+        // Determine tokens
+        address tokenIn = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
+        address tokenOut = zeroForOne ? Currency.unwrap(key.currency1) : Currency.unwrap(key.currency0);
+
+        emit Debug("Starting swap", amountIn);
+        emit Debug("Zero for one", zeroForOne ? 1 : 0);
+
+        // Handle input token - for exact input swaps, we need the input upfront
+        if (tokenIn == address(0)) {
+            // Native ETH input
+            require(msg.value >= amountIn, "Insufficient ETH sent");
+        } else {
+            // ERC20 token input
+            require(msg.value == 0, "ETH sent with ERC20 swap");
+            IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
         }
 
-        // Set proper price limit if none provided
-        if (sqrtPriceLimitX96 == 0) {
-            sqrtPriceLimitX96 = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
-        }
-
-        // Prepare swap params
-        SwapParams memory params = SwapParams({
+        // Set up swap parameters
+        SwapParams memory swapParams = SwapParams({
             zeroForOne: zeroForOne,
-            amountSpecified: amountSpecified,
-            sqrtPriceLimitX96: sqrtPriceLimitX96
+            amountSpecified: -int256(amountIn), // Negative for exact input
+            sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
         });
 
-        // Prepare swap data for callback
-        SwapData memory swapData = SwapData({
-            key: key,
-            params: params,
-            sender: msg.sender,
-            isETHOutput: isETHOutput
+        // Prepare callback data
+        SwapCallbackData memory callbackData = SwapCallbackData({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            payer: msg.sender,
+            amountIn: amountIn,
+            minAmountOut: minAmountOut
         });
 
-        emit ETHBalanceCheck("Before unlock", address(this).balance);
+        // Execute swap through unlock - the actual swap happens in the callback
+        BalanceDelta delta = abi.decode(
+            poolManager.unlock(abi.encode(key, swapParams, callbackData)),
+            (BalanceDelta)
+        );
 
-        // Perform the swap through unlock mechanism
-        delta = abi.decode(poolManager.unlock(abi.encode(swapData)), (BalanceDelta));
+        // Calculate output amount from the returned delta
+        if (zeroForOne) {
+            // When selling token0 for token1, we expect positive amount1() (we receive token1)
+            amountOut = uint256(uint128(delta.amount1()));
+        } else {
+            // When selling token1 for token0, we expect positive amount0() (we receive token0)
+            amountOut = uint256(uint128(delta.amount0()));
+        }
         
-        emit ETHBalanceCheck("After unlock", address(this).balance);
-        emit Debug("Delta amount0", delta.amount0() >= 0 ? uint256(uint128(delta.amount0())) : uint256(uint128(-delta.amount0())));
-        emit Debug("Delta amount1", delta.amount1() >= 0 ? uint256(uint128(delta.amount1())) : uint256(uint128(-delta.amount1())));
-        
-        return delta;
+        require(amountOut >= minAmountOut, "Insufficient output amount");
+
+        emit SwapExecuted(msg.sender, amountIn, amountOut);
+        return amountOut;
     }
 
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         require(msg.sender == address(poolManager), "Only pool manager can call this");
         
-        SwapData memory swapData = abi.decode(data, (SwapData));
+        (PoolKey memory key, SwapParams memory swapParams, SwapCallbackData memory callbackData) = 
+            abi.decode(data, (PoolKey, SwapParams, SwapCallbackData));
         
-        emit ETHBalanceCheck("Callback start", address(this).balance);
+        emit Debug("Callback start", callbackData.amountIn);
         
-        // Store initial ETH balance if output is ETH
-        uint256 initialETHBalance = 0;
-        if (swapData.isETHOutput) {
-            initialETHBalance = address(this).balance;
-            emit Debug("Initial ETH balance tracked", initialETHBalance);
-        }
+        // Perform the actual swap - this is where the swap should happen
+        BalanceDelta delta = poolManager.swap(key, swapParams, "");
         
-        // Perform the actual swap
-        BalanceDelta delta = poolManager.swap(swapData.key, swapData.params, "");
+        emit Debug("Swap executed, delta amounts", uint256(uint128(-delta.amount0())));
         
-        emit ETHBalanceCheck("After pool swap", address(this).balance);
-        emit Debug("Swap delta amount0", delta.amount0() >= 0 ? uint256(uint128(delta.amount0())) : uint256(uint128(-delta.amount0())));
-        emit Debug("Swap delta amount1", delta.amount1() >= 0 ? uint256(uint128(delta.amount1())) : uint256(uint128(-delta.amount1())));
-        
-        // Handle settling (paying what we owe)
+        // Settle what we owe to the pool (the input amount)
         if (delta.amount0() < 0) {
-            // We owe currency0 to the pool
-            uint256 amount = uint256(uint128(-delta.amount0()));
-            emit Debug("Settling currency0", amount);
-            _settle(swapData.key.currency0, swapData.sender, amount);
+            Currency currency0 = key.currency0;
+            uint256 amountToSettle = uint256(uint128(-delta.amount0()));
+            _settle(currency0, amountToSettle);
         }
         if (delta.amount1() < 0) {
-            // We owe currency1 to the pool
-            uint256 amount = uint256(uint128(-delta.amount1()));
-            emit Debug("Settling currency1", amount);
-            _settle(swapData.key.currency1, swapData.sender, amount);
+            Currency currency1 = key.currency1;
+            uint256 amountToSettle = uint256(uint128(-delta.amount1()));
+            _settle(currency1, amountToSettle);
         }
         
-        emit ETHBalanceCheck("After settle", address(this).balance);
-        
-        // Handle taking (receiving what we're owed) - take to this contract first
+        // Take what we're owed from the pool (the output amount)
         if (delta.amount0() > 0) {
-            // We get currency0 from the pool
-            uint256 amount = uint256(uint128(delta.amount0()));
-            emit Debug("Taking currency0", amount);
-            _take(swapData.key.currency0, address(this), amount);
+            Currency currency0 = key.currency0;
+            uint256 amountToTake = uint256(uint128(delta.amount0()));
+            _take(currency0, callbackData.payer, amountToTake);
         }
         if (delta.amount1() > 0) {
-            // We get currency1 from the pool
-            uint256 amount = uint256(uint128(delta.amount1()));
-            emit Debug("Taking currency1", amount);
-            _take(swapData.key.currency1, address(this), amount);
+            Currency currency1 = key.currency1;
+            uint256 amountToTake = uint256(uint128(delta.amount1()));
+            _take(currency1, callbackData.payer, amountToTake);
         }
-        
-        emit ETHBalanceCheck("After take", address(this).balance);
-        
-        // Transfer output tokens to user
-        if (swapData.isETHOutput) {
-            // Calculate how much ETH we received
-            uint256 currentETHBalance = address(this).balance;
-            uint256 ethReceived = currentETHBalance > initialETHBalance ? 
-                currentETHBalance - initialETHBalance : 0;
-            
-            emit Debug("Current ETH balance", currentETHBalance);
-            emit Debug("ETH received calculation", ethReceived);
-            
-            if (ethReceived > 0) {
-                // Transfer ETH directly to user
-                emit Debug("Attempting ETH transfer", ethReceived);
-                (bool success, ) = swapData.sender.call{value: ethReceived}("");
-                emit ETHTransferAttempt(swapData.sender, ethReceived, success);
-                require(success, "ETH transfer failed");
-            } else {
-                emit Debug("No ETH to transfer", 0);
-            }
-        } else {
-            // Transfer ERC20 tokens to user
-            address tokenOut = swapData.params.zeroForOne ? 
-                Currency.unwrap(swapData.key.currency1) : 
-                Currency.unwrap(swapData.key.currency0);
-                
-            if (tokenOut != address(0)) {
-                IERC20 token = IERC20(tokenOut);
-                uint256 balance = token.balanceOf(address(this));
-                if (balance > 0) {
-                    token.safeTransfer(swapData.sender, balance);
-                }
-            }
-        }
-        
-        emit ETHBalanceCheck("Callback end", address(this).balance);
         
         return abi.encode(delta);
     }
 
-    function _settle(Currency currency, address payer, uint256 amount) internal {
+    function _settle(Currency currency, uint256 amount) internal {
         if (amount == 0) return;
-
+        
         poolManager.sync(currency);
+        
         if (currency.isAddressZero()) {
             // ETH settlement
-            emit Debug("Settling ETH", amount);
             poolManager.settle{value: amount}();
         } else {
-            // ERC20 settlement - transfer from payer to PoolManager
-            emit Debug("Settling ERC20", amount);
-            IERC20(Currency.unwrap(currency)).safeTransferFrom(payer, address(poolManager), amount);
+            // ERC20 settlement - we already have the tokens in this contract
+            IERC20(Currency.unwrap(currency)).safeTransfer(address(poolManager), amount);
             poolManager.settle();
         }
     }
 
     function _take(Currency currency, address recipient, uint256 amount) internal {
         if (amount == 0) return;
-        emit Debug("Taking currency", amount);
-        emit Debug("Taking to address", uint256(uint160(recipient)));
+        
         poolManager.take(currency, recipient, amount);
     }
 

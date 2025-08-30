@@ -218,7 +218,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
         PoolKey calldata key,
         SwapParams calldata params,
         bytes calldata hookData
-    ) external pure returns (bytes4, BeforeSwapDelta, uint24) {
+    ) external returns (bytes4, BeforeSwapDelta, uint24) {
         return _beforeSwap(sender, key, params, hookData);
     }
 
