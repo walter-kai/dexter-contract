@@ -6,7 +6,7 @@ import {console2} from "forge-std/console2.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
-import {LimitOrderBatch} from "contract/src/LimitOrderBatch.sol";
+import {LimitOrderBatch} from "../src/LimitOrderBatch.sol";
 
 /**
  * @title DeployHookContract

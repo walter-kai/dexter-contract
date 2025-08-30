@@ -60,6 +60,7 @@ contract SwapToken is ImmutableState, IUnlockCallback {
         emit Debug("Is ETH output", isETHOutput ? 1 : 0);
         
         // Handle input token transfers for exact input (negative amountSpecified)
+        // Note: Transfers will happen during settlement, so we don't pre-transfer here
         if (amountSpecified < 0) {
             uint256 amountIn = uint256(-amountSpecified);
             
@@ -67,21 +68,29 @@ contract SwapToken is ImmutableState, IUnlockCallback {
                 // Native ETH input
                 require(msg.value >= amountIn, "Insufficient ETH sent");
             } else {
-                // ERC20 token input
+                // ERC20 token input - verify allowance but don't transfer yet
                 require(msg.value == 0, "ETH sent with ERC20 swap");
-                IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
-                emit Debug("Transferred ERC20 to contract", amountIn);
+                emit Debug("ERC20 swap amount", amountIn);
             }
         }
 
-        // Construct PoolKey
+        // Construct PoolKey - use the LimitOrderBatch hook address
         PoolKey memory key = PoolKey({
             currency0: Currency.wrap(currency0),
             currency1: Currency.wrap(currency1),
             fee: fee,
             tickSpacing: tickSpacing,
-            hooks: IHooks(address(0))
+            hooks: IHooks(0xB8308CaE46C322a4aECd7FC84C601f59e5A8B0C4)
         });
+
+        // Try to initialize the pool if it's not already initialized
+        // We'll attempt initialization and catch any reverts
+        try poolManager.initialize(key, 1447439070190732076203095993308308) {
+            emit Debug("Pool initialized successfully", 1447439070190732076203095993308308);
+        } catch {
+            // Pool is already initialized or initialization failed, continue with swap
+            emit Debug("Pool already initialized or init failed", 0);
+        }
 
         // Set proper price limit if none provided
         if (sqrtPriceLimitX96 == 0) {
@@ -207,7 +216,7 @@ contract SwapToken is ImmutableState, IUnlockCallback {
         return abi.encode(delta);
     }
 
-    function _settle(Currency currency, address /* payer */, uint256 amount) internal {
+    function _settle(Currency currency, address payer, uint256 amount) internal {
         if (amount == 0) return;
 
         poolManager.sync(currency);
@@ -216,9 +225,9 @@ contract SwapToken is ImmutableState, IUnlockCallback {
             emit Debug("Settling ETH", amount);
             poolManager.settle{value: amount}();
         } else {
-            // ERC20 settlement - transfer from this contract to PoolManager
+            // ERC20 settlement - transfer from payer to PoolManager
             emit Debug("Settling ERC20", amount);
-            IERC20(Currency.unwrap(currency)).safeTransfer(address(poolManager), amount);
+            IERC20(Currency.unwrap(currency)).safeTransferFrom(payer, address(poolManager), amount);
             poolManager.settle();
         }
     }

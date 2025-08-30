@@ -192,6 +192,10 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         _validateOrderInputs(targetPrices, targetAmounts, deadline, currency0, currency1);
         
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
+        
+        // Initialize pool if it doesn't exist
+        _ensurePoolInitialized(key);
+        
         int24[] memory targetTicks = _pricesToTicks(targetPrices);
         uint256 totalAmount = _sumAmounts(targetAmounts);
         
@@ -401,6 +405,25 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             }
         }
         require(total > 0, "Invalid total");
+    }
+
+    /**
+     * @notice Ensure pool is initialized, initialize it if not
+     */
+    function _ensurePoolInitialized(PoolKey memory key) internal {
+        PoolId poolId = key.toId();
+        
+        // Check if pool is already initialized by checking sqrtPriceX96
+        (uint160 currentPrice, , , ) = StateLibrary.getSlot0(poolManager, poolId);
+        
+        if (currentPrice > 0) {
+            // Pool is already initialized
+            return;
+        }
+        
+        // Initialize pool with 1:1 ratio (sqrt(1) * 2^96)
+        uint160 initPrice = 79228162514264337593543950336;
+        poolManager.initialize(key, initPrice);
     }
 
     function _createBatch(
