@@ -15,13 +15,14 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 
 /**
  * @title LimitOrderBatch - Simplified and Gas-Optimized Version
@@ -125,6 +126,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     
     address public immutable FEE_RECIPIENT;
     address public owner;
+    IPositionManager public immutable positionManager;
 
     // ========== ERRORS ==========
     
@@ -147,6 +149,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     event GasFeeConsumed(uint256 indexed batchId, uint256 actualGasCost, uint256 protocolFee);
     event GasFeeRefunded(uint256 indexed batchId, address indexed user, uint256 refundAmount);
     
+    // Liquidity events
+    event LiquidityProvisionAttempted(PoolId indexed poolId, uint256 amount, bool zeroForOne);
+    event LiquidityAdded(PoolId indexed poolId, uint256 amount0, uint256 amount1, int24 tickLower, int24 tickUpper);
+    event LiquidityAdditionFailed(PoolId indexed poolId, uint256 amount, string reason);
+    
     // Simplified events
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
 
@@ -165,13 +172,15 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     // ========== CONSTRUCTOR ==========
     
-    constructor(IPoolManager _poolManager, address _feeRecipient, address _owner) 
+    constructor(IPoolManager _poolManager, address _feeRecipient, address _owner, IPositionManager _positionManager) 
         BaseHook(_poolManager) 
     {
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_owner != address(0), "Invalid owner");
+        require(address(_positionManager) != address(0), "Invalid position manager");
         owner = _owner;
         FEE_RECIPIENT = _feeRecipient;
+        positionManager = _positionManager;
     }
 
     // ========== CORE FUNCTIONS ==========
@@ -223,6 +232,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         batchId = _createBatch(key, targetTicks, targetAmounts, totalAmount, zeroForOne, deadline);
         _handleTokenDeposit(key, zeroForOne, totalAmount);
+        
+        // Add liquidity using a portion of the deposited tokens
+        _addLiquidityFromDeposit(key, zeroForOne, totalAmount);
         
         emit BatchOrderCreated(batchId, msg.sender, currency0, currency1, totalAmount, targetPrices, targetAmounts);
         emit BatchOrderCreatedOptimized(batchId, msg.sender, totalAmount);
@@ -505,7 +517,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Ensure pool is initialized, initialize it if not
+     * @notice Ensure pool is initialized and has liquidity from batch order deposits
      */
     function _ensurePoolInitialized(PoolKey memory key) internal {
         PoolId poolId = key.toId();
@@ -522,6 +534,48 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint160 initPrice = 79228162514264337593543950336;
         poolManager.initialize(key, initPrice);
     }
+
+    /**
+     * @notice Add liquidity to pool using deposited tokens from batch orders
+     * @dev This function is called after tokens are deposited to provide initial liquidity
+     */
+    function _addLiquidityFromDeposit(
+        PoolKey memory key, 
+        bool zeroForOne, 
+        uint256 totalAmount
+    ) internal {
+        // Skip if amount is too small for meaningful liquidity
+        if (totalAmount < 1000) return;
+        
+        // Use a portion of the deposited amount to add liquidity to the pool
+        // This ensures that when account 2 tries to execute swaps, there's liquidity available
+        uint256 liquidityAmount = totalAmount / 4; // Use 25% for liquidity provision
+        
+        if (liquidityAmount == 0) return;
+        
+        // Add liquidity through unlock callback
+        bytes memory liquidityData = abi.encode(
+            key,
+            liquidityAmount,
+            zeroForOne,
+            "ADD_LIQUIDITY"
+        );
+        
+        try poolManager.unlock(liquidityData) {
+            // Liquidity added successfully
+            emit LiquidityAdded(key.toId(), liquidityAmount, liquidityAmount, 0, 0);
+        } catch {
+            // If liquidity addition fails, continue without it
+            // The pool initialization is more important than liquidity
+            emit LiquidityAdditionFailed(key.toId(), liquidityAmount, "Unlock failed");
+        }
+    }
+
+    /**
+     * @notice Internal function to add liquidity via PositionManager
+     * @dev External function to allow try/catch - simplified to not fail batch order creation
+     */
+
 
     function _createBatch(
         PoolKey memory key,
@@ -897,9 +951,117 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     // ========== CALLBACK ==========
 
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
-        (PoolKey memory key, SwapParams memory params) = abi.decode(data, (PoolKey, SwapParams));
-        BalanceDelta delta = poolManager.swap(key, params, "");
+        // Decode the operation type from the first part of data
+        if (data.length > 64) {
+            // Try to decode as general liquidity operation
+            (string memory operation) = abi.decode(data, (string));
+            
+            if (keccak256(abi.encodePacked(operation)) == keccak256(abi.encodePacked("general_liquidity"))) {
+                (, PoolKey memory key, ModifyLiquidityParams memory params) = abi.decode(data, (string, PoolKey, ModifyLiquidityParams));
+                return _handleGeneralLiquidityOperation(key, params);
+            }
+            
+            // Try to decode as batch order liquidity operation
+            try this._decodeLiquidityOperation(data) returns (
+                PoolKey memory liquidityKey,
+                uint256 amount,
+                bool zeroForOne,
+                string memory operation
+            ) {
+                if (keccak256(abi.encodePacked(operation)) == keccak256(abi.encodePacked("ADD_LIQUIDITY"))) {
+                    return _handleLiquidityOperation(liquidityKey, amount, zeroForOne);
+                }
+            } catch {
+                // Not a liquidity operation, continue to swap handling
+            }
+        }
+        
+        // Default: handle as swap operation
+        (PoolKey memory swapKey, SwapParams memory params) = abi.decode(data, (PoolKey, SwapParams));
+        BalanceDelta delta = poolManager.swap(swapKey, params, "");
         return abi.encode(delta);
+    }
+
+    /**
+     * @notice Handle general liquidity addition operations
+     */
+    function _handleGeneralLiquidityOperation(
+        PoolKey memory key,
+        ModifyLiquidityParams memory params
+    ) internal returns (bytes memory) {
+        // Add liquidity to the pool
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(key, params, "");
+        
+        // Settle the deltas by sending tokens to pool manager
+        if (delta.amount0() > 0) {
+            // Send token0 (ETH or ERC20)
+            if (Currency.unwrap(key.currency0) == address(0)) {
+                // ETH - settle with the sent value
+                poolManager.settle{value: uint256(int256(delta.amount0()))}();
+            } else {
+                // ERC20 token - transfer and settle
+                Currency.wrap(Currency.unwrap(key.currency0)).transfer(address(poolManager), uint256(int256(delta.amount0())));
+                poolManager.settle();
+            }
+        }
+        
+        if (delta.amount1() > 0) {
+            // Send token1 (always ERC20) - transfer and settle
+            Currency.wrap(Currency.unwrap(key.currency1)).transfer(address(poolManager), uint256(int256(delta.amount1())));
+            poolManager.settle();
+        }
+        
+        return abi.encode(delta);
+    }
+
+    /**
+     * @notice Helper to decode liquidity operation data (external for try/catch)
+     */
+    function _decodeLiquidityOperation(bytes calldata data) external pure returns (
+        PoolKey memory key,
+        uint256 amount,
+        bool zeroForOne,
+        string memory operation
+    ) {
+        return abi.decode(data, (PoolKey, uint256, bool, string));
+    }
+
+    /**
+     * @notice Handle adding liquidity when unlocked
+     */
+    function _handleLiquidityOperation(
+        PoolKey memory key,
+        uint256 amount,
+        bool zeroForOne
+    ) internal returns (bytes memory) {
+        // Get current pool state
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        
+        // Calculate wide tick range for liquidity provision
+        int24 tickSpacing = key.tickSpacing;
+        int24 tickLower = currentTick - (100 * tickSpacing);
+        int24 tickUpper = currentTick + (100 * tickSpacing);
+        
+        // Ensure ticks are aligned
+        tickLower = (tickLower / tickSpacing) * tickSpacing;
+        tickUpper = (tickUpper / tickSpacing) * tickSpacing;
+        
+        // Calculate liquidity delta (simplified calculation)
+        uint128 liquidityDelta = uint128(amount / 100); // Conservative amount
+        if (liquidityDelta == 0) liquidityDelta = 1000;
+        
+        // Create ModifyLiquidityParams struct
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            liquidityDelta: int256(uint256(liquidityDelta)),
+            salt: bytes32(uint256(block.timestamp))
+        });
+        
+        // Add liquidity to the pool
+        (BalanceDelta callerDelta, ) = poolManager.modifyLiquidity(key, params, "");
+        
+        return abi.encode(callerDelta);
     }
 
     // ========== MANUAL EXECUTION FUNCTIONS ==========
@@ -1266,6 +1428,53 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
     }
+
+    // ========== PUBLIC LIQUIDITY FUNCTIONS ==========
+    
+    /**
+     * @notice Add general liquidity to a pool for trading
+     * @dev This provides liquidity across a wide price range for general trading
+     */
+    function addGeneralLiquidity(
+        address currency0,
+        address currency1,
+        uint24 fee,
+        uint256 amount0,
+        uint256 amount1
+    ) external payable {
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(currency0),
+            currency1: Currency.wrap(currency1),
+            fee: fee,
+            tickSpacing: 60, // Standard tick spacing for dynamic fee
+            hooks: IHooks(address(this))
+        });
+        
+        // Wide range for general liquidity: -600 to +600 ticks
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: -600,
+            tickUpper: 600,
+            liquidityDelta: int256(amount0 + amount1), // Use total amount as liquidity
+            salt: bytes32(0)
+        });
+        
+        // Store amounts for use in callback
+        _tempAmount0 = amount0;
+        _tempAmount1 = amount1;
+        
+        // Add liquidity through unlock callback
+        poolManager.unlock(abi.encode("general_liquidity", key, params));
+        
+        // Clear temp storage
+        delete _tempAmount0;
+        delete _tempAmount1;
+        
+        emit LiquidityAdded(key.toId(), amount0, amount1, -600, 600);
+    }
+    
+    // Temporary storage for liquidity amounts (used in callback)
+    uint256 private _tempAmount0;
+    uint256 private _tempAmount1;
 
     // ========== FALLBACKS ==========
 

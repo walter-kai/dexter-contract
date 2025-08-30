@@ -12,6 +12,7 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {LimitOrderBatch} from "../src/LimitOrderBatch.sol";
 import "./mocks/MockContracts.sol";
 
@@ -47,17 +48,21 @@ contract SimpleTest is Test {
             Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
         
+        // Mock PositionManager for testing
+        IPositionManager mockPositionManager = IPositionManager(address(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e));
+        
         (address hookAddress, bytes32 salt) = HookMiner.find(
             address(this),
             flags,
             type(LimitOrderBatch).creationCode,
-            abi.encode(address(poolManager), feeRecipient, address(this))
+            abi.encode(address(poolManager), feeRecipient, address(this), address(mockPositionManager))
         );
         
         hook = new LimitOrderBatch{salt: salt}(
             IPoolManager(address(poolManager)),
             feeRecipient,
-            address(this)
+            address(this),
+            mockPositionManager
         );
         require(address(hook) == hookAddress, "Hook address mismatch");
 

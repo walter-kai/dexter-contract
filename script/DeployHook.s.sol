@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LimitOrderBatch} from "../src/LimitOrderBatch.sol";
@@ -20,11 +21,13 @@ contract DeployHookContract is Script {
         
         // Read addresses from environment
         IPoolManager poolManager = IPoolManager(vm.envOr("POOL_MANAGER_ADDRESS", address(0x000000000004444c5dc75cB358380D2e3dE08A90)));
+        IPositionManager positionManager = IPositionManager(vm.envOr("POSITION_MANAGER_ADDRESS", address(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e)));
         address feeRecipient = vm.envOr("FEE_RECIPIENT_ADDRESS", address(0x3Fef4207017024b01eFd67d3f4336df88F47A3F3));
         
         console2.log("=== Deploying LimitOrderBatch Hook ===");
         console2.log("Deployer:", deployer);
         console2.log("Pool Manager:", address(poolManager));
+        console2.log("Position Manager:", address(positionManager));
         console2.log("Fee Recipient:", feeRecipient);
         
         vm.startBroadcast(deployerPrivateKey);
@@ -47,7 +50,8 @@ contract DeployHookContract is Script {
         bytes memory constructorArgs = abi.encode(
             address(poolManager),
             feeRecipient,
-            deployer
+            deployer,
+            address(positionManager)
         );
         
         // Mine a salt that will produce a hook address with the correct flags
@@ -65,7 +69,8 @@ contract DeployHookContract is Script {
         LimitOrderBatch limitOrderBatch = new LimitOrderBatch{salt: salt}(
             poolManager,
             feeRecipient,
-            deployer
+            deployer,
+            positionManager
         );
         
         // Verify the deployed address matches the mined address

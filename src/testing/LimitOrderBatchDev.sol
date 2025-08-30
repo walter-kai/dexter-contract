@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {LimitOrderBatch} from "../LimitOrderBatch.sol";
 import {ILimitOrderBatchTesting} from "../interfaces/ILimitOrderBatchTesting.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -31,7 +32,7 @@ contract LimitOrderBatchDev is LimitOrderBatch, ILimitOrderBatchTesting {
     using FixedPointMathLib for uint256;
 
     constructor(IPoolManager _poolManager, address _feeRecipient) 
-        LimitOrderBatch(_poolManager, _feeRecipient, msg.sender) // Use msg.sender as owner
+        LimitOrderBatch(_poolManager, _feeRecipient, msg.sender, IPositionManager(address(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e))) // Use msg.sender as owner
     {
         // Testing version constructor
     }
