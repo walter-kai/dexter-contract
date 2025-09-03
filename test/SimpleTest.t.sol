@@ -55,14 +55,13 @@ contract SimpleTest is Test {
             address(this),
             flags,
             type(LimitOrderBatch).creationCode,
-            abi.encode(address(poolManager), feeRecipient, address(this), address(mockPositionManager))
+            abi.encode(address(poolManager), feeRecipient, address(this))
         );
         
         hook = new LimitOrderBatch{salt: salt}(
             IPoolManager(address(poolManager)),
             feeRecipient,
-            address(this),
-            mockPositionManager
+            address(this)
         );
         require(address(hook) == hookAddress, "Hook address mismatch");
 

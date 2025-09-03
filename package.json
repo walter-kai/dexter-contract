@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Uniswap v4 hooks for swap tracking and analytics",
   "scripts": {
-    "anvil": "source .env && anvil --fork-url $MAINNET_RPC_URL --chain-id 1",
+    "anvil": "source ../.env && anvil --fork-url $MAINNET_RPC_URL --chain-id 1",
 
     "test": "forge test",
     "test:verbose": "forge test -vvv",

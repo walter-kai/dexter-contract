@@ -22,7 +22,6 @@ import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
-import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 
 /**
  * @title LimitOrderBatch - Simplified and Gas-Optimized Version
@@ -126,7 +125,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     
     address public immutable FEE_RECIPIENT;
     address public owner;
-    IPositionManager public immutable positionManager;
 
     // ========== ERRORS ==========
     
@@ -172,15 +170,13 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     // ========== CONSTRUCTOR ==========
     
-    constructor(IPoolManager _poolManager, address _feeRecipient, address _owner, IPositionManager _positionManager) 
+    constructor(IPoolManager _poolManager, address _feeRecipient, address _owner) 
         BaseHook(_poolManager) 
     {
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_owner != address(0), "Invalid owner");
-        require(address(_positionManager) != address(0), "Invalid position manager");
         owner = _owner;
         FEE_RECIPIENT = _feeRecipient;
-        positionManager = _positionManager;
     }
 
     // ========== CORE FUNCTIONS ==========
@@ -392,11 +388,50 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Skip hook processing if the sender is this contract (to avoid recursion)
         if (sender == address(this)) return (BaseHook.afterSwap.selector, 0);
 
+        // Handle AMM liquidity settlement if hook provided liquidity
+        _handleAMMSettlement(key, params, delta);
+
         // Update last tick for tracking price movement
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         lastTicks[key.toId()] = currentTick;
         
         return (BaseHook.afterSwap.selector, 0);
+    }
+
+    /**
+     * @notice Handle settlement of tokens when hook provides AMM liquidity
+     */
+    function _handleAMMSettlement(PoolKey calldata key, SwapParams calldata params, BalanceDelta delta) internal {
+        // Only handle settlement for AMM swaps (when no limit orders were processed)
+        // We check if this swap used hook's AMM liquidity by seeing if we have the tokens
+        uint256 ethBalance = address(this).balance;
+        address usdcAddress = Currency.unwrap(key.currency1);
+        uint256 usdcBalance = IERC20(usdcAddress).balanceOf(address(this));
+        
+        if (ethBalance == 0 || usdcBalance == 0) {
+            return; // No AMM settlement needed
+        }
+        
+        // For swaps that used hook's AMM liquidity, we need to settle with the pool manager
+        if (params.zeroForOne) {
+            // User swapped ETH for USDC
+            // Hook received ETH (delta.amount0 > 0), needs to provide USDC (delta.amount1 < 0)
+            if (delta.amount1() < 0) {
+                uint256 usdcToProvide = uint256(uint128(-delta.amount1()));
+                if (usdcToProvide <= usdcBalance) {
+                    IERC20(usdcAddress).transfer(address(poolManager), usdcToProvide);
+                }
+            }
+        } else {
+            // User swapped USDC for ETH  
+            // Hook received USDC (delta.amount1 > 0), needs to provide ETH (delta.amount0 < 0)
+            if (delta.amount0() < 0) {
+                uint256 ethToProvide = uint256(uint128(-delta.amount0()));
+                if (ethToProvide <= ethBalance) {
+                    payable(address(poolManager)).transfer(ethToProvide);
+                }
+            }
+        }
     }
 
     /**
@@ -431,6 +466,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         );
         
         if (!hasOrders || totalLimitOrderAmount == 0) {
+            // No limit orders available - let the pool handle the swap with its own liquidity
             return BeforeSwapDeltaLibrary.ZERO_DELTA;
         }
         
@@ -453,6 +489,47 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         // Create the before swap delta to represent the limit order execution
         return _createBeforeSwapDelta(params.zeroForOne, limitOrderFulfillment);
+    }
+
+    /**
+     * @notice Provide AMM liquidity using hook's token balances when no limit orders available
+     * @param key The pool key
+     * @param params The swap parameters
+     * @return delta The before swap delta representing AMM liquidity provision
+     */
+    function _provideAMMliquidity(PoolKey calldata key, SwapParams calldata params) 
+        internal returns (BeforeSwapDelta) {
+        
+        // Get hook's token balances
+        uint256 ethBalance = address(this).balance;
+        address usdcAddress = Currency.unwrap(key.currency1);
+        uint256 usdcBalance = IERC20(usdcAddress).balanceOf(address(this));
+        
+        // Only provide liquidity if we have both tokens
+        if (ethBalance == 0 || usdcBalance == 0) {
+            return BeforeSwapDeltaLibrary.ZERO_DELTA;
+        }
+        
+        // Calculate swap amount (use absolute value)
+        uint256 swapAmount = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+        
+        // Provide liquidity up to available balance
+        uint256 liquidityAmount;
+        if (params.zeroForOne) {
+            // Swapping ETH for USDC, use ETH balance
+            liquidityAmount = _min(swapAmount, ethBalance);
+        } else {
+            // Swapping USDC for ETH, use USDC balance  
+            liquidityAmount = _min(swapAmount, usdcBalance);
+        }
+        
+        // Only provide liquidity if we have a meaningful amount
+        if (liquidityAmount < 1e15) { // Minimum 0.001 ETH or equivalent
+            return BeforeSwapDeltaLibrary.ZERO_DELTA;
+        }
+        
+        // Create the before swap delta to represent AMM liquidity
+        return _createBeforeSwapDelta(params.zeroForOne, liquidityAmount);
     }
 
     /**
@@ -572,8 +649,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Internal function to add liquidity via PositionManager
-     * @dev External function to allow try/catch - simplified to not fail batch order creation
+     * @notice Internal function to add general liquidity
+     * @dev Simplified to not fail batch order creation
      */
 
 
@@ -954,11 +1031,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Decode the operation type from the first part of data
         if (data.length > 64) {
             // Try to decode as general liquidity operation
-            (string memory operation) = abi.decode(data, (string));
+            (string memory operationType) = abi.decode(data, (string));
             
-            if (keccak256(abi.encodePacked(operation)) == keccak256(abi.encodePacked("general_liquidity"))) {
-                (, PoolKey memory key, ModifyLiquidityParams memory params) = abi.decode(data, (string, PoolKey, ModifyLiquidityParams));
-                return _handleGeneralLiquidityOperation(key, params);
+            if (keccak256(abi.encodePacked(operationType)) == keccak256(abi.encodePacked("general_liquidity"))) {
+                (, PoolKey memory key, ModifyLiquidityParams memory liquidityParams) = abi.decode(data, (string, PoolKey, ModifyLiquidityParams));
+                return _handleGeneralLiquidityOperation(key, liquidityParams);
             }
             
             // Try to decode as batch order liquidity operation
@@ -966,9 +1043,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
                 PoolKey memory liquidityKey,
                 uint256 amount,
                 bool zeroForOne,
-                string memory operation
+                string memory batchOperation
             ) {
-                if (keccak256(abi.encodePacked(operation)) == keccak256(abi.encodePacked("ADD_LIQUIDITY"))) {
+                if (keccak256(abi.encodePacked(batchOperation)) == keccak256(abi.encodePacked("ADD_LIQUIDITY"))) {
                     return _handleLiquidityOperation(liquidityKey, amount, zeroForOne);
                 }
             } catch {
@@ -977,8 +1054,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         }
         
         // Default: handle as swap operation
-        (PoolKey memory swapKey, SwapParams memory params) = abi.decode(data, (PoolKey, SwapParams));
-        BalanceDelta delta = poolManager.swap(swapKey, params, "");
+        (PoolKey memory swapKey, SwapParams memory swapParams) = abi.decode(data, (PoolKey, SwapParams));
+        BalanceDelta delta = poolManager.swap(swapKey, swapParams, "");
         return abi.encode(delta);
     }
 
@@ -1458,24 +1535,11 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             salt: bytes32(0)
         });
         
-        // Store amounts for use in callback
-        _tempAmount0 = amount0;
-        _tempAmount1 = amount1;
-        
         // Add liquidity through unlock callback
         poolManager.unlock(abi.encode("general_liquidity", key, params));
         
-        // Clear temp storage
-        delete _tempAmount0;
-        delete _tempAmount1;
-        
         emit LiquidityAdded(key.toId(), amount0, amount1, -600, 600);
     }
-    
-    // Temporary storage for liquidity amounts (used in callback)
-    uint256 private _tempAmount0;
-    uint256 private _tempAmount1;
-
     // ========== FALLBACKS ==========
 
     receive() external payable {}
