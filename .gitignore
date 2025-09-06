@@ -47,4 +47,3 @@ forge-cache/
 package-lock.json
 yarn.lock
 /lib
-/lib
