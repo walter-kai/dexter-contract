@@ -344,7 +344,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             afterRemoveLiquidityReturnDelta: false
         });
     }
-
+    
+    // @note shoudnt we enforce the dynamic fees if no we can disable this hook 
     function _beforeInitialize(address /* sender */, PoolKey calldata /* key */, uint160 /* sqrtPriceX96 */) internal pure override returns (bytes4) {
         // For development, allow both static and dynamic fees
         // if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
@@ -356,6 +357,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         // Simple pool initialization tracking
         PoolId poolId = key.toId();
+        //@note  how it can be initialized and this is the first time 
         if (!poolInitialized[poolId]) {
             poolInitialized[poolId] = true;
             
@@ -373,12 +375,14 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata) 
         internal override returns (bytes4, BeforeSwapDelta, uint24) {
         // Skip hook processing if the sender is this contract (to avoid recursion)
+        // @note we should return 
         if (sender == address(this)) {
             uint24 baseFee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, baseFee);
         }
 
         // Process limit orders that can satisfy the swap
+        // @note if we doing it before the swap the swapper (user who swap a for b) get manipulated price (lower or higher)
         BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
         
         // Use fixed fee for simplified version - tools contract can override for dynamic fees
@@ -408,6 +412,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Only handle settlement for AMM swaps (when no limit orders were processed)
         // We check if this swap used hook's AMM liquidity by seeing if we have the tokens
         uint256 ethBalance = address(this).balance;
+        // @note is it like always the usdc address is the first address ? no it not 
         address usdcAddress = Currency.unwrap(key.currency1);
         uint256 usdcBalance = IERC20(usdcAddress).balanceOf(address(this));
         
@@ -422,6 +427,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             if (delta.amount1() < 0) {
                 uint256 usdcToProvide = uint256(uint128(-delta.amount1()));
                 if (usdcToProvide <= usdcBalance) {
+                    // @note use safe transfer ?? 
                     IERC20(usdcAddress).transfer(address(poolManager), usdcToProvide);
                 }
             }
@@ -449,6 +455,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Check if pool is initialized by checking if currentTick is accessible
         // If this fails, it means the pool isn't initialized yet
         int24 currentTick;
+    // @note we only call init pool ? 
         try this.getPoolCurrentTick(key.toId()) returns (int24 tick) {
             currentTick = tick;
         } catch {
@@ -500,6 +507,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @param params The swap parameters
      * @return delta The before swap delta representing AMM liquidity provision
      */
+    // @note not used at all 
     function _provideAMMliquidity(PoolKey calldata key, SwapParams calldata params) 
         internal view returns (BeforeSwapDelta) {
         
@@ -508,7 +516,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         address usdcAddress = Currency.unwrap(key.currency1);
         uint256 usdcBalance = IERC20(usdcAddress).balanceOf(address(this));
         
-        // Only provide liquidity if we have both tokens
+        // Only provide liquidity if we have both tokens 
+        // @note we can have both token but one of them is 0 ? ig NO  
+        // but why it restricted to native coin 
         if (ethBalance == 0 || usdcBalance == 0) {
             return BeforeSwapDeltaLibrary.ZERO_DELTA;
         }
@@ -538,6 +548,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     /**
      * @notice External function to safely get current tick (used for try-catch)
      */
+    // @note make this internal 
     function getPoolCurrentTick(PoolId poolId) external view returns (int24) {
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, poolId);
         return currentTick;
@@ -561,6 +572,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return PoolKey({
             currency0: Currency.wrap(currency0),
             currency1: Currency.wrap(currency1),
+            // @note here we force dynamoic fee but in the before init we dont ? 
             fee: fee | 0x800000, // Force dynamic fee
             tickSpacing: _getTickSpacing(fee),
             hooks: IHooks(address(this))
@@ -746,7 +758,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Fee already deducted at execution time, just transfer to user
         outputToken.transfer(msg.sender, outputAmount);
     }
-
+    
+    // @note not called at all 
     function _processOrdersWithDelta(
         PoolKey calldata key,
         SwapParams calldata /* params */,
@@ -825,7 +838,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Return negative delta when hook provides tokens to pool
         return zeroForOne ? -int128(int256(outputAmount)) : int128(int256(outputAmount));
     }
-
+    // @note this called in a function never used 
     function _updateLimitOrderState(
         PoolKey calldata key,
         int24 fromTick,
@@ -858,7 +871,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             }
         }
     }
-
+    // @note this called in a function never used 
     function _executeLimitOrderAtTick(
         PoolKey calldata key,
         int24 tick,
@@ -925,7 +938,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Clear batch IDs array
         delete tickToBatchIds[poolId][tick][zeroForOne];
     }
-
+    // @note this called in a function never used 
     function _getBatchAmountAtTick(uint256 batchId, int24 tick) internal view returns (uint256) {
         uint256 ticksLength = batchOrders[batchId].ticksLength;
         unchecked {
