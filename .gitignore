@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Build outputs
 /cache
 /out
@@ -47,3 +48,55 @@ forge-cache/
 package-lock.json
 yarn.lock
 /lib
+=======
+# Build outputs
+/cache
+/out
+/broadcast
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+/lib
+
+# IDE files
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# Forge specific
+forge-cache/
+.forge-snapshots/
+
+# TypeScript
+*.tsbuildinfo
+
+# Package manager lock files (optional - some prefer to commit these)
+package-lock.json
+yarn.lock
+/lib
+/lib
+>>>>>>> origin/main
