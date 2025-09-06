@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.25;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -16,6 +16,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
@@ -116,6 +117,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     event LiquidityAdded(PoolId indexed poolId, uint256 amount0, uint256 amount1, int24 tickLower, int24 tickUpper);
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
+    event LiquidityAdditionFailed(PoolId indexed poolId, uint256 amount, string reason);
 
     // ========== MODIFIERS ==========
     modifier onlyOwner() {
@@ -249,16 +251,44 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return BaseHook.beforeInitialize.selector;
     }
 
-    function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick, , ) internal override returns (bytes4) {
+    function _afterInitialize(
+        address sender,
+        PoolKey calldata key,
+        uint160 sqrtPriceX96,
+        int24 tick,
+        uint8 protocolFee,
+        uint8 hookFee
+    ) internal override returns (bytes4) {
         lastTicks[key.toId()] = tick;
-        _trackPoolInitialization(key.toId(), tick);
+        
+        // Simple pool initialization tracking
+        PoolId poolId = key.toId();
+        if (!poolInitialized[poolId]) {
+            poolInitialized[poolId] = true;
+            allPoolIds.push(poolId);
+            poolIdToKey[poolId] = key;
+            poolIndex[poolId] = allPoolIds.length - 1;
+            emit PoolInitializationTracked(poolId, tick, block.timestamp);
+        }
+        
         return BaseHook.afterInitialize.selector;
     }
 
     function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata) 
-        internal override returns (bytes4, BeforeSwapDelta) {
-        if (sender == address(this)) return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA);
-        return (BaseHook.beforeSwap.selector, _processLimitOrdersBeforeSwap(key, params));
+        internal override returns (bytes4, BeforeSwapDelta, uint24) {
+        if (sender == address(this)) {
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE);
+        }
+
+        int24 currentTick = _getCurrentTick(key);
+        int24 targetTick = _getTargetTick(params.sqrtPriceLimitX96, params.zeroForOne);
+        
+        // Process limit orders that can satisfy the swap
+        BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
+        
+        // Use fixed fee for simplified version
+        uint24 fee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        return (BaseHook.beforeSwap.selector, delta, fee);
     }
 
     function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata) 
@@ -291,6 +321,77 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     // ========== UTILITY FUNCTIONS ==========
+    function _addLiquidityFromDeposit(PoolKey memory key, bool zeroForOne, uint256 totalAmount) internal {
+        if (totalAmount < 1000) return;
+        
+        uint256 liquidityAmount = totalAmount / 4;
+        if (liquidityAmount == 0) return;
+        
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: -887272,
+            tickUpper: 887272,
+            liquidityDelta: int256(uint256(liquidityAmount))
+        });
+        
+        try poolManager.modifyLiquidity(key, params, "") {
+            emit LiquidityAdded(key.toId(), liquidityAmount, liquidityAmount, params.tickLower, params.tickUpper);
+        } catch {
+            emit LiquidityAdditionFailed(key.toId(), liquidityAmount, "Failed to add liquidity");
+        }
+    }
+
+    function _handleGeneralLiquidityOperation(
+        PoolKey memory key,
+        ModifyLiquidityParams memory params
+    ) internal returns (bytes memory) {
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(key, params, "");
+        return abi.encode(delta);
+    }
+
+    function _handleLiquidityOperation(
+        PoolKey memory key,
+        uint256 amount,
+        bool zeroForOne
+    ) internal returns (bytes memory) {
+        int24 tickSpacing = key.tickSpacing;
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: currentTick - (100 * tickSpacing),
+            tickUpper: currentTick + (100 * tickSpacing),
+            liquidityDelta: int256(uint256(amount))
+        });
+        
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(key, params, "");
+        return abi.encode(delta);
+    }
+
+    function _getTickSpacing(uint24 fee) internal pure returns (int24) {
+        if (fee == 100) return 1;
+        if (fee == 500) return 10;
+        if (fee == 3000) return 60;
+        if (fee == 10000) return 200;
+        return 60;
+    }
+
+    function _calculateEstimatedGasFee() internal view returns (uint256) {
+        uint256 estimatedCost = ESTIMATED_EXECUTION_GAS * tx.gasprice;
+        estimatedCost = (estimatedCost * GAS_PRICE_BUFFER_MULTIPLIER) / 100;
+        
+        if (estimatedCost > MAX_GAS_FEE_ETH) {
+            return MAX_GAS_FEE_ETH;
+        }
+        
+        return estimatedCost;
+    }
+
+    function _getTargetTick(uint160 sqrtPriceLimitX96, bool zeroForOne) internal pure returns (int24) {
+        if (sqrtPriceLimitX96 == 0) {
+            return zeroForOne ? TickMath.MIN_TICK + 1 : TickMath.MAX_TICK - 1;
+        }
+        return TickMath.getTickAtSqrtPrice(sqrtPriceLimitX96);
+    }
+
     function _validateOrderInputs(
         uint256[] memory targetPrices,
         uint256[] memory targetAmounts,
@@ -327,16 +428,21 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256) {
         uint256 length = amounts.length;
         require(length > 0, "Empty arrays");
+        uint256 totalSum = 0;
         unchecked {
-            uint256 total;
             for (uint256 i; i < length; ++i) {
                 uint256 amount = amounts[i];
                 require(amount > 0, "Invalid amount");
-                total += amount;
+                totalSum += amount;
             }
         }
-        require(total > 0, "Invalid total");
-        return total;
+        require(totalSum > 0, "Invalid total");
+        return totalSum;
+    }
+
+    function _getCurrentTick(PoolKey memory key) internal view returns (int24) {
+        (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        return tick;
     }
 
     function _ensurePoolInitialized(PoolKey memory key) internal {
@@ -456,19 +562,21 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     function _findLimitOrdersInRange(
-        PoolId poolId,
+        PoolKey calldata key,
         int24 currentTick,
         int24 targetTick,
         bool zeroForOne
     ) internal view returns (uint256) {
+        PoolId poolId = key.toId();
         uint256 totalAmount = 0;
         bool ascending = targetTick > currentTick;
+        int24 spacing = key.tickSpacing;
         if (ascending) {
-            for (int24 tick = currentTick; tick <= targetTick; tick += key.tickSpacing) {
+            for (int24 tick = currentTick; tick <= targetTick; tick += spacing) {
                 totalAmount += pendingBatchOrders[poolId][tick][!zeroForOne];
             }
         } else {
-            for (int24 tick = currentTick; tick >= targetTick; tick -= key.tickSpacing) {
+            for (int24 tick = currentTick; tick >= targetTick; tick -= spacing) {
                 totalAmount += pendingBatchOrders[poolId][tick][!zeroForOne];
             }
         }
@@ -573,7 +681,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         poolInitialized[poolId] = true;
         poolIndex[poolId] = allPoolIds.length;
         allPoolIds.push(poolId);
-        poolIdToKey[poolId] = PoolKeyLibrary.fromId(poolId);
+        poolIdToKey[poolId] = key;
         emit PoolInitializationTracked(poolId, initialTick, block.timestamp);
     }
 
@@ -603,7 +711,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         }
         return baseProtocolFee;
     }
-
     function processGasRefund(uint256 batchId) external onlyOwner {
         require(!gasRefundProcessed[batchId], "Refund already processed");
         require(!batchOrders[batchId].isActive, "Batch still active");

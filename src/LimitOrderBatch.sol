@@ -573,7 +573,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return tick;
     }
 
-        function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
+    function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
         uint256 length = prices.length;
         ticks = new int24[](length);
         unchecked {
@@ -583,7 +583,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         }
     }
 
-        function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256 total) {
+    function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256 total) {
         uint256 length = amounts.length;
         require(length > 0, "Empty arrays");
         unchecked {
@@ -609,7 +609,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             // Pool is already initialized
             return;
         }
-        
+        // @note make sure it correct and make it variable 
         // Initialize pool with 1:1 ratio (sqrt(1) * 2^96)
         uint160 initPrice = 79228162514264337593543950336;
         poolManager.initialize(key, initPrice);
@@ -676,11 +676,15 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             totalAmount: uint96(totalAmount),
             poolKey: key,
             expirationTime: uint64(deadline),
+            // @note the user pass it because accumulated 3% is alot 
+            // the market in his peak can reach 10% and user is oki with this 
             maxSlippageBps: 300,  // Fixed 3% slippage
+            // @note why no timeout 
             bestPriceTimeout: 0,  // No timeout
             ticksLength: uint16(targetTicks.length),
             zeroForOne: zeroForOne,
             isActive: true,
+            // @audit buggy 
             minOutputAmount: 0    // No minimum output requirement
         });
 
@@ -701,6 +705,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         // Calculate and collect gas fee
         uint256 estimatedGasFee = _calculateEstimatedGasFee();
+        // @note can handle it better 
         uint256 batchId = nextBatchOrderId - 1; // Current batch ID (already incremented in _createBatch)
         preCollectedGasFees[batchId] = estimatedGasFee;
         
@@ -708,6 +713,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             // ETH case: require total amount + gas fee
             require(msg.value >= totalAmount + estimatedGasFee, "Insufficient ETH for order + gas");
             if (msg.value > totalAmount + estimatedGasFee) {
+                //@note use call here 
                 payable(msg.sender).transfer(msg.value - totalAmount - estimatedGasFee);
             }
         } else {
@@ -1100,6 +1106,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     /**
      * @notice Helper to decode liquidity operation data (external for try/catch)
      */
+    // @note make this internal  
     function _decodeLiquidityOperation(bytes calldata data) external pure returns (
         PoolKey memory key,
         uint256 amount,
@@ -1518,6 +1525,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @notice Add general liquidity to a pool for trading
      * @dev This provides liquidity across a wide price range for general trading
      */
+    // @note we need to redesign this and coded again 
     function addGeneralLiquidity(
         address currency0,
         address currency1,
@@ -1532,7 +1540,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             tickSpacing: 60, // Standard tick spacing for dynamic fee
             hooks: IHooks(address(this))
         });
-        
+        // @note this the user should pass it because it depends on pair and prices 
         // Wide range for general liquidity: -600 to +600 ticks
         ModifyLiquidityParams memory params = ModifyLiquidityParams({
             tickLower: -600,
