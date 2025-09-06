@@ -49,7 +49,7 @@ contract SimpleTest is Test {
         );
         
         // Mock PositionManager for testing
-        IPositionManager mockPositionManager = IPositionManager(address(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e));
+        // IPositionManager mockPositionManager = IPositionManager(address(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e));
         
         (address hookAddress, bytes32 salt) = HookMiner.find(
             address(this),

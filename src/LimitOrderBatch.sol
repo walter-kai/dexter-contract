@@ -109,8 +109,9 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
 
     // ========== CONSTANTS ==========
-    
+    // @note the fees are fucked up 
     uint24 public constant BASE_FEE = 3000; // 0.3%
+    // @note not used 
     uint256 public constant MAX_SLIPPAGE_BPS = 500; // 5%
     uint256 public constant BASE_PROTOCOL_FEE_BPS = 35; // 0.35% base protocol fee
     uint256 public constant FEE_BASIS_POINTS = 35; // Backward compatibility - same as BASE_PROTOCOL_FEE_BPS
@@ -122,12 +123,13 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether; // Cap at 0.01 ETH
     
     // Tools constants (minimal)
+
     
     address public immutable FEE_RECIPIENT;
     address public owner;
 
     // ========== ERRORS ==========
-    
+    // @note error not used at all 
     error InvalidOrder();
     error NothingToClaim();
     error NotEnoughToClaim();
@@ -143,6 +145,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     event GasPriceTrackedOptimized(uint128 gasPrice, uint128 newAverage, uint104 count);
     
     // Gas fee events
+    // @note many not emitted 
     event GasFeePreCollected(uint256 indexed batchId, uint256 estimatedGasFee);
     event GasFeeConsumed(uint256 indexed batchId, uint256 actualGasCost, uint256 protocolFee);
     event GasFeeRefunded(uint256 indexed batchId, address indexed user, uint256 refundAmount);
@@ -336,7 +339,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             beforeDonate: false,
             afterDonate: false,
             beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: true,
+            afterSwapReturnDelta: true, // @note why we enable this ?? 
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
@@ -498,7 +501,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @return delta The before swap delta representing AMM liquidity provision
      */
     function _provideAMMliquidity(PoolKey calldata key, SwapParams calldata params) 
-        internal returns (BeforeSwapDelta) {
+        internal view returns (BeforeSwapDelta) {
         
         // Get hook's token balances
         uint256 ethBalance = address(this).balance;
@@ -944,6 +947,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      */
     function _calculateEstimatedGasFee() internal view returns (uint256) {
         uint256 estimatedCost = ESTIMATED_EXECUTION_GAS * tx.gasprice;
+        // @note we should divide it by 1000 if we need 20% 
         estimatedCost = (estimatedCost * GAS_PRICE_BUFFER_MULTIPLIER) / 100;
         
         // Cap the gas fee to prevent excessive charges
@@ -985,7 +989,8 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     /**
      * @notice Process gas fee refund for completed batch orders
      */
-    function processGasRefund(uint256 batchId) external {
+    // @note we can call this inside the function but we adding more gas fees 
+     function processGasRefund(uint256 batchId) external {
         require(!gasRefundProcessed[batchId], "Refund already processed");
         require(!batchOrders[batchId].isActive, "Batch still active");
         
@@ -997,6 +1002,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             gasRefundProcessed[batchId] = true;
             
             address user = batchOrders[batchId].user;
+            // @note use call 
             payable(user).transfer(refundAmount);
             
             emit GasFeeRefunded(batchId, user, refundAmount);
@@ -1109,7 +1115,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     function _handleLiquidityOperation(
         PoolKey memory key,
         uint256 amount,
-        bool zeroForOne
+         bool zeroForOne
     ) internal returns (bytes memory) {
         // Get current pool state
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
@@ -1479,7 +1485,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         // Clean up if tick is now empty
         if (pendingBatchOrders[poolId][tick][zeroForOne] == 0) {
             delete tickToBatchIds[poolId][tick][zeroForOne];
-        }
+        } 
     }
 
     /**

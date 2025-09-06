@@ -50,7 +50,7 @@ library BatchOrderLogic {
      * @param currentTick Current pool tick
      * @param bestPriceQueue Storage reference to the queue
      * @param queueIndex Storage reference to queue index
-     * @param poolManager Pool manager instance
+     * // poolManager Pool manager instance
      * @param contractAddress Address of the calling contract
      */
     function processQueuedOrders(
@@ -58,7 +58,7 @@ library BatchOrderLogic {
         int24 currentTick,
         mapping(PoolId => QueuedOrder[]) storage bestPriceQueue,
         mapping(PoolId => uint256) storage queueIndex,
-        IPoolManager poolManager,
+        // IPoolManager poolManager,
         address contractAddress
     ) external {
         PoolId poolId = key.toId();

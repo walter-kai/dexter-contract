@@ -6,6 +6,7 @@ pragma solidity ^0.8.20;
  * @notice Utility library for network detection and configuration
  * @dev Provides functions to detect the current network environment
  */
+// @note this is also not used 
 library NetworkUtils {
     // Known chain IDs
     uint256 constant MAINNET_CHAIN_ID = 1;

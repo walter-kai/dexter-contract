@@ -17,6 +17,7 @@ import {PriceLibrary} from "../libraries/PriceLibrary.sol";
  * @title PoolManagerBase
  * @notice Abstract base contract for pool management functionality
  */
+// @note why this contract is abstract we dont use it and we dont need it ig
 abstract contract PoolManagerBase {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
