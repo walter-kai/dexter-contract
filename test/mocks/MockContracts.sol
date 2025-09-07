@@ -8,7 +8,6 @@ import "../../src/interfaces/ILimitOrderBatch.sol";
 import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
@@ -257,7 +256,7 @@ contract MockPoolManager {
     // Mock swap function for the callback
     function swap(
         PoolKey memory /* poolKey */,
-        SwapParams memory swapParams,
+        IPoolManager.SwapParams memory swapParams,
         bytes memory /* hookData */
     ) external returns (BalanceDelta) {
         require(!shouldFail, "Mock swap failed");

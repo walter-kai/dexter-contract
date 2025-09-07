@@ -9,4 +9,4 @@
 	url = https://github.com/OpenZeppelin/openzeppelin-contracts
 [submodule "lib/v4-core"]
 	path = lib/v4-core
-	url = https://github.com/uniswap/v4-core
+	url = https://github.com/Uniswap/v4-core

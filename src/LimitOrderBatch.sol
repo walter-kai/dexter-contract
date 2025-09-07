@@ -15,7 +15,6 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
-import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
@@ -367,7 +366,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata) 
+    function _beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata) 
         internal override returns (bytes4, BeforeSwapDelta, uint24) {
         // Skip hook processing if the sender is this contract (to avoid recursion)
         if (sender == address(this)) {
@@ -383,7 +382,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return (BaseHook.beforeSwap.selector, delta, fee);
     }
 
-    function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata) 
+    function _afterSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta, bytes calldata) 
         internal override returns (bytes4, int128) {
         // Skip hook processing if the sender is this contract (to avoid recursion)
         if (sender == address(this)) return (BaseHook.afterSwap.selector, 0);
@@ -401,7 +400,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     /**
      * @notice Handle settlement of tokens when hook provides AMM liquidity
      */
-    function _handleAMMSettlement(PoolKey calldata key, SwapParams calldata params, BalanceDelta delta) internal {
+    function _handleAMMSettlement(PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta) internal {
         // Only handle settlement for AMM swaps (when no limit orders were processed)
         // We check if this swap used hook's AMM liquidity by seeing if we have the tokens
         uint256 ethBalance = address(this).balance;
@@ -440,7 +439,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @param params The swap parameters
      * @return delta The before swap delta representing limit order execution
      */
-    function _processLimitOrdersBeforeSwap(PoolKey calldata key, SwapParams calldata params) 
+    function _processLimitOrdersBeforeSwap(PoolKey calldata key, IPoolManager.SwapParams calldata params) 
         internal returns (BeforeSwapDelta) {
         
         // Check if pool is initialized by checking if currentTick is accessible
@@ -497,7 +496,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @param params The swap parameters
      * @return delta The before swap delta representing AMM liquidity provision
      */
-    function _provideAMMliquidity(PoolKey calldata key, SwapParams calldata params) 
+    function _provideAMMliquidity(PoolKey calldata key, IPoolManager.SwapParams calldata params) 
         internal returns (BeforeSwapDelta) {
         
         // Get hook's token balances
