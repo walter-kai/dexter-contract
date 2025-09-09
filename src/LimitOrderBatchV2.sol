@@ -186,7 +186,7 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
         emit BatchOrderCreatedOptimized(batchId, msg.sender, totalAmount);
         return batchId;
     }
-    
+         
     /* ==========================================================
        CANCEL / REDEEM – identical to previous file
        ========================================================== */
