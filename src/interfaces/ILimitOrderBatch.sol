@@ -66,7 +66,8 @@ interface ILimitOrderBatch {
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
-        uint256 deadline
+        uint256 deadline,
+        bool provideLiquidity
     ) external payable returns (uint256 batchId);
 
     function cancelBatchOrder(uint256 batchId) external;

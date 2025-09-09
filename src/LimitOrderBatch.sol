@@ -7,6 +7,7 @@ import {ILimitOrderBatch} from "./interfaces/ILimitOrderBatch.sol";
 import {ERC6909Base} from "./base/ERC6909Base.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -44,27 +45,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     mapping(uint256 => uint256) public claimTokensSupply;
     mapping(PoolId => mapping(int24 => mapping(bool => uint256[]))) internal tickToBatchIds;
     
-    // Additional storage for limit order tracking
-    mapping(bytes32 => uint256) public limitOrderAmounts; // keccak256(poolId, tick, zeroForOne) => amount
-    mapping(bytes32 => address) public limitOrderUsers;   // keccak256(poolId, tick, zeroForOne) => user
-    
     // ========== EVENTS ==========
-    
-    event LimitOrderPlaced(
-        PoolId indexed poolId,
-        int24 indexed tick,
-        bool zeroForOne,
-        uint256 amount,
-        address indexed user
-    );
-    
-    event LimitOrderExecuted(
-        PoolId indexed poolId,
-        int24 indexed tick,
-        bool zeroForOne,
-        uint256 amount,
-        address indexed user
-    );
 
     // Gas fee management
     mapping(uint256 => uint256) public preCollectedGasFees;
@@ -88,12 +69,12 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         uint256 minOutputAmount;        // 32 bytes (separate slot)
     }
-    
+
     // Store arrays separately to avoid dynamic array gas costs
     mapping(uint256 => int24[]) public batchTargetTicks;
     mapping(uint256 => uint256[]) public batchTargetAmounts;
     
-    mapping(uint256 => BatchInfo) public batchOrders;
+    mapping(uint256 => BatchInfo) public batchInfos;
     uint256 public nextBatchOrderId = 1;
 
     // ========== SIMPLIFIED STORAGE ==========
@@ -112,17 +93,14 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     uint24 public constant BASE_FEE = 3000; // 0.3%
     uint256 public constant MAX_SLIPPAGE_BPS = 500; // 5%
     uint256 public constant BASE_PROTOCOL_FEE_BPS = 35; // 0.35% base protocol fee
-    uint256 public constant FEE_BASIS_POINTS = 35; // Backward compatibility - same as BASE_PROTOCOL_FEE_BPS
     uint256 public constant BASIS_POINTS_DENOMINATOR = 10000;
     
     // Gas estimation constants
-    uint256 public constant ESTIMATED_EXECUTION_GAS = 150000; // Conservative estimate
-    uint256 public constant GAS_PRICE_BUFFER_MULTIPLIER = 120; // 20% buffer (120%)
-    uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether; // Cap at 0.01 ETH
-    
+    uint256 public constant ESTIMATED_EXECUTION_GAS = 200000;
+    uint256 public constant GAS_PRICE_BUFFER_MULTIPLIER = 120; // 20% buffer
+    uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether; // Maximum gas fee cap
+
     // Tools constants (minimal)
-    
-    address public immutable FEE_RECIPIENT;
     address public owner;
 
     // ========== ERRORS ==========
@@ -135,7 +113,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     // ========== EVENTS ==========
     
-    event BatchOrderCreatedOptimized(uint256 indexed batchId, address indexed user, uint256 totalAmount);
     event BatchLevelExecutedOptimized(uint256 indexed batchId, uint256 tick, uint256 amount);
     event BatchOrderCancelledOptimized(uint256 indexed batchId, address indexed user);
     event TokensRedeemedOptimized(uint256 indexed batchId, address indexed user, uint256 amount);
@@ -150,6 +127,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     event LiquidityProvisionAttempted(PoolId indexed poolId, uint256 amount, bool zeroForOne);
     event LiquidityAdded(PoolId indexed poolId, uint256 amount0, uint256 amount1, int24 tickLower, int24 tickUpper);
     event LiquidityAdditionFailed(PoolId indexed poolId, uint256 amount, string reason);
+    event LimitOrderAsLiquidityCreated(uint256 indexed batchId, address indexed user, PoolId indexed poolId, int24 tick, uint256 amount);
     
     // Simplified events
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
@@ -163,7 +141,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
 
     modifier validBatchOrder(uint256 batchId) {
         require(batchId > 0 && batchId < nextBatchOrderId, "Invalid batch ID");
-        require(batchOrders[batchId].isActive, "Order not active");
+        require(batchInfos[batchId].isActive, "Order not active");
         _;
     }
 
@@ -175,13 +153,61 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         require(_feeRecipient != address(0), "Invalid fee recipient");
         require(_owner != address(0), "Invalid owner");
         owner = _owner;
-        FEE_RECIPIENT = _feeRecipient;
     }
+
+
+    /**
+     * @notice Redeem executed order output tokens
+     */    // ========== HOOK IMPLEMENTATIONS ==========
+
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: true,   // Re-enable to enforce dynamic fees
+            afterInitialize: true,    // Re-enable for pool tracking
+            beforeSwap: true,
+            afterSwap: true,
+            beforeAddLiquidity: false,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: true,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
 
     // ========== CORE FUNCTIONS ==========
 
     /**
-     * @notice Create a batch limit order
+     * @notice Create a batch limit order with optional liquidity provision
+     * @param currency0 First token address 
+     * @param currency1 Second token address
+     * @param fee Pool fee tier
+     * @param zeroForOne Direction of the trade
+     * @param targetPrices Array of target prices for execution
+     * @param targetAmounts Array of amounts for each price level
+     * @param deadline Expiration time for the order
+     * @param provideLiquidity Choose order execution method:
+     *        - false: Traditional limit orders (stored separately, executed via afterSwap)
+     *        - true: Liquidity-based limit orders (added as concentrated liquidity, earns fees)
+     * @return batchId The ID of the created batch order
+     * 
+     * @dev Traditional vs Liquidity-based limit orders:
+     * 
+     * Traditional (provideLiquidity = false):
+     * - Orders stored in mapping, executed when price crosses tick
+     * - Exact price execution, no fee earning while waiting
+     * - Better for short-term traders who want precise fills
+     * 
+     * Liquidity-based (provideLiquidity = true):
+     * - Orders become concentrated liquidity at target ticks
+     * - Earn trading fees while waiting for execution
+     * - Capital is productive, helps pool liquidity
+     * - Better for longer-term positions
      */
     function createBatchOrder(
         address currency0,
@@ -190,37 +216,16 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
-        uint256 deadline
+        uint256 deadline,
+        bool provideLiquidity // New parameter: true = provide liquidity at target ticks, false = traditional limit orders
     ) external payable virtual returns (uint256 batchId) {
-        return _createBatchOrderInternal(
-            currency0,
-            currency1,
-            fee,
-            zeroForOne,
-            targetPrices,
-            targetAmounts,
-            deadline
-        );
-    }
-
-    /**
-     * @notice Internal batch order creation logic
-     */
-    function _createBatchOrderInternal(
-        address currency0,
-        address currency1,
-        uint24 fee,
-        bool zeroForOne,
-        uint256[] memory targetPrices,
-        uint256[] memory targetAmounts,
-        uint256 deadline
-    ) internal returns (uint256 batchId) {
         _validateOrderInputs(targetPrices, targetAmounts, deadline, currency0, currency1);
         
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
         
-        // Initialize pool if it doesn't exist
-        _ensurePoolInitialized(key);
+        // Check if pool exists
+        (uint160 currentPrice, , , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        require(currentPrice > 0, "Pool does not exist");
         
         int24[] memory targetTicks = _pricesToTicks(targetPrices);
         uint256 totalAmount = _sumAmounts(targetAmounts);
@@ -228,11 +233,12 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         batchId = _createBatch(key, targetTicks, targetAmounts, totalAmount, zeroForOne, deadline);
         _handleTokenDeposit(key, zeroForOne, totalAmount);
         
-        // Add liquidity using a portion of the deposited tokens
-        _addLiquidityFromDeposit(key, zeroForOne, totalAmount);
+        // Optional: Provide liquidity at target ticks instead of traditional limit orders
+        if (provideLiquidity) {
+            _createLimitOrderAsLiquidity(key, targetTicks, targetAmounts, zeroForOne, batchId);
+        }
         
         emit BatchOrderCreated(batchId, msg.sender, currency0, currency1, totalAmount, targetPrices, targetAmounts);
-        emit BatchOrderCreatedOptimized(batchId, msg.sender, totalAmount);
         
         return batchId;
     }
@@ -241,7 +247,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @notice Cancel batch order - refunds only the unexecuted portion
      */
     function cancelBatchOrder(uint256 batchOrderId) external validBatchOrder(batchOrderId) {
-        BatchInfo storage batch = batchOrders[batchOrderId];
+        BatchInfo storage batch = batchInfos[batchOrderId];
         require(batch.user == msg.sender, "Not authorized");
         
         uint256 userClaimBalance = balanceOf[msg.sender][batchOrderId];
@@ -318,29 +324,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         emit TokensRedeemedOptimized(batchOrderId, msg.sender, outputAmount);
     }
 
-    /**
-     * @notice Redeem executed order output tokens
-     */    // ========== HOOK IMPLEMENTATIONS ==========
-
-    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
-        return Hooks.Permissions({
-            beforeInitialize: true,   // Re-enable to enforce dynamic fees
-            afterInitialize: true,    // Re-enable for pool tracking
-            beforeSwap: true,
-            afterSwap: true,
-            beforeAddLiquidity: false,
-            afterAddLiquidity: false,
-            beforeRemoveLiquidity: false,
-            afterRemoveLiquidity: false,
-            beforeDonate: false,
-            afterDonate: false,
-            beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: true,
-            afterAddLiquidityReturnDelta: false,
-            afterRemoveLiquidityReturnDelta: false
-        });
-    }
-
     function _beforeInitialize(address /* sender */, PoolKey calldata /* key */, uint160 /* sqrtPriceX96 */) internal pure override returns (bytes4) {
         // For development, allow both static and dynamic fees
         // if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
@@ -366,7 +349,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata) 
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata) 
         internal override returns (bytes4, BeforeSwapDelta, uint24) {
         // Skip hook processing if the sender is this contract (to avoid recursion)
         if (sender == address(this)) {
@@ -374,169 +357,19 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, baseFee);
         }
 
-        // Process limit orders that can satisfy the swap
-        BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
-        
-        // Use fixed fee for simplified version - tools contract can override for dynamic fees
+        // Set fee and let swap proceed normally
+        // All limit order execution happens in afterSwap
         uint24 fee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-        return (BaseHook.beforeSwap.selector, delta, fee);
+        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 
-    function _afterSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta, bytes calldata) 
+    function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata) 
         internal override returns (bytes4, int128) {
-        // Skip hook processing if the sender is this contract (to avoid recursion)
-        if (sender == address(this)) return (BaseHook.afterSwap.selector, 0);
-
-        // Handle AMM liquidity settlement if hook provided liquidity
-        _handleAMMSettlement(key, params, delta);
-
         // Update last tick for tracking price movement
-        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
-        lastTicks[key.toId()] = currentTick;
+        (, int24 newTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        lastTicks[key.toId()] = newTick;
         
         return (BaseHook.afterSwap.selector, 0);
-    }
-
-    /**
-     * @notice Handle settlement of tokens when hook provides AMM liquidity
-     */
-    function _handleAMMSettlement(PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta) internal {
-        // Only handle settlement for AMM swaps (when no limit orders were processed)
-        // We check if this swap used hook's AMM liquidity by seeing if we have the tokens
-        uint256 ethBalance = address(this).balance;
-        address usdcAddress = Currency.unwrap(key.currency1);
-        uint256 usdcBalance = IERC20(usdcAddress).balanceOf(address(this));
-        
-        if (ethBalance == 0 || usdcBalance == 0) {
-            return; // No AMM settlement needed
-        }
-        
-        // For swaps that used hook's AMM liquidity, we need to settle with the pool manager
-        if (params.zeroForOne) {
-            // User swapped ETH for USDC
-            // Hook received ETH (delta.amount0 > 0), needs to provide USDC (delta.amount1 < 0)
-            if (delta.amount1() < 0) {
-                uint256 usdcToProvide = uint256(uint128(-delta.amount1()));
-                if (usdcToProvide <= usdcBalance) {
-                    IERC20(usdcAddress).transfer(address(poolManager), usdcToProvide);
-                }
-            }
-        } else {
-            // User swapped USDC for ETH  
-            // Hook received USDC (delta.amount1 > 0), needs to provide ETH (delta.amount0 < 0)
-            if (delta.amount0() < 0) {
-                uint256 ethToProvide = uint256(uint128(-delta.amount0()));
-                if (ethToProvide <= ethBalance) {
-                    payable(address(poolManager)).transfer(ethToProvide);
-                }
-            }
-        }
-    }
-
-    /**
-     * @notice Process limit orders before a swap to potentially satisfy swap demand
-     * @param key The pool key
-     * @param params The swap parameters
-     * @return delta The before swap delta representing limit order execution
-     */
-    function _processLimitOrdersBeforeSwap(PoolKey calldata key, IPoolManager.SwapParams calldata params) 
-        internal returns (BeforeSwapDelta) {
-        
-        // Check if pool is initialized by checking if currentTick is accessible
-        // If this fails, it means the pool isn't initialized yet
-        int24 currentTick;
-        try this.getPoolCurrentTick(key.toId()) returns (int24 tick) {
-            currentTick = tick;
-        } catch {
-            // Pool not initialized, return zero delta to allow normal swap
-            return BeforeSwapDeltaLibrary.ZERO_DELTA;
-        }
-        
-        // Calculate the target tick based on sqrtPriceLimitX96
-        int24 targetTick = _getTargetTick(params.sqrtPriceLimitX96, params.zeroForOne);
-        
-        // Find limit orders between current tick and target tick
-        (uint256 totalLimitOrderAmount, bool hasOrders) = _findLimitOrdersInRange(
-            key.toId(), 
-            currentTick, 
-            targetTick, 
-            params.zeroForOne,
-            key.tickSpacing
-        );
-        
-        if (!hasOrders || totalLimitOrderAmount == 0) {
-            // No limit orders available - let the pool handle the swap with its own liquidity
-            return BeforeSwapDeltaLibrary.ZERO_DELTA;
-        }
-        
-        // Calculate how much of the swap demand can be satisfied by limit orders
-        uint256 swapAmount = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        uint256 limitOrderFulfillment = _min(totalLimitOrderAmount, swapAmount);
-        
-        if (limitOrderFulfillment == 0) {
-            return BeforeSwapDeltaLibrary.ZERO_DELTA;
-        }
-        
-        // Execute the limit orders that can fulfill this swap
-        _executeLimitOrdersInRange(
-            key, 
-            currentTick, 
-            targetTick, 
-            params.zeroForOne, 
-            limitOrderFulfillment
-        );
-        
-        // Create the before swap delta to represent the limit order execution
-        return _createBeforeSwapDelta(params.zeroForOne, limitOrderFulfillment);
-    }
-
-    /**
-     * @notice Provide AMM liquidity using hook's token balances when no limit orders available
-     * @param key The pool key
-     * @param params The swap parameters
-     * @return delta The before swap delta representing AMM liquidity provision
-     */
-    function _provideAMMliquidity(PoolKey calldata key, IPoolManager.SwapParams calldata params) 
-        internal returns (BeforeSwapDelta) {
-        
-        // Get hook's token balances
-        uint256 ethBalance = address(this).balance;
-        address usdcAddress = Currency.unwrap(key.currency1);
-        uint256 usdcBalance = IERC20(usdcAddress).balanceOf(address(this));
-        
-        // Only provide liquidity if we have both tokens
-        if (ethBalance == 0 || usdcBalance == 0) {
-            return BeforeSwapDeltaLibrary.ZERO_DELTA;
-        }
-        
-        // Calculate swap amount (use absolute value)
-        uint256 swapAmount = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        
-        // Provide liquidity up to available balance
-        uint256 liquidityAmount;
-        if (params.zeroForOne) {
-            // Swapping ETH for USDC, use ETH balance
-            liquidityAmount = _min(swapAmount, ethBalance);
-        } else {
-            // Swapping USDC for ETH, use USDC balance  
-            liquidityAmount = _min(swapAmount, usdcBalance);
-        }
-        
-        // Only provide liquidity if we have a meaningful amount
-        if (liquidityAmount < 1e15) { // Minimum 0.001 ETH or equivalent
-            return BeforeSwapDeltaLibrary.ZERO_DELTA;
-        }
-        
-        // Create the before swap delta to represent AMM liquidity
-        return _createBeforeSwapDelta(params.zeroForOne, liquidityAmount);
-    }
-
-    /**
-     * @notice External function to safely get current tick (used for try-catch)
-     */
-    function getPoolCurrentTick(PoolId poolId) external view returns (int24) {
-        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, poolId);
-        return currentTick;
     }
 
     // ========== INTERNAL HELPER FUNCTIONS ==========
@@ -593,25 +426,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Ensure pool is initialized and has liquidity from batch order deposits
-     */
-    function _ensurePoolInitialized(PoolKey memory key) internal {
-        PoolId poolId = key.toId();
-        
-        // Check if pool is already initialized by checking sqrtPriceX96
-        (uint160 currentPrice, , , ) = StateLibrary.getSlot0(poolManager, poolId);
-        
-        if (currentPrice > 0) {
-            // Pool is already initialized
-            return;
-        }
-        
-        // Initialize pool with 1:1 ratio (sqrt(1) * 2^96)
-        uint160 initPrice = 79228162514264337593543950336;
-        poolManager.initialize(key, initPrice);
-    }
-
-    /**
      * @notice Add liquidity to pool using deposited tokens from batch orders
      * @dev This function is called after tokens are deposited to provide initial liquidity
      */
@@ -648,6 +462,85 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
+     * @notice Create limit orders as concentrated liquidity at exact ticks
+     * @param key The pool key
+     * @param targetTicks Array of target ticks for orders
+     * @param targetAmounts Array of amounts for each tick
+     * @param zeroForOne Direction of the orders
+     * @param batchId The batch ID for tracking positions
+     */
+    function _createLimitOrderAsLiquidity(
+        PoolKey memory key,
+        int24[] memory targetTicks,
+        uint256[] memory targetAmounts,
+        bool zeroForOne,
+        uint256 batchId
+    ) internal {
+        for (uint256 i = 0; i < targetTicks.length; i++) {
+            if (targetAmounts[i] == 0) continue;
+            
+            int24 targetTick = targetTicks[i];
+            uint256 amount = targetAmounts[i];
+            
+            // Create concentrated liquidity at exactly one tick
+            // This liquidity will only be active when price is at this exact level
+            ModifyLiquidityParams memory params = ModifyLiquidityParams({
+                tickLower: targetTick,
+                tickUpper: targetTick + key.tickSpacing, // Single tick range
+                liquidityDelta: int256(amount),
+                salt: bytes32(uint256(keccak256(abi.encode(msg.sender, batchId, i))))
+            });
+            
+            try poolManager.modifyLiquidity(key, params, "") {
+                // Track this liquidity position for the user
+                _trackLiquidityPosition(key, targetTick, amount, batchId, i);
+                
+                emit LiquidityAdded(
+                    key.toId(), 
+                    zeroForOne ? amount : 0, 
+                    zeroForOne ? 0 : amount, 
+                    targetTick, 
+                    targetTick + key.tickSpacing
+                );
+            } catch {
+                // If liquidity provision fails for this tick, continue with others
+                emit LiquidityAdditionFailed(key.toId(), amount, "ModifyLiquidity failed");
+            }
+        }
+    }
+
+    /**
+     * @notice Track liquidity positions for batch orders
+     * @param key The pool key
+     * @param tick The tick where liquidity was added
+     * @param amount The amount of liquidity
+     * @param batchId The batch ID
+     * @param index The index within the batch
+     */
+    function _trackLiquidityPosition(
+        PoolKey memory key,
+        int24 tick,
+        uint256 amount,
+        uint256 batchId,
+        uint256 index
+    ) internal {
+        // Store position info for potential withdrawal later
+        bytes32 positionKey = keccak256(abi.encode(msg.sender, batchId, index));
+        
+        // You could add a mapping to track positions:
+        // liquidityPositions[positionKey] = LiquidityPosition({
+        //     owner: msg.sender,
+        //     poolId: key.toId(),
+        //     tick: tick,
+        //     amount: amount,
+        //     active: true
+        // });
+        
+        // Emit event for tracking limit order as liquidity
+        emit LimitOrderAsLiquidityCreated(batchId, msg.sender, key.toId(), tick, amount);
+    }
+
+    /**
      * @notice Internal function to add general liquidity
      * @dev Simplified to not fail batch order creation
      */
@@ -667,7 +560,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         batchTargetTicks[batchId] = targetTicks;
         batchTargetAmounts[batchId] = targetAmounts;
         
-        batchOrders[batchId] = BatchInfo({
+        batchInfos[batchId] = BatchInfo({
             user: msg.sender,
             totalAmount: uint96(totalAmount),
             poolKey: key,
@@ -730,194 +623,17 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     function _transferWithFee(uint256 batchOrderId, uint256 outputAmount) internal {
-        BatchInfo storage batch = batchOrders[batchOrderId];
+        BatchInfo storage batch = batchInfos[batchOrderId];
         Currency outputToken = batch.zeroForOne ? batch.poolKey.currency1 : batch.poolKey.currency0;
         
         // Fee already deducted at execution time, just transfer to user
         outputToken.transfer(msg.sender, outputAmount);
     }
 
-    function _processOrdersWithDelta(
-        PoolKey calldata key,
-        SwapParams calldata /* params */,
-        BalanceDelta /* swapDelta */
-    ) internal returns (int128) {
-        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
-        int24 lastTick = lastTicks[key.toId()];
-        
-        if (currentTick == lastTick) return 0;
-        
-        PoolId poolId = key.toId();
-        bool ascending = currentTick > lastTick;
-        
-        // Find limit orders that should execute in the tick range
-        uint256 totalLimitOrderAmount = 0;
-        bool limitOrderDirection = ascending ? false : true; // opposite of price movement
-        
-        // Calculate total limit order volume in range
-        if (ascending) {
-            // Price going up, execute sell orders (zeroForOne = false)
-            unchecked {
-                for (int24 tick = lastTick; tick <= currentTick; tick += key.tickSpacing) {
-                    totalLimitOrderAmount += pendingBatchOrders[poolId][tick][false];
-                }
-            }
-        } else {
-            // Price going down, execute buy orders (zeroForOne = true)
-            unchecked {
-                for (int24 tick = lastTick; tick >= currentTick; tick -= key.tickSpacing) {
-                    totalLimitOrderAmount += pendingBatchOrders[poolId][tick][true];
-                }
-            }
-        }
-        
-        if (totalLimitOrderAmount == 0) {
-            lastTicks[poolId] = currentTick;
-            return 0;
-        }
-        
-        // Calculate hook delta contribution
-        int128 hookDelta = _calculateHookDelta(
-            totalLimitOrderAmount,
-            currentTick,
-            limitOrderDirection
-        );
-        
-        // Update limit order state
-        _updateLimitOrderState(key, lastTick, currentTick, limitOrderDirection, totalLimitOrderAmount);
-        
-        lastTicks[poolId] = currentTick;
-        return hookDelta;
-    }
-
-    function _calculateHookDelta(
-        uint256 limitOrderAmount,
-        int24 currentTick,
-        bool zeroForOne
-    ) internal pure returns (int128) {
-        if (limitOrderAmount == 0) return 0;
-        
-        // Calculate output amount using current tick price
-        uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(currentTick);
-        
-        uint256 outputAmount;
-        if (zeroForOne) {
-            // Selling token0 for token1: amount1 = amount0 * sqrtPrice / 2^96
-            outputAmount = FullMath.mulDiv(limitOrderAmount, sqrtPrice, FixedPoint96.Q96);
-            outputAmount = FullMath.mulDiv(outputAmount, sqrtPrice, FixedPoint96.Q96);
-        } else {
-            // Selling token1 for token0: amount0 = amount1 * 2^96 / sqrtPrice
-            outputAmount = FullMath.mulDiv(limitOrderAmount, FixedPoint96.Q96, sqrtPrice);
-            outputAmount = FullMath.mulDiv(outputAmount, FixedPoint96.Q96, sqrtPrice);
-        }
-        
-        // Hook provides the output token and takes the input token
-        // Return negative delta when hook provides tokens to pool
-        return zeroForOne ? -int128(int256(outputAmount)) : int128(int256(outputAmount));
-    }
-
-    function _updateLimitOrderState(
-        PoolKey calldata key,
-        int24 fromTick,
-        int24 toTick,
-        bool /* zeroForOne */,
-        uint256 totalAmount
-    ) internal {
-        PoolId poolId = key.toId();
-        bool ascending = toTick > fromTick;
-        
-        if (ascending) {
-            // Price going up, execute sell orders (zeroForOne = false)
-            unchecked {
-                for (int24 tick = fromTick; tick <= toTick; tick += key.tickSpacing) {
-                    uint256 amount = pendingBatchOrders[poolId][tick][false];
-                    if (amount > 0) {
-                        _executeLimitOrderAtTick(key, tick, false, amount, totalAmount);
-                    }
-                }
-            }
-        } else {
-            // Price going down, execute buy orders (zeroForOne = true)  
-            unchecked {
-                for (int24 tick = fromTick; tick >= toTick; tick -= key.tickSpacing) {
-                    uint256 amount = pendingBatchOrders[poolId][tick][true];
-                    if (amount > 0) {
-                        _executeLimitOrderAtTick(key, tick, true, amount, totalAmount);
-                    }
-                }
-            }
-        }
-    }
-
-    function _executeLimitOrderAtTick(
-        PoolKey calldata key,
-        int24 tick,
-        bool zeroForOne,
-        uint256 inputAmount,
-        uint256 /* totalExecutedAmount */
-    ) internal {
-        uint256 gasStart = gasleft();
-        
-        // Calculate proportional output based on current tick price
-        uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(tick);
-        uint256 outputAmount;
-        
-        if (zeroForOne) {
-            // Selling token0 for token1
-            outputAmount = FullMath.mulDiv(inputAmount, sqrtPrice, FixedPoint96.Q96);
-            outputAmount = FullMath.mulDiv(outputAmount, sqrtPrice, FixedPoint96.Q96);
-        } else {
-            // Selling token1 for token0
-            outputAmount = FullMath.mulDiv(inputAmount, FixedPoint96.Q96, sqrtPrice);
-            outputAmount = FullMath.mulDiv(outputAmount, FixedPoint96.Q96, sqrtPrice);
-        }
-
-        // Update claimable amounts for all batches at this tick
-        PoolId poolId = key.toId();
-        uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
-        
-        unchecked {
-            for (uint256 i = 0; i < batchIds.length; i++) {
-                uint256 batchId = batchIds[i];
-                
-                // Find proportion for this batch
-                uint256 batchAmount = _getBatchAmountAtTick(batchId, tick);
-                uint256 batchOutputRaw = (outputAmount * batchAmount) / inputAmount;
-                
-                // Calculate dynamic protocol fee for this batch
-                uint256 gasUsed = gasStart - gasleft() + 50000; // Add base gas overhead
-                uint256 actualGasCost = gasUsed * tx.gasprice;
-                actualGasCosts[batchId] += actualGasCost;
-                
-                uint256 dynamicProtocolFee = _calculateDynamicProtocolFee(
-                    batchId, 
-                    batchOutputRaw, 
-                    actualGasCost
-                );
-                
-                uint256 batchOutputNet = batchOutputRaw - dynamicProtocolFee;
-                claimableOutputTokens[batchId] += batchOutputNet;
-                
-                // Send protocol fee immediately
-                if (dynamicProtocolFee > 0) {
-                    Currency outputToken = zeroForOne ? key.currency1 : key.currency0;
-                    outputToken.transfer(FEE_RECIPIENT, dynamicProtocolFee);
-                }
-                
-                emit BatchLevelExecutedOptimized(batchId, uint256(uint24(tick)), batchAmount);
-                emit GasFeeConsumed(batchId, actualGasCost, dynamicProtocolFee);
-            }
-        }
-
-        // Clear pending orders
-        pendingBatchOrders[poolId][tick][zeroForOne] = 0;
-        
-        // Clear batch IDs array
-        delete tickToBatchIds[poolId][tick][zeroForOne];
-    }
+    /// @notice Check if any limit orders should execute based on price movement
 
     function _getBatchAmountAtTick(uint256 batchId, int24 tick) internal view returns (uint256) {
-        uint256 ticksLength = batchOrders[batchId].ticksLength;
+        uint256 ticksLength = batchInfos[batchId].ticksLength;
         unchecked {
             for (uint256 i = 0; i < ticksLength; i++) {
                 if (batchTargetTicks[batchId][i] == tick) {
@@ -986,7 +702,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      */
     function processGasRefund(uint256 batchId) external {
         require(!gasRefundProcessed[batchId], "Refund already processed");
-        require(!batchOrders[batchId].isActive, "Batch still active");
+        require(!batchInfos[batchId].isActive, "Batch still active");
         
         uint256 preCollectedGas = preCollectedGasFees[batchId];
         uint256 totalActualGas = actualGasCosts[batchId];
@@ -995,7 +711,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             uint256 refundAmount = preCollectedGas - totalActualGas;
             gasRefundProcessed[batchId] = true;
             
-            address user = batchOrders[batchId].user;
+            address user = batchInfos[batchId].user;
             payable(user).transfer(refundAmount);
             
             emit GasFeeRefunded(batchId, user, refundAmount);
@@ -1146,7 +862,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
      * @notice Execute a specific batch order level at current market price
      */
     function executeBatchLevel(uint256 batchId, uint256 levelIndex) external returns (bool isFullyExecuted) {
-        BatchInfo storage batch = batchOrders[batchId];
+        BatchInfo storage batch = batchInfos[batchId];
         require(batch.isActive && msg.sender == owner && levelIndex < batch.ticksLength, "Invalid execution");
         
         PoolId poolId = batch.poolKey.toId();
@@ -1250,7 +966,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 totalBatches,
         uint24 currentFee
     ) {
-        BatchInfo storage batch = batchOrders[batchId];
+        BatchInfo storage batch = batchInfos[batchId];
         require(batch.user != address(0), "Invalid batch");
         
         uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[batchId];
@@ -1291,7 +1007,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 actualGasCost,
         uint256 gasRefundable
     ) {
-        BatchInfo storage batch = batchOrders[batchId];
+        BatchInfo storage batch = batchInfos[batchId];
         require(batch.user != address(0), "Invalid batch");
         
         uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[batchId];
@@ -1328,7 +1044,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts,
         bool isActive, bool isFullyExecuted
     ) {
-        BatchInfo storage batch = batchOrders[batchId];
+        BatchInfo storage batch = batchInfos[batchId];
         
         // Get target ticks and amounts from storage
         int24[] memory targetTicks = batchTargetTicks[batchId];
@@ -1398,103 +1114,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
                     hasOrders = true;
                 }
             }
-        }
-    }
-
-    /**
-     * @notice Execute limit orders in the specified range
-     */
-    function _executeLimitOrdersInRange(
-        PoolKey calldata key,
-        int24 currentTick,
-        int24 targetTick,
-        bool zeroForOne,
-        uint256 maxAmountToExecute
-    ) internal {
-        PoolId poolId = key.toId();
-        uint256 remainingAmount = maxAmountToExecute;
-        bool limitOrderDirection = !zeroForOne; // Opposite direction to the market swap
-
-        if (zeroForOne) {
-            // Market swap is selling token0, execute buy limit orders
-            for (int24 tick = currentTick; tick >= targetTick && remainingAmount > 0; tick -= key.tickSpacing) {
-                uint256 availableAmount = pendingBatchOrders[poolId][tick][limitOrderDirection];
-                if (availableAmount > 0) {
-                    uint256 executeAmount = _min(availableAmount, remainingAmount);
-                    _executeLimitOrdersAtTick(poolId, tick, limitOrderDirection, executeAmount);
-                    remainingAmount -= executeAmount;
-                }
-            }
-        } else {
-            // Market swap is buying token0, execute sell limit orders  
-            for (int24 tick = currentTick; tick <= targetTick && remainingAmount > 0; tick += key.tickSpacing) {
-                uint256 availableAmount = pendingBatchOrders[poolId][tick][limitOrderDirection];
-                if (availableAmount > 0) {
-                    uint256 executeAmount = _min(availableAmount, remainingAmount);
-                    _executeLimitOrdersAtTick(poolId, tick, limitOrderDirection, executeAmount);
-                    remainingAmount -= executeAmount;
-                }
-            }
-        }
-    }
-
-    /**
-     * @notice Execute limit orders at a specific tick
-     */
-    function _executeLimitOrdersAtTick(
-        PoolId poolId,
-        int24 tick,
-        bool zeroForOne,
-        uint256 amountToExecute
-    ) internal {
-        // Reduce pending amount
-        pendingBatchOrders[poolId][tick][zeroForOne] -= amountToExecute;
-        
-        // Find and update relevant batch orders
-        uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
-        uint256 remainingToExecute = amountToExecute;
-        
-        for (uint256 i = 0; i < batchIds.length && remainingToExecute > 0; i++) {
-            uint256 batchId = batchIds[i];
-            BatchInfo storage batch = batchOrders[batchId];
-            
-            if (!batch.isActive) continue;
-            
-            // Find this tick in the batch's target ticks
-            for (uint256 j = 0; j < batch.ticksLength; j++) {
-                if (batchTargetTicks[batchId][j] == tick) {
-                    uint256 batchAmountAtTick = batchTargetAmounts[batchId][j];
-                    uint256 executeFromBatch = _min(batchAmountAtTick, remainingToExecute);
-                    
-                    // Update batch state
-                    claimableOutputTokens[batchId] += executeFromBatch;
-                    remainingToExecute -= executeFromBatch;
-                    
-                    break;
-                }
-            }
-        }
-        
-        // Clean up if tick is now empty
-        if (pendingBatchOrders[poolId][tick][zeroForOne] == 0) {
-            delete tickToBatchIds[poolId][tick][zeroForOne];
-        }
-    }
-
-    /**
-     * @notice Create a BeforeSwapDelta representing limit order execution
-     */
-    function _createBeforeSwapDelta(bool zeroForOne, uint256 amount) internal pure returns (BeforeSwapDelta) {
-        if (zeroForOne) {
-            // Market swap wants to sell token0, limit orders provide token1
-            // The hook provides token1 output, so amount1 is negative (flowing out)
-            // The hook takes token0 input, so amount0 is positive (flowing in)
-            return toBeforeSwapDelta(int128(int256(amount)), -int128(int256(amount)));
-        } else {
-            // Market swap wants to buy token0, limit orders provide token0  
-            // The hook provides token0 output, so amount0 is negative (flowing out)
-            // The hook takes token1 input, so amount1 is positive (flowing in)
-            return toBeforeSwapDelta(-int128(int256(amount)), int128(int256(amount)));
         }
     }
 

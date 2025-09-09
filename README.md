@@ -1,302 +1,83 @@
 # Dexter Batch Limit Order Hook
-*Production-Ready Batch Limit Orders for Uniswap V4*
+Production-ready batch limit orders for Uniswap V4 (ABI & integration guide)
 
-## 🎯 Overview
+## Purpose of this document
+This README focuses on the ABI-level types, hook/callback flow, and encoding examples that integrators and off-chain tooling need to interact with the `LimitOrderBatch` hook and the Uniswap V4 PoolManager. Test output and run logs have been intentionally removed — the repo contains separate tests under `test/`.
 
-Dexter is a **gas-optimized batch limit order system** built as a Uniswap V4 hook. It enables users to create limit orders across multiple price levels in a single transa## 🚦 Current Status
+## Quick overview
+Dexter implements a gas-optimized batch limit order hook for Uniswap V4. The contract uses Uniswap V4 core types and the PoolManager unlock/callback flow. Key on-chain interactions are expressed in canonical v4 types (see `lib/v4-core/src/interfaces/IPoolManager.sol`).
 
-**Production Readiness:** Production-ready with all tests passing ✅
+## Canonical ABI types (detailed)
+Below are the exact ABI-level shapes and practical semantics used across the codebase.
 
-**Test Suite:** All 8/8 tests passing including gas fee collection
+- PoolKey (tuple)
+    - Solidity shape: tuple(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)
+    - Notes: In v4 the `Currency` wrapper is used, but ABI-level encoding is the underlying address. Off-chain code must ensure address(currency0) < address(currency1) before creating a `PoolKey`.
+    - PoolId: a bytes32 identifier computed from a `PoolKey` (library exposes `PoolKey.toId()` helpers). ABI consumers treat PoolId as `bytes32`.
 
-**Next Steps:**
-1. Security audit
-2. Mainnet deployment preparation  
-3. Frontend integration
-4. Documentation finalizationtomatic execution via V4's native hook system.
+- IPoolManager.SwapParams (struct)
+    - Solidity shape: struct SwapParams { bool zeroForOne; int256 amountSpecified; uint160 sqrtPriceLimitX96; }
+    - Semantics:
+        - `amountSpecified < 0` => exactIn (caller provides input amount). The absolute value is the input token amount.
+        - `amountSpecified > 0` => exactOut (caller requests output amount).
+        - `sqrtPriceLimitX96` sets a price boundary for the swap (as Q64.96 sqrt price).
 
-**Key Features:**
-- **Batch limit orders** across multiple price ticks in one transaction
-- **Native V4 hook integration** for automatic execution during swaps
-- **ERC-6909 claim tokens** for gas-efficient order proceeds management
-- **Gas fee pre-collection** with refund mechanism for failed executions
-- **Production-optimized** contract size (20.8KB deployment)
+- IPoolManager.ModifyLiquidityParams (struct)
+    - Solidity shape: struct ModifyLiquidityParams { int24 tickLower; int24 tickUpper; int256 liquidityDelta; bytes32 salt; }
+    - Semantics: positive `liquidityDelta` adds liquidity, negative removes. `salt` distinguishes multiple positions with identical ranges.
 
----
+- BalanceDelta (struct / representation)
+    - ABI-level: pair of signed 128-bit integers: (int128 amount0, int128 amount1).
+    - Role: represents the token deltas resulting from swaps, modifies, and settlements. Positive values mean tokens were added to the pool; negative values mean tokens were removed.
 
-## 🏗️ Architecture
+- BeforeSwapDelta / AfterSwap semantics
+    - Hooks can return values (BeforeSwapDelta or other encoded returns) that the PoolManager interprets to adjust deltas during a swap. In this repo the hook returns `BeforeSwapDelta` instances to indicate how much of the swap should be consumed by on-chain limit order execution or hook-provided liquidity.
 
-### Core Contract: LimitOrderBatch (20.8KB)
+## Hook permissions and lifecycle (how PoolManager calls hooks)
+- Permission discovery:
+    - The PoolManager queries a hook contract for `Hooks.Permissions` flags (beforeInitialize, afterInitialize, beforeSwap, afterSwap, returnDelta flags, etc.) to determine which callbacks to call.
 
-**Single-Contract Design**: Unlike the previous modular approach, the current implementation focuses on a single, highly optimized contract that handles all batch limit order functionality.
+- Typical unlock/callback pattern for state-changing operations:
+    1. An external actor (or the hook itself) calls `poolManager.unlock(bytes calldata data)` to begin an operation that requires atomic settlement.
+ 2. The PoolManager invokes `IUnlockCallback(msg.sender).unlockCallback(data)` on the caller contract. The hook executes logic (reading storage, moving tokens, emitting actions) and returns `bytes memory` to the PoolManager.
+ 3. The PoolManager continues / finalizes the underlying operation (swap, modifyLiquidity, settle) using the updated balances and any returned data.
 
-```solidity
-contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCallback
+## ABI encoding examples (off-chain)
+Below are practical examples for off-chain encoding with ethers.js. Use the v4-core types when possible; manual ABI encoding is useful for low-level calls and testing.
+
+- Encode a `PoolKey` and `SwapParams` into a single payload for `poolManager.unlock`:
+
+```js
+// Ethers.js pseudocode
+const abi = new ethers.utils.AbiCoder();
+
+const poolKeyTuple = [currency0Address, currency1Address, fee, tickSpacing, hookAddress];
+const poolKeyEncoded = abi.encode(['tuple(address,address,uint24,int24,address)'], [poolKeyTuple]);
+
+const swapParamsTuple = [zeroForOne, amountSpecified, sqrtPriceLimitX96];
+const swapParamsEncoded = abi.encode(['tuple(bool,int256,uint160)'], [swapParamsTuple]);
+
+// combine (concatenate) encodings or create a larger tuple depending on the target function signature
+const payload = ethers.utils.concat([poolKeyEncoded, swapParamsEncoded]);
+// call poolManager.unlock(payload)
 ```
 
-**Hook Permissions:**
-```solidity
-Hooks.Permissions({
-    beforeInitialize: true,  // Pool setup and fee configuration
-    afterInitialize: true,   // Track pool initialization
-    beforeSwap: true,        // Pre-swap order matching
-    afterSwap: true,         // Execute matched orders
-    afterSwapReturnDelta: true // Handle swap deltas
-})
-```
+Notes:
+- If you interact with the Solidity `IPoolManager` functions directly from a contract (not off-chain), prefer using `IPoolManager.SwapParams` and `IPoolManager.ModifyLiquidityParams` datatypes in Solidity to avoid manual encoding errors.
+- Use Uniswap v4 helper libraries (PoolKey.toId) when available to compute `PoolId` instead of reimplementing hash logic off-chain.
 
-### Storage Optimization
+## Practical integration tips
+- Always verify token ordering (currency0 < currency1 by address) before creating or signing a `PoolKey`.
+- Use `IPoolManager.SwapParams` with `amountSpecified` sign conventions to avoid accidental exactOut/ exactIn mismatches.
+- When returning deltas from hook callbacks, ensure values are within int128 ranges and match the pool's expected token denominations.
+- Prefer `poolManager.unlock` + `unlockCallback` pattern for any on-chain action that requires atomic settlement.
 
-**Gas-Optimized Storage Layout:**
-```solidity
-struct BatchInfo {
-    address user;                    // 20 bytes
-    uint96 totalAmount;             // 12 bytes - packed with user
-    PoolKey poolKey;                // 32 bytes (separate slot)
-    uint64 expirationTime;          // 8 bytes 
-    uint32 maxSlippageBps;          // 4 bytes
-    uint32 bestPriceTimeout;        // 4 bytes
-    uint16 ticksLength;             // 2 bytes
-    bool zeroForOne;                // 1 byte
-    bool isActive;                  // 1 byte
-    uint256 minOutputAmount;        // 32 bytes (separate slot)
-}
-```
+## Development & quick commands
+- Build: `forge build`
+- Run tests: `forge test`
 
-**Separate Array Storage** to avoid dynamic array gas costs:
-- `mapping(uint256 => int24[]) public batchTargetTicks`
-- `mapping(uint256 => uint256[]) public batchTargetAmounts`
+## License
+MIT - see LICENSE
+     3. The PoolManager then completes the underlying operation (modifyLiquidity, swap, settle, etc.) using the data returned by the hook.
 
----
 
-## � Core Features
-
-### 1. Batch Limit Orders
-
-Create multiple limit orders across different price levels in a single transaction:
-
-```solidity
-function createBatchOrder(
-    Currency currency0,
-    Currency currency1, 
-    uint24 fee,
-    bool zeroForOne,
-    uint256[] calldata targetPrices,
-    uint256[] calldata targetAmounts,
-    uint64 expirationTime,
-    uint32 bestPriceTimeout
-) external payable returns (uint256 batchId)
-```
-
-**Benefits:**
-- Reduce gas costs by batching multiple orders
-- Distribute liquidity across multiple price points
-- Automatic execution via V4 hooks during pool swaps
-
-### 2. Gas Fee Management
-
-**Pre-Collection with Refunds:**
-```solidity
-uint256 estimatedGasFee = (tx.gasprice * ESTIMATED_EXECUTION_GAS * GAS_PRICE_BUFFER_MULTIPLIER) / 100;
-require(msg.value >= totalInputAmount + estimatedGasFee, "Insufficient ETH for gas");
-```
-
-- Gas fees are pre-collected when creating orders
-- Unused gas is refunded after execution or cancellation
-- Protocol fee (0.35%) collected for successful executions
-
-### 3. ERC-6909 Claim Tokens
-
-**Efficient Proceed Management:**
-```solidity
-// User receives claim tokens for executed orders
-_mint(user, batchId, claimAmount);
-
-// Redeem claim tokens for output tokens
-function redeem(uint256 id, uint256 amount, address to) external
-```
-
-### 4. Hook-Based Execution
-
-**Automatic Execution During Swaps:**
-```solidity
-function afterSwap(
-    address sender,
-    PoolKey calldata key,
-    SwapParams calldata params,
-    BalanceDelta delta,
-    bytes calldata hookData
-) external override onlyByPoolManager returns (bytes4, int128)
-```
-
-Orders execute automatically when pool swaps move the price through order levels.
-
----
-
-## � Technical Specifications
-
-### Contract Details
-
-| Metric | Value |
-|--------|-------|
-| **Contract Size** | 20.8KB |
-| **Deployment Cost** | 4,009,496 gas |
-| **Test Coverage** | 8/8 tests passing |
-| **Hook Permissions** | 5 hooks implemented |
-
-### Gas Usage (Mainnet Estimates)
-
-| Function | Gas Cost |
-|----------|----------|
-| `createBatchOrder` (1 level) | ~25,000 |
-| `createBatchOrder` (3 levels) | ~400,000 |
-| `createBatchOrder` (10 levels) | ~1,240,000 |
-| `cancelBatchOrder` | ~68,000 |
-
-### Constants
-
-```solidity
-uint24 public constant BASE_FEE = 3000;                    // 0.3%
-uint256 public constant MAX_SLIPPAGE_BPS = 500;            // 5%
-uint256 public constant BASE_PROTOCOL_FEE_BPS = 35;        // 0.35%
-uint256 public constant ESTIMATED_EXECUTION_GAS = 150000;  // Conservative estimate
-uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether;      // Gas fee cap
-```
-
----
-
-## � Usage Examples
-
-### Basic Batch Order Creation
-
-```solidity
-// Create a 3-level batch order: USDC → WETH
-uint256[] memory targetPrices = new uint256[](3);
-targetPrices[0] = 3000e6; // $3000 USDC per ETH
-targetPrices[1] = 3100e6; // $3100 USDC per ETH  
-targetPrices[2] = 3200e6; // $3200 USDC per ETH
-
-uint256[] memory targetAmounts = new uint256[](3);
-targetAmounts[0] = 1000e6; // 1000 USDC
-targetAmounts[1] = 1500e6; // 1500 USDC
-targetAmounts[2] = 2000e6; // 2000 USDC
-
-uint256 batchId = limitOrderBatch.createBatchOrder{value: 0.005 ether}(
-    Currency.wrap(address(USDC)),   // currency0
-    Currency.wrap(address(WETH)),   // currency1
-    3000 | 0x800000,               // 0.3% fee + dynamic fee flag
-    true,                          // zeroForOne (USDC → WETH)
-    targetPrices,
-    targetAmounts,
-    block.timestamp + 86400,       // 24 hour expiration
-    300                           // 5 minute best price timeout
-);
-```
-
-### Claiming Executed Orders
-
-```solidity
-// Check claimable amount
-uint256 claimAmount = limitOrderBatch.balanceOf(user, batchId);
-
-// Redeem executed orders for output tokens
-limitOrderBatch.redeem(batchId, claimAmount, user);
-```
-
-### Canceling Orders
-
-```solidity
-// Cancel active batch order
-limitOrderBatch.cancelBatchOrder(batchId);
-// Refunds remaining input tokens + unused gas fees
-```
-
----
-
-## � Development
-
-### Prerequisites
-
-- Foundry
-- Uniswap V4 Core & Periphery
-
-### Building
-
-```bash
-forge build
-```
-
-### Testing
-
-```bash
-forge test
-forge test --gas-report    # View gas usage
-forge test -vvv           # Verbose output
-```
-
-### Current Test Status
-
-```bash
-Ran 8 tests for test/SimpleTest.t.sol:SimpleTest
-[PASS] test_CanCancelOrder() (gas: 344599)
-[PASS] test_CanCreateBasicOrder() (gas: 413582)  
-[PASS] test_CanCreateMultiLevelOrder() (gas: 598077)
-[PASS] test_CanDeployHook() (gas: 12094)
-[PASS] test_GasFeeCollection() (gas: 436169) // ✅ Fixed!
-[PASS] test_HookPermissions() (gas: 13846)
-[PASS] test_InvalidInputs() (gas: 36324)
-[PASS] test_MaxLevelsOrder() (gas: 1282487)
-```
-
-### Deployment
-
-```bash
-# Deploy to local testnet
-forge script script/DeployHook.s.sol --broadcast --fork-url $ANVIL_RPC_URL
-
-# Deploy to mainnet (when ready)
-forge script script/DeployHook.s.sol --broadcast --verify --fork-url $MAINNET_RPC_URL
-```
-
----
-
-## 🔒 Security Considerations
-
-### Input Validation
-- Maximum slippage hardcoded to 5%
-- Gas fee capped at 0.01 ETH per order
-- Array length validation for batch orders
-- Expiration time validation
-
-### Access Control
-- Owner-only functions for emergency management
-- User-only cancellation and redemption
-- Pool manager-only hook execution
-
-### Economic Security
-- Protocol fee collection (0.35%)
-- Gas fee pre-collection with refunds
-- Slippage protection on order execution
-
----
-
-## � Current Status
-
-**Production Readiness:** Near production-ready with minor test fixes needed
-
-**Known Issues:**
-- Gas fee collection test failing (implementation vs test mismatch)
-- Single contract approach (no more tools contract)
-- Simplified feature set focused on core functionality
-
-**Next Steps:**
-1. Fix gas fee collection logic
-2. Complete test suite 
-3. Security audit
-4. Mainnet deployment preparation
-
----
-
-## 📝 License
-
-MIT License - see [LICENSE](./LICENSE) for details.

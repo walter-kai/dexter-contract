@@ -11,7 +11,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
-import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
+import {IPositionManager} from "@uniswap/v4-periphery/interfaces/IPositionManager.sol";
 import {LimitOrderBatch} from "../src/LimitOrderBatch.sol";
 import "./mocks/MockContracts.sol";
 
@@ -115,7 +115,8 @@ contract SimpleTest is Test {
             true, // zeroForOne
             targetPrices,
             targetAmounts,
-            block.timestamp + 3600
+            block.timestamp + 3600,
+            false // provideLiquidity
         );
 
         // Verify order creation
@@ -159,7 +160,7 @@ contract SimpleTest is Test {
 
         uint256 batchId = hook.createBatchOrder{value: 0.01 ether}(
             address(token0), address(token1), 3000, true,
-            targetPrices, targetAmounts, block.timestamp + 3600
+            targetPrices, targetAmounts, block.timestamp + 3600, false
         );
 
         // Verify total amount
@@ -179,7 +180,7 @@ contract SimpleTest is Test {
 
         uint256 batchId = hook.createBatchOrder{value: 0.01 ether}(
             address(token0), address(token1), 3000, true,
-            targetPrices, targetAmounts, block.timestamp + 3600
+            targetPrices, targetAmounts, block.timestamp + 3600, false
         );
 
         // Cancel order
@@ -211,7 +212,7 @@ contract SimpleTest is Test {
         uint256 sentValue = 0.1 ether;
         uint256 batchId = hook.createBatchOrder{value: sentValue}(
             address(token0), address(token1), 3000, true,
-            targetPrices, targetAmounts, block.timestamp + 3600
+            targetPrices, targetAmounts, block.timestamp + 3600, false
         );
 
         uint256 userBalanceAfter = user.balance;
@@ -237,7 +238,7 @@ contract SimpleTest is Test {
         hook.createBatchOrder{value: 0.01 ether}(
             address(token0), address(token1), 3000, true,
             new uint256[](0), new uint256[](0),
-            block.timestamp + 3600
+            block.timestamp + 3600, false
         );
 
         // Test mismatched array lengths
@@ -245,7 +246,7 @@ contract SimpleTest is Test {
         hook.createBatchOrder{value: 0.01 ether}(
             address(token0), address(token1), 3000, true,
             new uint256[](1), new uint256[](2),
-            block.timestamp + 3600
+            block.timestamp + 3600, false
         );
 
         vm.stopPrank();
@@ -265,7 +266,7 @@ contract SimpleTest is Test {
         uint256 batchId = hook.createBatchOrder{value: 0.01 ether}(
             address(token0), address(token1), 3000, true,
             targetPrices, targetAmounts,
-            block.timestamp + 3600
+            block.timestamp + 3600, false
         );
         
         (, , , uint256 totalAmount, , , , , , , , ) = hook.getBatchInfo(batchId);
@@ -283,7 +284,7 @@ contract SimpleTest is Test {
         hook.createBatchOrder{value: 0.01 ether}(
             address(token0), address(token1), 3000, true,
             tooManyPrices, tooManyAmounts,
-            block.timestamp + 3600
+            block.timestamp + 3600, false
         );
 
         vm.stopPrank();
