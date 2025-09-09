@@ -66,6 +66,7 @@ interface ILimitOrderBatch {
         bool zeroForOne,
         uint256[] calldata targetPrices,
         uint256[] calldata targetAmounts,
+        uint32 slippage,
         uint256 deadline
     ) external payable returns (uint256 batchId);
 
