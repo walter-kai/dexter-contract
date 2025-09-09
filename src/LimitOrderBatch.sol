@@ -59,7 +59,6 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
         
         uint64 expirationTime;          // 8 bytes 
         uint32 maxSlippageBps;          // 4 bytes
-        uint32 bestPriceTimeout;        // 4 bytes
         uint16 ticksLength;             // 2 bytes - store length instead of dynamic array
         bool zeroForOne;                // 1 byte
         bool isActive;                  // 1 byte
@@ -632,7 +631,7 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
             // the market in his peak can reach 10% and user is oki with this 
             maxSlippageBps: slippage,  // Fixed 3% slippage
             // @note we dont need this ig ?  
-            bestPriceTimeout: 0,  // No timeout
+           
             ticksLength: uint16(targetTicks.length),
             zeroForOne: zeroForOne,
             isActive: true,
