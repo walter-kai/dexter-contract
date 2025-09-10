@@ -70,7 +70,7 @@ interface ILimitOrderBatch {
         bool provideLiquidity
     ) external payable returns (uint256 batchId);
 
-    function cancelBatchOrder(uint256 batchId) external;
+    function settleOrder(uint256 batchId) external;
 
     // ===== VIEW FUNCTIONS =====
 

@@ -244,84 +244,80 @@ contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCall
     }
 
     /**
-     * @notice Cancel batch order - refunds only the unexecuted portion
+     * @notice Settle batch order - redeems executed portions or cancels unexecuted portions
      */
-    function cancelBatchOrder(uint256 batchOrderId) external validBatchOrder(batchOrderId) {
+    function settleOrder(uint256 batchOrderId) external validBatchOrder(batchOrderId) {
         BatchInfo storage batch = batchInfos[batchOrderId];
         require(batch.user == msg.sender, "Not authorized");
         
         uint256 userClaimBalance = balanceOf[msg.sender][batchOrderId];
-        require(userClaimBalance > 0, "No tokens to cancel");
+        require(userClaimBalance > 0, "No tokens to settle");
         
-        // Check total pending amount
-        PoolId poolId = batch.poolKey.toId();
-        uint256 totalPendingAmount = 0;
-        for (uint256 i = 0; i < batch.ticksLength; i++) {
-            totalPendingAmount += pendingBatchOrders[poolId][batchTargetTicks[batchOrderId][i]][batch.zeroForOne];
-        }
+        // Check if there are claimable output tokens (executed portions)
+        uint256 claimableOutput = claimableOutputTokens[batchOrderId];
         
-        require(totalPendingAmount > 0, "Batch already executed, use redeem instead");
-        
-        uint256 cancellableAmount = userClaimBalance * totalPendingAmount / uint256(batch.totalAmount);
-        require(cancellableAmount > 0, "Nothing to cancel");
-        
-        // Burn claim tokens and update pending orders
-        _burn(msg.sender, address(uint160(batchOrderId)), cancellableAmount);
-        for (uint256 i = 0; i < batch.ticksLength; i++) {
-            int24 targetTick = batchTargetTicks[batchOrderId][i];
-            uint256 levelPending = pendingBatchOrders[poolId][targetTick][batch.zeroForOne];
-            if (levelPending > 0) {
-                uint256 levelCancellation = cancellableAmount * levelPending / totalPendingAmount;
-                pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= levelCancellation;
-            }
-        }
-        
-        claimTokensSupply[batchOrderId] -= cancellableAmount;
-        if (totalPendingAmount == cancellableAmount) batch.isActive = false;
-        
-        // Return tokens
-        Currency inputCurrency = batch.zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
-        if (Currency.unwrap(inputCurrency) == address(0)) {
-            payable(msg.sender).transfer(cancellableAmount);
+        if (claimableOutput > 0) {
+            // REDEEM: There are executed portions to claim
+            uint256 userShare = (claimableOutput * userClaimBalance) / claimTokensSupply[batchOrderId];
+            
+            // Update state for redemption
+            claimableOutputTokens[batchOrderId] -= userShare;
+            claimTokensSupply[batchOrderId] -= userClaimBalance;
+            _burn(msg.sender, address(uint160(batchOrderId)), userClaimBalance);
+            
+            // Transfer output tokens
+            Currency outputToken = batch.zeroForOne ? batch.poolKey.currency1 : batch.poolKey.currency0;
+            outputToken.transfer(msg.sender, userShare);
+            
+            emit TokensRedeemedOptimized(batchOrderId, msg.sender, userShare);
+            
         } else {
-            IERC20(Currency.unwrap(inputCurrency)).transfer(msg.sender, cancellableAmount);
-        }
-        
-        // Refund gas fee if fully cancelled
-        if (totalPendingAmount == cancellableAmount && !gasRefundProcessed[batchOrderId]) {
-            uint256 gasRefund = preCollectedGasFees[batchOrderId];
-            if (gasRefund > 0) {
-                gasRefundProcessed[batchOrderId] = true;
-                payable(msg.sender).transfer(gasRefund);
-                emit GasFeeRefunded(batchOrderId, msg.sender, gasRefund);
+            // CANCEL: No executed portions, cancel remaining unexecuted amounts
+            PoolId poolId = batch.poolKey.toId();
+            uint256 totalPendingAmount = 0;
+            for (uint256 i = 0; i < batch.ticksLength; i++) {
+                totalPendingAmount += pendingBatchOrders[poolId][batchTargetTicks[batchOrderId][i]][batch.zeroForOne];
             }
+            
+            require(totalPendingAmount > 0, "Nothing to settle");
+            
+            uint256 cancellableAmount = userClaimBalance * totalPendingAmount / uint256(batch.totalAmount);
+            require(cancellableAmount > 0, "Nothing to cancel");
+            
+            // Burn claim tokens and update pending orders
+            _burn(msg.sender, address(uint160(batchOrderId)), cancellableAmount);
+            for (uint256 i = 0; i < batch.ticksLength; i++) {
+                int24 targetTick = batchTargetTicks[batchOrderId][i];
+                uint256 levelPending = pendingBatchOrders[poolId][targetTick][batch.zeroForOne];
+                if (levelPending > 0) {
+                    uint256 levelCancellation = cancellableAmount * levelPending / totalPendingAmount;
+                    pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= levelCancellation;
+                }
+            }
+            
+            claimTokensSupply[batchOrderId] -= cancellableAmount;
+            if (totalPendingAmount == cancellableAmount) batch.isActive = false;
+            
+            // Return input tokens
+            Currency inputCurrency = batch.zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
+            if (Currency.unwrap(inputCurrency) == address(0)) {
+                payable(msg.sender).transfer(cancellableAmount);
+            } else {
+                IERC20(Currency.unwrap(inputCurrency)).transfer(msg.sender, cancellableAmount);
+            }
+            
+            // Refund gas fee if fully cancelled
+            if (totalPendingAmount == cancellableAmount && !gasRefundProcessed[batchOrderId]) {
+                uint256 gasRefund = preCollectedGasFees[batchOrderId];
+                if (gasRefund > 0) {
+                    gasRefundProcessed[batchOrderId] = true;
+                    payable(msg.sender).transfer(gasRefund);
+                    emit GasFeeRefunded(batchOrderId, msg.sender, gasRefund);
+                }
+            }
+            
+            emit BatchOrderCancelledOptimized(batchOrderId, msg.sender);
         }
-        
-        emit BatchOrderCancelledOptimized(batchOrderId, msg.sender);
-    }
-
-    /**
-     * @notice Redeem executed order output tokens
-     */
-    function redeemBatchOrder(uint256 batchOrderId, uint256 inputAmountToClaimFor) external {
-        require(claimableOutputTokens[batchOrderId] > 0, "Nothing to claim");
-        require(balanceOf[msg.sender][batchOrderId] >= inputAmountToClaimFor, "Insufficient balance");
-
-        // Calculate proportional output
-        uint256 outputAmount = inputAmountToClaimFor.mulDivDown(
-            claimableOutputTokens[batchOrderId],
-            claimTokensSupply[batchOrderId]
-        );
-
-        // Update state
-        claimableOutputTokens[batchOrderId] -= outputAmount;
-        claimTokensSupply[batchOrderId] -= inputAmountToClaimFor;
-        _burn(msg.sender, address(uint160(batchOrderId)), inputAmountToClaimFor);
-
-        // Transfer tokens with fee
-        _transferWithFee(batchOrderId, outputAmount);
-
-        emit TokensRedeemedOptimized(batchOrderId, msg.sender, outputAmount);
     }
 
     function _beforeInitialize(address /* sender */, PoolKey calldata /* key */, uint160 /* sqrtPriceX96 */) internal pure override returns (bytes4) {

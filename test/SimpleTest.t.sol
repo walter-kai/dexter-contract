@@ -183,8 +183,8 @@ contract SimpleTest is Test {
             targetPrices, targetAmounts, block.timestamp + 3600, false
         );
 
-        // Cancel order
-        hook.cancelBatchOrder(batchId);
+        // Settle order
+        hook.settleOrder(batchId);
 
         // Verify cancellation
         (, , , , , , bool isActive, , , , , ) = hook.getBatchInfo(batchId);
