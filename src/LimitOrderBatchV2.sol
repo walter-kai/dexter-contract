@@ -73,9 +73,8 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
     address public Executor;
 
     /* ==========================================================
-       CONSTANTS – unchanged
+       CONSTANTS – updated to remove BASE_FEE since we use pool fee parameter
        ========================================================== */
-    uint24 public constant BASE_FEE = 3000;
     uint256 public constant BASE_PROTOCOL_FEE_BPS = 35;
     uint256 public constant BASIS_POINTS_DENOMINATOR = 10000;
     uint256 public constant ESTIMATED_EXECUTION_GAS = 150000;
@@ -83,9 +82,8 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
     uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether;
 
     /* ==========================================================
-       ERRORS – unchanged list + one new
+       ERRORS – updated to remove MustUseDynamicFee
        ========================================================== */
-    error MustUseDynamicFee();
     error NothingToClaim();
     error InvalidBatchId();
     error OrderNotActive();
@@ -248,62 +246,7 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
         emit TokensRedeemedOptimized(batchOrderId, msg.sender, outputAmount);
     }
 
-    /* ==========================================================
-       EXECUTE – identical logic until the “fully executed” check
-       ========================================================== */
-    function executeBatchLevel(uint256 batchId, uint256 levelIndex) external returns (bool isFullyExecuted) {
-        BatchInfo storage batch = batchOrders[batchId];
-        if (!(batch.isActive && msg.sender == Executor && levelIndex < batch.ticksLength))
-            revert InvalidExecution();
 
-        PoolId poolId = batch.poolKey.toId();
-        int24 targetTick = batchTargetTicks[batchId][levelIndex];
-        uint256 pendingAmount = pendingBatchOrders[poolId][targetTick][batch.zeroForOne];
-        if (pendingAmount == 0) revert NoPendingOrders();
-
-        uint256 amountToExecute = batchTargetAmounts[batchId][levelIndex];
-        if (pendingAmount < amountToExecute) amountToExecute = pendingAmount;
-
-        SwapParams memory params = SwapParams({
-            zeroForOne: batch.zeroForOne,
-            amountSpecified: -int256(amountToExecute),
-            sqrtPriceLimitX96: batch.zeroForOne
-                ? TickMath.MIN_SQRT_PRICE + 1
-                : TickMath.MAX_SQRT_PRICE - 1
-        });
-
-        bytes memory result = poolManager.unlock(abi.encode(batch.poolKey, params));
-        BalanceDelta delta = abi.decode(result, (BalanceDelta));
-        uint256 outputAmount = batch.zeroForOne
-            ? uint256(int256(-delta.amount1()))
-            : uint256(int256(-delta.amount0()));
-
-        claimableOutputTokens[batchId] += outputAmount;
-        pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= amountToExecute;
-
-        if (pendingBatchOrders[poolId][targetTick][batch.zeroForOne] == 0)
-            _removeBatchIdFromTick(poolId, targetTick, batch.zeroForOne, batchId);
-
-        // ----------  fully executed check  ----------
-        isFullyExecuted = true;
-        for (uint256 i = 0; i < batch.ticksLength; i++) {
-            if (pendingBatchOrders[poolId][batchTargetTicks[batchId][i]][batch.zeroForOne] > 0) {
-                isFullyExecuted = false;
-                break;
-            }
-        }
-        emit ManualBatchLevelExecuted(batchId, levelIndex, msg.sender, amountToExecute);
-        emit BatchLevelExecuted(batchId, levelIndex, uint256(uint24(targetTick)), amountToExecute);
-
-        if (isFullyExecuted) {
-            batch.isActive = false;
-            emit BatchFullyExecuted(batchId, amountToExecute, claimableOutputTokens[batchId]);
-
-            // NEW – auto-flip if requested
-            if (batch.flipEnabled) _flipBatch(batchId);
-        }
-        return isFullyExecuted;
-    }
 
     /* ==========================================================
        FLIP BATCH – new helper
@@ -387,7 +330,7 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
     function _beforeInitialize(address, PoolKey calldata key, uint160)
         internal pure override returns (bytes4)
     {
-        if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
+        // Remove dynamic fee requirement - use fee from createBatchOrder parameter
         return BaseHook.beforeInitialize.selector;
     }
 
@@ -408,11 +351,11 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
         internal override returns (bytes4, BeforeSwapDelta, uint24)
     {
         if (msg.sender == address(this))
-            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
 
         BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
-        uint24 fee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-        return (BaseHook.beforeSwap.selector, delta, fee);
+        // Use the pool's actual fee instead of overriding
+        return (BaseHook.beforeSwap.selector, delta, 0);
     }
 
     function _afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta, bytes calldata)
@@ -470,7 +413,7 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
         return PoolKey({
             currency0: Currency.wrap(currency0),
             currency1: Currency.wrap(currency1),
-            fee: fee | 0x800000,
+            fee: fee, // Use the fee parameter directly, no dynamic fee flag
             tickSpacing: _getTickSpacing(fee),
             hooks: IHooks(address(this))
         });
@@ -779,7 +722,7 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
             batch.user, Currency.unwrap(batch.poolKey.currency0), Currency.unwrap(batch.poolKey.currency1),
             uint256(batch.totalAmount), execAmount, claimableOutputTokens[batchId],
             batch.isActive, claimTokensSupply[batchId] == 0, uint256(batch.expirationTime),
-            batch.zeroForOne, nextBatchOrderId - 1, BASE_FEE
+            batch.zeroForOne, nextBatchOrderId - 1, batch.poolKey.fee
         );
     }
 
@@ -799,7 +742,7 @@ contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCa
             batch.user, Currency.unwrap(batch.poolKey.currency0), Currency.unwrap(batch.poolKey.currency1),
             uint256(batch.totalAmount), execAmount, claimableOutputTokens[batchId], batch.isActive,
             claimTokensSupply[batchId] == 0, uint256(batch.expirationTime), batch.zeroForOne,
-            nextBatchOrderId - 1, BASE_FEE, preCollectedGasFees[batchId], actualGasCosts[batchId], refundable
+            nextBatchOrderId - 1, batch.poolKey.fee, preCollectedGasFees[batchId], actualGasCosts[batchId], refundable
         );
     }
 

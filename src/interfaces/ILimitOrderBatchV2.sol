@@ -93,10 +93,5 @@ interface ILimitOrderBatchV2 {
         uint24 currentFee
     );
 
-    // ===== ADMIN FUNCTIONS =====
 
-    /// @notice Manually execute a specific batch level at current market price
-    function executeBatchLevel(uint256 batchId, uint256 levelIndex) 
-        external 
-        returns (bool isFullyExecuted);
 }
