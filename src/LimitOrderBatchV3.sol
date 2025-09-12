@@ -20,9 +20,6 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
-import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
-import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
-import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 
 
 contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCallback {
@@ -31,7 +28,6 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
     using FixedPointMathLib for uint256;
-    using LPFeeLibrary for uint24;
 
     /* ==========================================================
        STORAGE – DCA system storage + previous storage
@@ -45,12 +41,6 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     mapping(uint256 => uint256) public preCollectedGasFees;
     mapping(uint256 => uint256) public actualGasCosts;
     mapping(uint256 => bool) public gasRefundProcessed;
-
-    // DCA-specific storage
-    mapping(uint256 => uint256) public dcaCycleCount; // Track how many cycles a DCA has completed
-    mapping(uint256 => uint256) public dcaAccumulatedProfit; // Track total profit for DCA order
-    mapping(uint256 => int24) public dcaStartTick; // Starting tick for current DCA cycle
-    mapping(uint256 => uint256) public dcaCurrentLevel; // Current DCA level being executed
 
     struct BatchInfo {
         address user;
@@ -76,19 +66,13 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     mapping(uint256 => BatchInfo) public batchOrders;
     uint256 public nextBatchOrderId = 1;
 
-    mapping(PoolId => bool) public poolInitialized;
     PoolId[] public allPoolIds;
     mapping(PoolId => PoolKey) public poolIdToKey;
-    mapping(PoolId => uint256) public poolIndex;
-
-    address public immutable FEE_RECIPIENT;
-    address public Executor;
+    
 
     /* ==========================================================
        CONSTANTS – updated to remove BASE_FEE since we use pool fee parameter
        ========================================================== */
-    uint256 public constant BASE_PROTOCOL_FEE_BPS = 35;
-    uint256 public constant BASIS_POINTS_DENOMINATOR = 10000;
     uint256 public constant ESTIMATED_EXECUTION_GAS = 150000;
     uint256 public constant GAS_PRICE_BUFFER_MULTIPLIER = 120;
     uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether;
@@ -106,26 +90,17 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     error InsufficientClaimTokenBalance();
     error InsufficientETHForOrderPlusGas();
     error InsufficientETHForGasFee();
-    error RefundAlreadyProcessed();
-    error BatchStillActive();
     error InvalidFeeRecipient();
     error InvalidExecutorAddress();
-    error InvalidArrays();
     error ExpiredDeadline();
     error SameCurrencies();
-    error EmptyArrays();
     error InvalidAmount();
-    error InvalidTotal();
-    error NoPendingOrders();
-    error InvalidExecution();
     error InvalidBatch();
-    error NothingToFlip();
     // DCA-specific errors
     error InvalidTakeProfitPercent();
     error InvalidMaxSwapOrders();
     error InvalidPriceDeviation();
     error InvalidMultiplier();
-    error DCANotPerpetual();
 
     /* ==========================================================
        EVENTS – DCA system events
@@ -133,17 +108,11 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     event DCAOrderCreated(uint256 indexed dcaId, address indexed user, address currency0, address currency1, 
                          uint256 totalAmount, uint32 takeProfitPercent, uint8 maxSwapOrders);
     event DCASwapExecuted(uint256 indexed dcaId, uint256 level, uint256 amountIn, uint256 amountOut, bool direction);
-    event DCATakeProfitHit(uint256 indexed dcaId, uint256 totalProfit);
-    event DCARestarted(uint256 indexed dcaId, uint256 newCycle, uint256 currentPrice);
-    event BatchOrderCreatedOptimized(uint256 indexed batchId, address indexed user, uint256 totalAmount);
     event BatchOrderCancelledOptimized(uint256 indexed batchId, address indexed user);
     event TokensRedeemedOptimized(uint256 indexed batchId, address indexed user, uint256 amount);
     event GasFeePreCollected(uint256 indexed batchId, uint256 estimatedGasFee);
     event GasFeeRefunded(uint256 indexed batchId, address indexed user, uint256 refundAmount);
-    event LiquidityAdded(PoolId indexed poolId, uint256 amount0, uint256 amount1, int24 tickLower, int24 tickUpper);
-    event LiquidityAdditionFailed(PoolId indexed poolId, uint256 amount, string reason);
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
-    event BatchFlipped(uint256 indexed batchId, uint256 newTotal, bool newZeroForOne); // NEW
 
     modifier validBatchOrder(uint256 batchId) {
         if (!(batchId > 0 && batchId < nextBatchOrderId)) revert InvalidBatchId();
@@ -156,8 +125,6 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     {
         if (_feeRecipient == address(0)) revert InvalidFeeRecipient();
         if (_executor == address(0)) revert InvalidExecutorAddress();
-        Executor = _executor;
-        FEE_RECIPIENT = _feeRecipient;
     }
 
     /* ==========================================================
@@ -334,7 +301,7 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         });
     }
 
-    function _beforeInitialize(address, PoolKey calldata key, uint160)
+    function _beforeInitialize(address, PoolKey calldata, uint160)
         internal pure override returns (bytes4)
     {
         // Remove dynamic fee requirement - use fee from createBatchOrder parameter
@@ -344,13 +311,11 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick)
         internal override returns (bytes4)
     {
-        lastTicks[key.toId()] = tick;
-        PoolId poolId = key.toId();
-        poolInitialized[poolId] = true;
-        poolIndex[poolId] = allPoolIds.length;
-        allPoolIds.push(poolId);
-        poolIdToKey[poolId] = key;
-        emit PoolInitializationTracked(poolId, tick, block.timestamp);
+    lastTicks[key.toId()] = tick;
+    PoolId poolId = key.toId();
+    allPoolIds.push(poolId);
+    poolIdToKey[poolId] = key;
+    emit PoolInitializationTracked(poolId, tick, block.timestamp);
         return BaseHook.afterInitialize.selector;
     }
 
@@ -365,7 +330,7 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         return (BaseHook.beforeSwap.selector, delta, 0);
     }
 
-    function _afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta, bytes calldata)
+    function _afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
         internal override returns (bytes4, int128)
     {
         if (msg.sender == address(this)) return (BaseHook.afterSwap.selector, 0);
@@ -538,11 +503,6 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
             swapOrderMultiplier: swapOrderMultiplier
         });
 
-        // Initialize DCA state
-        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
-        dcaStartTick[dcaId] = currentTick;
-        dcaCycleCount[dcaId] = 0;
-        dcaCurrentLevel[dcaId] = 0;
 
         // Register pending orders
         PoolId poolId = key.toId();
@@ -564,24 +524,9 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         emit DCASwapExecuted(dcaId, 0, batch.baseSwapAmount, 0, batch.zeroForOne);
     }
 
-    function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
-        uint256 length = prices.length;
-        ticks = new int24[](length);
-        unchecked {
-            for (uint256 i; i < length; ++i) ticks[i] = TickMath.getTickAtSqrtPrice(uint160(prices[i]));
-        }
-    }
+    // Removed unused helpers: _pricesToTicks, _sumAmounts
 
-    function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256 total) {
-        uint256 length = amounts.length;
-        if (length == 0) revert EmptyArrays();
-        unchecked {
-            for (uint256 i; i < length; ++i) total += amounts[i];
-        }
-        if (total == 0) revert InvalidTotal();
-    }
-
-    function _ensurePoolInitialized(PoolKey memory key) internal {
+    function _ensurePoolInitialized(PoolKey memory key) internal view {
         (uint160 currentPrice, , , ) = StateLibrary.getSlot0(poolManager, key.toId());
         if (currentPrice > 0) return;
         revert();
@@ -610,16 +555,6 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         emit GasFeePreCollected(batchId, estimatedGasFee);
     }
 
-    function _removeBatchIdFromTick(PoolId poolId, int24 tick, bool zeroForOne, uint256 batchOrderId) internal {
-        uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
-        for (uint256 i = 0; i < batchIds.length; i++) {
-            if (batchIds[i] == batchOrderId) {
-                batchIds[i] = batchIds[batchIds.length - 1];
-                batchIds.pop();
-                break;
-            }
-        }
-    }
 
     function _transfer(uint256 batchOrderId, uint256 outputAmount) internal {
         BatchInfo storage batch = batchOrders[batchOrderId];
@@ -641,7 +576,7 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         return abi.decode(data, (PoolKey, uint256, bool, string));
     }
 
-    function _handleLiquidityOperation(PoolKey memory key, uint256 amount, bool zeroForOne)
+    function _handleLiquidityOperation(PoolKey memory key, uint256 amount, bool)
         internal returns (bytes memory)
     {
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
