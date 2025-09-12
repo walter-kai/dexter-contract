@@ -6,7 +6,7 @@ import {console2} from "forge-std/console2.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
-import {LimitOrderBatch} from "../src/LimitOrderBatch.sol";
+import {DCADexterBotV1} from "../src/DCADexterBotV1.sol";
 
 /**
  * @title DeployHookContract
@@ -54,7 +54,7 @@ contract DeployHookContract is Script {
         (address hookAddress, bytes32 salt) = HookMiner.find(
             CREATE2_DEPLOYER,
             flags,
-            type(LimitOrderBatch).creationCode,
+            type(DCADexterBotV1).creationCode,
             constructorArgs
         );
         
@@ -62,20 +62,18 @@ contract DeployHookContract is Script {
         console2.log("Using salt:", vm.toString(salt));
         
         // Deploy the hook using CREATE2 with the mined salt
-        LimitOrderBatch limitOrderBatch = new LimitOrderBatch{salt: salt}(
+        DCADexterBotV1 dcaDexterBot = new DCADexterBotV1{salt: salt}(
             poolManager,
             feeRecipient,
             deployer
         );
         
         // Verify the deployed address matches the mined address
-        require(address(limitOrderBatch) == hookAddress, "Hook address mismatch!");
-        console2.log("Deployed hook address:", address(limitOrderBatch));
+        require(address(dcaDexterBot) == hookAddress, "Hook address mismatch!");
+        console2.log("Deployed hook address:", address(dcaDexterBot));
         
         vm.stopBroadcast();
         
-        console2.log(unicode"✅ LimitOrderBatch hook deployed at:", address(limitOrderBatch));
-        console2.log("");
-        console2.log("LIMIT_ORDER_BATCH_ADDRESS=", vm.toString(address(limitOrderBatch)));
+        console2.log(unicode"✅ DCADexterBotV1 hook deployed at: ", address(dcaDexterBot));
     }
 }
