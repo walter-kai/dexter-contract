@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 /*  ----------  imports (unchanged)  ----------  */
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ILimitOrderBatchV3} from "./interfaces/ILimitOrderBatchV3.sol";
+import {ILimitOrderBatchV2} from "./interfaces/ILimitOrderBatchV2.sol";
 import {ERC6909Base} from "./base/ERC6909Base.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
@@ -20,17 +20,21 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 
 
-contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCallback {
+contract LimitOrderBatch is ILimitOrderBatchV2, ERC6909Base, BaseHook, IUnlockCallback {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
     using FixedPointMathLib for uint256;
+    using LPFeeLibrary for uint24;
 
     /* ==========================================================
-       STORAGE – DCA system storage + previous storage
+       STORAGE – identical to previous file, only flipEnabled added
        ========================================================== */
     mapping(PoolId => int24) public lastTicks;
     mapping(PoolId => mapping(int24 => mapping(bool => uint256))) public pendingBatchOrders;
@@ -48,17 +52,11 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         PoolKey poolKey;
         uint64 expirationTime;
         uint32 maxSlippageBps;
-        uint32 takeProfitPercent; // NEW - take profit %
+        uint32 bestPriceTimeout;
         uint16 ticksLength;
-        uint8 maxSwapOrders; // NEW - max DCA levels
         bool zeroForOne;
         bool isActive;
-        bool isPerpetual; // NEW - indicates this is a perpetual DCA order
-        // DCA-specific parameters
-        uint32 priceDeviationPercent; // NEW
-        uint32 priceDeviationMultiplier; // NEW
-        uint256 baseSwapAmount; // NEW - base swap amount
-        uint32 swapOrderMultiplier; // NEW
+        bool flipEnabled; // NEW – 1 bit
     }
 
     mapping(uint256 => int24[]) public batchTargetTicks;
@@ -66,20 +64,28 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     mapping(uint256 => BatchInfo) public batchOrders;
     uint256 public nextBatchOrderId = 1;
 
+    mapping(PoolId => bool) public poolInitialized;
     PoolId[] public allPoolIds;
     mapping(PoolId => PoolKey) public poolIdToKey;
-    
+    mapping(PoolId => uint256) public poolIndex;
+
+    address public immutable FEE_RECIPIENT;
+    address public Executor;
 
     /* ==========================================================
-       CONSTANTS – updated to remove BASE_FEE since we use pool fee parameter
+       CONSTANTS – unchanged
        ========================================================== */
+    uint24 public constant BASE_FEE = 3000;
+    uint256 public constant BASE_PROTOCOL_FEE_BPS = 35;
+    uint256 public constant BASIS_POINTS_DENOMINATOR = 10000;
     uint256 public constant ESTIMATED_EXECUTION_GAS = 150000;
     uint256 public constant GAS_PRICE_BUFFER_MULTIPLIER = 120;
     uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether;
 
     /* ==========================================================
-       ERRORS – DCA system errors
+       ERRORS – unchanged list + one new
        ========================================================== */
+    error MustUseDynamicFee();
     error NothingToClaim();
     error InvalidBatchId();
     error OrderNotActive();
@@ -90,29 +96,33 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     error InsufficientClaimTokenBalance();
     error InsufficientETHForOrderPlusGas();
     error InsufficientETHForGasFee();
+    error RefundAlreadyProcessed();
+    error BatchStillActive();
     error InvalidFeeRecipient();
     error InvalidExecutorAddress();
+    error InvalidArrays();
     error ExpiredDeadline();
     error SameCurrencies();
+    error EmptyArrays();
     error InvalidAmount();
+    error InvalidTotal();
+    error NoPendingOrders();
+    error InvalidExecution();
     error InvalidBatch();
-    // DCA-specific errors
-    error InvalidTakeProfitPercent();
-    error InvalidMaxSwapOrders();
-    error InvalidPriceDeviation();
-    error InvalidMultiplier();
+    error NothingToFlip(); // NEW
 
     /* ==========================================================
-       EVENTS – DCA system events
+       EVENTS – unchanged + flip event
        ========================================================== */
-    event DCAOrderCreated(uint256 indexed dcaId, address indexed user, address currency0, address currency1, 
-                         uint256 totalAmount, uint32 takeProfitPercent, uint8 maxSwapOrders);
-    event DCASwapExecuted(uint256 indexed dcaId, uint256 level, uint256 amountIn, uint256 amountOut, bool direction);
+    event BatchOrderCreatedOptimized(uint256 indexed batchId, address indexed user, uint256 totalAmount);
     event BatchOrderCancelledOptimized(uint256 indexed batchId, address indexed user);
     event TokensRedeemedOptimized(uint256 indexed batchId, address indexed user, uint256 amount);
     event GasFeePreCollected(uint256 indexed batchId, uint256 estimatedGasFee);
     event GasFeeRefunded(uint256 indexed batchId, address indexed user, uint256 refundAmount);
+    event LiquidityAdded(PoolId indexed poolId, uint256 amount0, uint256 amount1, int24 tickLower, int24 tickUpper);
+    event LiquidityAdditionFailed(PoolId indexed poolId, uint256 amount, string reason);
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
+    event BatchFlipped(uint256 indexed batchId, uint256 newTotal, bool newZeroForOne); // NEW
 
     modifier validBatchOrder(uint256 batchId) {
         if (!(batchId > 0 && batchId < nextBatchOrderId)) revert InvalidBatchId();
@@ -125,102 +135,85 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
     {
         if (_feeRecipient == address(0)) revert InvalidFeeRecipient();
         if (_executor == address(0)) revert InvalidExecutorAddress();
+        Executor = _executor;
+        FEE_RECIPIENT = _feeRecipient;
     }
 
     /* ==========================================================
-       CREATE DCA ORDER – new DCA system
+       CREATE – signature extended with flipEnabled
        ========================================================== */
-    // New modularized createDCAOrder using PoolParams and DCAParams
-    function createDCAOrder(
-        ILimitOrderBatchV3.PoolParams calldata pool,
-        ILimitOrderBatchV3.DCAParams calldata dca,
-        uint32 slippage,
-        uint256 expirationTime
-    ) external payable virtual returns (uint256 dcaId) {
-        return _createDCAOrderInternal(
-        pool.currency0,
-        pool.currency1,
-        pool.fee,
-        dca.zeroForOne,
-        dca.takeProfitPercent,
-        dca.maxSwapOrders,
-        dca.priceDeviationPercent,
-        dca.priceDeviationMultiplier,
-        dca.swapOrderAmount,
-        dca.swapOrderMultiplier,
-            slippage,
-            expirationTime
-        );
-    }
-
-    function _createDCAOrderInternal(
+    function createBatchOrder(
         address currency0,
         address currency1,
         uint24 fee,
         bool zeroForOne,
-        uint32 takeProfitPercent,
-        uint8 maxSwapOrders,
-        uint32 priceDeviationPercent,
-        uint32 priceDeviationMultiplier,
-        uint256 swapOrderAmount,
-        uint32 swapOrderMultiplier,
-    uint32 slippage,
-    uint256 expirationTime
-    ) internal returns (uint256 dcaId) {
-    _validateDCAInputs(takeProfitPercent, maxSwapOrders, priceDeviationPercent, 
-              priceDeviationMultiplier, swapOrderAmount, swapOrderMultiplier, 
-              expirationTime, currency0, currency1);
-        
+        uint256[] calldata targetPrices,
+        uint256[] calldata targetAmounts,
+        uint32 slippage,
+        uint256 deadline,
+        bool flipEnabled // NEW
+    ) external payable virtual returns (uint256 batchId) {
+        return _createBatchOrderInternal(
+            currency0, currency1, fee, zeroForOne,
+            targetPrices, targetAmounts, slippage, deadline, flipEnabled
+        );
+    }
+
+    function _createBatchOrderInternal(
+        address currency0,
+        address currency1,
+        uint24 fee,
+        bool zeroForOne,
+        uint256[] memory targetPrices,
+        uint256[] memory targetAmounts,
+        uint32 slippage,
+        uint256 deadline,
+        bool flipEnabled // NEW
+    ) internal returns (uint256 batchId) {
+        _validateOrderInputs(targetPrices, targetAmounts, deadline, currency0, currency1);
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
         _ensurePoolInitialized(key);
-        
-        // Calculate DCA levels and amounts
-        (int24[] memory targetTicks, uint256[] memory targetAmounts, uint256 totalAmount) = 
-            _calculateDCALevels(key, zeroForOne, maxSwapOrders, priceDeviationPercent, 
-                               priceDeviationMultiplier, swapOrderAmount, swapOrderMultiplier);
+        int24[] memory targetTicks = _pricesToTicks(targetPrices);
+        uint256 totalAmount = _sumAmounts(targetAmounts);
 
-    dcaId = _createDCABatch(key, targetTicks, targetAmounts, totalAmount,
-                   zeroForOne, slippage, expirationTime, takeProfitPercent, maxSwapOrders,
-                               priceDeviationPercent, priceDeviationMultiplier, 
-                               swapOrderAmount, swapOrderMultiplier);
+        batchId = _createBatch(key, targetTicks, targetAmounts, totalAmount,
+                               zeroForOne, slippage, deadline, flipEnabled); // CHANGED
 
         _handleTokenDeposit(key, zeroForOne, totalAmount);
 
-        // TODO: Start initial buy swap immediately at swapOrderAmount
-        _initiateFirstDCASwap(dcaId);
-
-        emit DCAOrderCreated(dcaId, msg.sender, currency0, currency1, totalAmount, 
-                           takeProfitPercent, maxSwapOrders);
-        return dcaId;
+        emit BatchOrderCreated(batchId, msg.sender, currency0, currency1,
+                               totalAmount, targetPrices, targetAmounts);
+        emit BatchOrderCreatedOptimized(batchId, msg.sender, totalAmount);
+        return batchId;
     }
          
     /* ==========================================================
        CANCEL / REDEEM – identical to previous file
        ========================================================== */
-    function cancelDCAOrder(uint256 dcaOrderId) external validBatchOrder(dcaOrderId) {
+    function cancelBatchOrder(uint256 batchOrderId) external validBatchOrder(batchOrderId) {
         /*  identical implementation  */
-        BatchInfo storage batch = batchOrders[dcaOrderId];
+        BatchInfo storage batch = batchOrders[batchOrderId];
         if (batch.user != msg.sender) revert NotAuthorized();
-        uint256 userClaimBalance = balanceOf[msg.sender][dcaOrderId];
+        uint256 userClaimBalance = balanceOf[msg.sender][batchOrderId];
         if (userClaimBalance == 0) revert NoTokensToCancel();
         PoolId poolId = batch.poolKey.toId();
         uint256 totalPendingAmount;
         for (uint256 i = 0; i < batch.ticksLength; i++) {
-            totalPendingAmount += pendingBatchOrders[poolId][batchTargetTicks[dcaOrderId][i]][batch.zeroForOne];
+            totalPendingAmount += pendingBatchOrders[poolId][batchTargetTicks[batchOrderId][i]][batch.zeroForOne];
         }
         if (totalPendingAmount == 0) revert BatchAlreadyExecutedUseRedeem();
         uint256 cancellableAmount = userClaimBalance * totalPendingAmount / uint256(batch.totalAmount);
         if (cancellableAmount == 0) revert NothingToCancel();
-        _burn(msg.sender, address(uint160(dcaOrderId)), cancellableAmount);
+        _burn(msg.sender, address(uint160(batchOrderId)), cancellableAmount);
         for (uint256 i = 0; i < batch.ticksLength; i++) {
-            int24 targetTick = batchTargetTicks[dcaOrderId][i];
+            int24 targetTick = batchTargetTicks[batchOrderId][i];
             uint256 levelPending = pendingBatchOrders[poolId][targetTick][batch.zeroForOne];
             if (levelPending > 0) {
                 uint256 levelCancellation = cancellableAmount * levelPending / totalPendingAmount;
                 pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= levelCancellation;
             }
         }
-        claimTokensSupply[dcaOrderId] -= cancellableAmount;
+        claimTokensSupply[batchOrderId] -= cancellableAmount;
         if (totalPendingAmount == cancellableAmount) batch.isActive = false;
         Currency inputCurrency = batch.zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
         if (Currency.unwrap(inputCurrency) == address(0)) {
@@ -229,32 +222,122 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         } else {
             IERC20(Currency.unwrap(inputCurrency)).safeTransfer(msg.sender, cancellableAmount);
         }
-        if (totalPendingAmount == cancellableAmount && !gasRefundProcessed[dcaOrderId]) {
-            uint256 gasRefund = preCollectedGasFees[dcaOrderId];
+        if (totalPendingAmount == cancellableAmount && !gasRefundProcessed[batchOrderId]) {
+            uint256 gasRefund = preCollectedGasFees[batchOrderId];
             if (gasRefund > 0) {
-                gasRefundProcessed[dcaOrderId] = true;
+                gasRefundProcessed[batchOrderId] = true;
                 (bool success, ) = payable(msg.sender).call{value: gasRefund}("");
                 require(success, "ETH refund failed");
-                emit GasFeeRefunded(dcaOrderId, msg.sender, gasRefund);
+                emit GasFeeRefunded(batchOrderId, msg.sender, gasRefund);
             }
         }
-        emit BatchOrderCancelledOptimized(dcaOrderId, msg.sender);
+        emit BatchOrderCancelledOptimized(batchOrderId, msg.sender);
     }
 
-    function redeemProfits(uint256 dcaOrderId, uint256 inputAmountToClaimFor) external {
-        // Redeem only accumulated claimable output tokens (profits) proportionally.
-        if (claimableOutputTokens[dcaOrderId] == 0) revert NothingToClaim();
-        if (balanceOf[msg.sender][dcaOrderId] < inputAmountToClaimFor) revert InsufficientClaimTokenBalance();
+    function redeemBatchOrder(uint256 batchOrderId, uint256 inputAmountToClaimFor) external {
+        if (claimableOutputTokens[batchOrderId] == 0) revert NothingToClaim();
+        if (balanceOf[msg.sender][batchOrderId] < inputAmountToClaimFor) revert InsufficientClaimTokenBalance();
         uint256 outputAmount = inputAmountToClaimFor.mulDivDown(
-            claimableOutputTokens[dcaOrderId],
-            claimTokensSupply[dcaOrderId]
+            claimableOutputTokens[batchOrderId],
+            claimTokensSupply[batchOrderId]
         );
-        // Deduct only the profits portion and reduce claim token supply by the input amount
-        claimableOutputTokens[dcaOrderId] -= outputAmount;
-        claimTokensSupply[dcaOrderId] -= inputAmountToClaimFor;
-        _burn(msg.sender, address(uint160(dcaOrderId)), inputAmountToClaimFor);
-        _transfer(dcaOrderId, outputAmount);
-        emit TokensRedeemedOptimized(dcaOrderId, msg.sender, outputAmount);
+        claimableOutputTokens[batchOrderId] -= outputAmount;
+        claimTokensSupply[batchOrderId] -= inputAmountToClaimFor;
+        _burn(msg.sender, address(uint160(batchOrderId)), inputAmountToClaimFor);
+        _transfer(batchOrderId, outputAmount);
+        emit TokensRedeemedOptimized(batchOrderId, msg.sender, outputAmount);
+    }
+
+    /* ==========================================================
+       EXECUTE – identical logic until the “fully executed” check
+       ========================================================== */
+    function executeBatchLevel(uint256 batchId, uint256 levelIndex) external returns (bool isFullyExecuted) {
+        BatchInfo storage batch = batchOrders[batchId];
+        if (!(batch.isActive && msg.sender == Executor && levelIndex < batch.ticksLength))
+            revert InvalidExecution();
+
+        PoolId poolId = batch.poolKey.toId();
+        int24 targetTick = batchTargetTicks[batchId][levelIndex];
+        uint256 pendingAmount = pendingBatchOrders[poolId][targetTick][batch.zeroForOne];
+        if (pendingAmount == 0) revert NoPendingOrders();
+
+        uint256 amountToExecute = batchTargetAmounts[batchId][levelIndex];
+        if (pendingAmount < amountToExecute) amountToExecute = pendingAmount;
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: batch.zeroForOne,
+            amountSpecified: -int256(amountToExecute),
+            sqrtPriceLimitX96: batch.zeroForOne
+                ? TickMath.MIN_SQRT_PRICE + 1
+                : TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        bytes memory result = poolManager.unlock(abi.encode(batch.poolKey, params));
+        BalanceDelta delta = abi.decode(result, (BalanceDelta));
+        uint256 outputAmount = batch.zeroForOne
+            ? uint256(int256(-delta.amount1()))
+            : uint256(int256(-delta.amount0()));
+
+        claimableOutputTokens[batchId] += outputAmount;
+        pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= amountToExecute;
+
+        if (pendingBatchOrders[poolId][targetTick][batch.zeroForOne] == 0)
+            _removeBatchIdFromTick(poolId, targetTick, batch.zeroForOne, batchId);
+
+        // ----------  fully executed check  ----------
+        isFullyExecuted = true;
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            if (pendingBatchOrders[poolId][batchTargetTicks[batchId][i]][batch.zeroForOne] > 0) {
+                isFullyExecuted = false;
+                break;
+            }
+        }
+        emit ManualBatchLevelExecuted(batchId, levelIndex, msg.sender, amountToExecute);
+        emit BatchLevelExecuted(batchId, levelIndex, uint256(uint24(targetTick)), amountToExecute);
+
+        if (isFullyExecuted) {
+            batch.isActive = false;
+            emit BatchFullyExecuted(batchId, amountToExecute, claimableOutputTokens[batchId]);
+
+            // NEW – auto-flip if requested
+            if (batch.flipEnabled) _flipBatch(batchId);
+        }
+        return isFullyExecuted;
+    }
+
+    /* ==========================================================
+       FLIP BATCH – new helper
+       ========================================================== */
+    function _flipBatch(uint256 batchId) internal {
+        BatchInfo storage b = batchOrders[batchId];
+
+        uint256 newTotal = claimableOutputTokens[batchId];
+        if (newTotal == 0) revert NothingToFlip();
+
+        // 1. flip direction
+        b.zeroForOne = !b.zeroForOne;
+
+        // 2. recycle output → new input supply
+        claimTokensSupply[batchId] = newTotal;
+        claimableOutputTokens[batchId] = 0;
+
+        // 3. re-register same ticks, new direction, proportional amounts
+        PoolId poolId = b.poolKey.toId();
+        uint256 oldTotal = uint256(b.totalAmount);
+        b.totalAmount = uint96(newTotal);
+
+        for (uint256 i = 0; i < b.ticksLength; ++i) {
+            int24 tick = batchTargetTicks[batchId][i];
+            uint256 amt = batchTargetAmounts[batchId][i];
+            amt = amt * newTotal / oldTotal;
+            pendingBatchOrders[poolId][tick][b.zeroForOne] += amt;
+            tickToBatchIds[poolId][tick][b.zeroForOne].push(batchId);
+        }
+
+        // 4. re-activate
+        b.isActive = true;
+
+        emit BatchFlipped(batchId, newTotal, b.zeroForOne);
     }
 
     /* ==========================================================
@@ -301,21 +384,23 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         });
     }
 
-    function _beforeInitialize(address, PoolKey calldata, uint160)
+    function _beforeInitialize(address, PoolKey calldata key, uint160)
         internal pure override returns (bytes4)
     {
-        // Remove dynamic fee requirement - use fee from createBatchOrder parameter
+        if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
         return BaseHook.beforeInitialize.selector;
     }
 
     function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick)
         internal override returns (bytes4)
     {
-    lastTicks[key.toId()] = tick;
-    PoolId poolId = key.toId();
-    allPoolIds.push(poolId);
-    poolIdToKey[poolId] = key;
-    emit PoolInitializationTracked(poolId, tick, block.timestamp);
+        lastTicks[key.toId()] = tick;
+        PoolId poolId = key.toId();
+        poolInitialized[poolId] = true;
+        poolIndex[poolId] = allPoolIds.length;
+        allPoolIds.push(poolId);
+        poolIdToKey[poolId] = key;
+        emit PoolInitializationTracked(poolId, tick, block.timestamp);
         return BaseHook.afterInitialize.selector;
     }
 
@@ -323,14 +408,14 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         internal override returns (bytes4, BeforeSwapDelta, uint24)
     {
         if (msg.sender == address(this))
-            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
 
         BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
-        // Use the pool's actual fee instead of overriding
-        return (BaseHook.beforeSwap.selector, delta, 0);
+        uint24 fee = BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        return (BaseHook.beforeSwap.selector, delta, fee);
     }
 
-    function _afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
+    function _afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta, bytes calldata)
         internal override returns (bytes4, int128)
     {
         if (msg.sender == address(this)) return (BaseHook.afterSwap.selector, 0);
@@ -366,92 +451,17 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         return _createBeforeSwapDelta(params.zeroForOne, limitOrderFulfillment);
     }
 
-    function _validateDCAInputs(
-        uint32 takeProfitPercent,
-        uint8 maxSwapOrders,
-        uint32 priceDeviationPercent,
-        uint32 priceDeviationMultiplier,
-        uint256 swapOrderAmount,
-        uint32 swapOrderMultiplier,
-        uint256 expirationTime,
+    function _validateOrderInputs(
+        uint256[] memory targetPrices,
+        uint256[] memory targetAmounts,
+        uint256 deadline,
         address currency0,
         address currency1
     ) internal view {
-        if (takeProfitPercent == 0 || takeProfitPercent > 5000) revert InvalidTakeProfitPercent(); // 0-50%
-        if (maxSwapOrders == 0 || maxSwapOrders > 10) revert InvalidMaxSwapOrders(); // 1-10 levels
-        if (priceDeviationPercent == 0 || priceDeviationPercent > 2000) revert InvalidPriceDeviation(); // 0-20%
-        if (priceDeviationMultiplier < 10 || priceDeviationMultiplier > 100) revert InvalidMultiplier(); // 0.1-10.0
-        if (swapOrderAmount == 0) revert InvalidAmount();
-        if (swapOrderMultiplier < 10 || swapOrderMultiplier > 100) revert InvalidMultiplier(); // 0.1-10.0
-    if (expirationTime <= block.timestamp) revert ExpiredDeadline();
+        if (!(targetPrices.length == targetAmounts.length && targetPrices.length > 0 && targetPrices.length <= 10))
+            revert InvalidArrays();
+        if (deadline <= block.timestamp) revert ExpiredDeadline();
         if (currency0 == currency1) revert SameCurrencies();
-    }
-
-    function _calculateDCALevels(
-        PoolKey memory key,
-        bool zeroForOne,
-        uint8 maxSwapOrders,
-        uint32 priceDeviationPercent,
-        uint32 priceDeviationMultiplier,
-        uint256 baseSwapAmount,
-        uint32 swapOrderMultiplier
-    ) internal view returns (int24[] memory targetTicks, uint256[] memory targetAmounts, uint256 totalAmount) {
-        // Get current price
-        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
-        
-        targetTicks = new int24[](maxSwapOrders);
-        targetAmounts = new uint256[](maxSwapOrders);
-        totalAmount = 0;
-
-        // Convert multipliers from basis points to actual multipliers
-        uint256 deviationMultiplier = uint256(priceDeviationMultiplier); // 10-100 (0.1-10.0)
-        uint256 amountMultiplier = uint256(swapOrderMultiplier); // 10-100 (0.1-10.0)
-
-        for (uint8 i = 0; i < maxSwapOrders; i++) {
-            // Calculate price deviation with logarithmic spacing
-            // Higher levels get exponentially larger spacing
-            uint256 levelMultiplier = _calculateLogarithmicMultiplier(i + 1, deviationMultiplier);
-            
-            // Calculate tick deviation
-            int24 tickDeviation = int24(int256(
-                (uint256(priceDeviationPercent) * levelMultiplier * uint256(int256(key.tickSpacing))) / (10000 * 10)
-            ));
-            
-            // Set target tick based on direction
-            if (zeroForOne) {
-                // Selling: set buy levels below current price
-                targetTicks[i] = currentTick - tickDeviation;
-            } else {
-                // Buying: set sell levels above current price  
-                targetTicks[i] = currentTick + tickDeviation;
-            }
-
-            // Calculate amount with logarithmic multiplier effect
-            // Higher levels get exponentially larger amounts
-            uint256 amountLevelMultiplier = _calculateLogarithmicMultiplier(i + 1, amountMultiplier);
-            targetAmounts[i] = (baseSwapAmount * amountLevelMultiplier) / 10;
-            
-            totalAmount += targetAmounts[i];
-        }
-    }
-
-    function _calculateLogarithmicMultiplier(uint256 level, uint256 baseMultiplier) internal pure returns (uint256) {
-        // Logarithmic scaling: effect increases at higher levels
-        // Formula: 10 + (baseMultiplier - 10) * (1 + log2(level))
-        // This ensures multiplier is always >= 1.0 and increases logarithmically
-        
-        uint256 logLevel = 0;
-        uint256 tempLevel = level;
-        
-        // Simple log2 calculation
-        while (tempLevel > 1) {
-            logLevel++;
-            tempLevel >>= 1;
-        }
-        
-        // Calculate final multiplier
-        uint256 multiplier = 10 + ((baseMultiplier - 10) * (10 + logLevel * 5)) / 10;
-        return multiplier;
     }
 
     function _createPoolKey(address currency0, address currency1, uint24 fee)
@@ -460,76 +470,69 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         return PoolKey({
             currency0: Currency.wrap(currency0),
             currency1: Currency.wrap(currency1),
-            fee: fee, // Use the fee parameter directly, no dynamic fee flag
+            fee: fee | 0x800000,
             tickSpacing: _getTickSpacing(fee),
             hooks: IHooks(address(this))
         });
     }
 
-    function _createDCABatch(
-        PoolKey memory key,
-        int24[] memory targetTicks,
-        uint256[] memory targetAmounts,
-    uint256 totalAmount,
-        bool zeroForOne,
-        uint32 slippage,
-    uint256 expirationTime,
-        uint32 takeProfitPercent,
-        uint8 maxSwapOrders,
-        uint32 priceDeviationPercent,
-        uint32 priceDeviationMultiplier,
-        uint256 baseSwapAmount,
-        uint32 swapOrderMultiplier
-    ) internal returns (uint256 dcaId) {
-        dcaId = nextBatchOrderId++;
-        batchTargetTicks[dcaId] = targetTicks;
-        batchTargetAmounts[dcaId] = targetAmounts;
-
-        batchOrders[dcaId] = BatchInfo({
-            user: msg.sender,
-            totalAmount: uint96(totalAmount),
-            poolKey: key,
-            expirationTime: uint64(expirationTime),
-            maxSlippageBps: slippage,
-            takeProfitPercent: takeProfitPercent,
-            ticksLength: uint16(targetTicks.length),
-            maxSwapOrders: maxSwapOrders,
-            zeroForOne: zeroForOne,
-            isActive: true,
-            isPerpetual: true, // DCA orders are perpetual
-            priceDeviationPercent: priceDeviationPercent,
-            priceDeviationMultiplier: priceDeviationMultiplier,
-            baseSwapAmount: baseSwapAmount,
-            swapOrderMultiplier: swapOrderMultiplier
-        });
-
-
-        // Register pending orders
-        PoolId poolId = key.toId();
-        for (uint256 i = 0; i < targetTicks.length; i++) {
-            pendingBatchOrders[poolId][targetTicks[i]][zeroForOne] += targetAmounts[i];
-            tickToBatchIds[poolId][targetTicks[i]][zeroForOne].push(dcaId);
+    function _pricesToTicks(uint256[] memory prices) internal pure returns (int24[] memory ticks) {
+        uint256 length = prices.length;
+        ticks = new int24[](length);
+        unchecked {
+            for (uint256 i; i < length; ++i) ticks[i] = TickMath.getTickAtSqrtPrice(uint160(prices[i]));
         }
-        
-        claimTokensSupply[dcaId] = totalAmount;
-        _mint(msg.sender, address(uint160(dcaId)), totalAmount);
     }
 
-    function _initiateFirstDCASwap(uint256 dcaId) internal {
-        // TODO: Implement immediate first swap at base swap amount
-        // This should execute the first DCA level immediately
-        BatchInfo storage batch = batchOrders[dcaId];
-        
-        // For now, just emit an event - actual swap implementation would go here
-        emit DCASwapExecuted(dcaId, 0, batch.baseSwapAmount, 0, batch.zeroForOne);
+    function _sumAmounts(uint256[] memory amounts) internal pure returns (uint256 total) {
+        uint256 length = amounts.length;
+        if (length == 0) revert EmptyArrays();
+        unchecked {
+            for (uint256 i; i < length; ++i) total += amounts[i];
+        }
+        if (total == 0) revert InvalidTotal();
     }
 
-    // Removed unused helpers: _pricesToTicks, _sumAmounts
-
-    function _ensurePoolInitialized(PoolKey memory key) internal view {
+    function _ensurePoolInitialized(PoolKey memory key) internal {
         (uint160 currentPrice, , , ) = StateLibrary.getSlot0(poolManager, key.toId());
         if (currentPrice > 0) return;
         revert();
+    }
+
+    function _createBatch(
+        PoolKey memory key,
+        int24[] memory targetTicks,
+        uint256[] memory targetAmounts,
+        uint256 totalAmount,
+        bool zeroForOne,
+        uint32 slippage,
+        uint256 deadline,
+        bool flipEnabled // NEW
+    ) internal returns (uint256 batchId) {
+        batchId = nextBatchOrderId++;
+        batchTargetTicks[batchId] = targetTicks;
+        batchTargetAmounts[batchId] = targetAmounts;
+
+        batchOrders[batchId] = BatchInfo({
+            user: msg.sender,
+            totalAmount: uint96(totalAmount),
+            poolKey: key,
+            expirationTime: uint64(deadline),
+            maxSlippageBps: slippage,
+            bestPriceTimeout: 0,
+            ticksLength: uint16(targetTicks.length),
+            zeroForOne: zeroForOne,
+            isActive: true,
+            flipEnabled: flipEnabled // NEW
+        });
+
+        PoolId poolId = key.toId();
+        for (uint256 i = 0; i < targetTicks.length; i++) {
+            pendingBatchOrders[poolId][targetTicks[i]][zeroForOne] += targetAmounts[i];
+            tickToBatchIds[poolId][targetTicks[i]][zeroForOne].push(batchId);
+        }
+        claimTokensSupply[batchId] = totalAmount;
+        _mint(msg.sender, address(uint160(batchId)), totalAmount);
     }
 
     function _handleTokenDeposit(PoolKey memory key, bool zeroForOne, uint256 totalAmount) internal {
@@ -555,6 +558,16 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         emit GasFeePreCollected(batchId, estimatedGasFee);
     }
 
+    function _removeBatchIdFromTick(PoolId poolId, int24 tick, bool zeroForOne, uint256 batchOrderId) internal {
+        uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
+        for (uint256 i = 0; i < batchIds.length; i++) {
+            if (batchIds[i] == batchOrderId) {
+                batchIds[i] = batchIds[batchIds.length - 1];
+                batchIds.pop();
+                break;
+            }
+        }
+    }
 
     function _transfer(uint256 batchOrderId, uint256 outputAmount) internal {
         BatchInfo storage batch = batchOrders[batchOrderId];
@@ -576,7 +589,7 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         return abi.decode(data, (PoolKey, uint256, bool, string));
     }
 
-    function _handleLiquidityOperation(PoolKey memory key, uint256 amount, bool)
+    function _handleLiquidityOperation(PoolKey memory key, uint256 amount, bool zeroForOne)
         internal returns (bytes memory)
     {
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
@@ -754,58 +767,58 @@ contract LimitOrderBatch is ILimitOrderBatchV3, ERC6909Base, BaseHook, IUnlockCa
         return allPoolIds.length;
     }
 
-    function getDCAInfo(uint256 dcaId) external view returns (
+    function getBatchInfo(uint256 batchId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
         uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalBatches, uint24 currentFee
     ) {
-        BatchInfo storage batch = batchOrders[dcaId];
+        BatchInfo storage batch = batchOrders[batchId];
         if (batch.user == address(0)) revert InvalidBatch();
-        uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[dcaId];
+        uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[batchId];
         return (
             batch.user, Currency.unwrap(batch.poolKey.currency0), Currency.unwrap(batch.poolKey.currency1),
-            uint256(batch.totalAmount), execAmount, claimableOutputTokens[dcaId],
-            batch.isActive, claimTokensSupply[dcaId] == 0, uint256(batch.expirationTime),
-            batch.zeroForOne, nextBatchOrderId - 1, batch.poolKey.fee
+            uint256(batch.totalAmount), execAmount, claimableOutputTokens[batchId],
+            batch.isActive, claimTokensSupply[batchId] == 0, uint256(batch.expirationTime),
+            batch.zeroForOne, nextBatchOrderId - 1, BASE_FEE
         );
     }
 
-    function getDCAInfoExtended(uint256 dcaId) external view returns (
+    function getBatchInfoExtended(uint256 batchId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
         uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalBatches, uint24 currentFee,
         uint256 preCollectedGasFee, uint256 actualGasCost, uint256 gasRefundable
     ) {
-        BatchInfo storage batch = batchOrders[dcaId];
+        BatchInfo storage batch = batchOrders[batchId];
         if (batch.user == address(0)) revert InvalidBatch();
-        uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[dcaId];
-        uint256 refundable = (preCollectedGasFees[dcaId] > actualGasCosts[dcaId] && !gasRefundProcessed[dcaId])
-            ? preCollectedGasFees[dcaId] - actualGasCosts[dcaId]
+        uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[batchId];
+        uint256 refundable = (preCollectedGasFees[batchId] > actualGasCosts[batchId] && !gasRefundProcessed[batchId])
+            ? preCollectedGasFees[batchId] - actualGasCosts[batchId]
             : 0;
         return (
             batch.user, Currency.unwrap(batch.poolKey.currency0), Currency.unwrap(batch.poolKey.currency1),
-            uint256(batch.totalAmount), execAmount, claimableOutputTokens[dcaId], batch.isActive,
-            claimTokensSupply[dcaId] == 0, uint256(batch.expirationTime), batch.zeroForOne,
-            nextBatchOrderId - 1, batch.poolKey.fee, preCollectedGasFees[dcaId], actualGasCosts[dcaId], refundable
+            uint256(batch.totalAmount), execAmount, claimableOutputTokens[batchId], batch.isActive,
+            claimTokensSupply[batchId] == 0, uint256(batch.expirationTime), batch.zeroForOne,
+            nextBatchOrderId - 1, BASE_FEE, preCollectedGasFees[batchId], actualGasCosts[batchId], refundable
         );
     }
 
-    function getDCAOrder(uint256 dcaId) external view returns (
+    function getBatchOrder(uint256 batchId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
         uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts,
         bool isActive, bool isFullyExecuted
     ) {
-        BatchInfo storage batch = batchOrders[dcaId];
-        int24[] memory targetTicks = batchTargetTicks[dcaId];
-        uint256[] memory amounts = batchTargetAmounts[dcaId];
+        BatchInfo storage batch = batchOrders[batchId];
+        int24[] memory targetTicks = batchTargetTicks[batchId];
+        uint256[] memory amounts = batchTargetAmounts[batchId];
         uint256[] memory prices = new uint256[](targetTicks.length);
         for (uint256 i = 0; i < targetTicks.length; i++) {
             prices[i] = TickMath.getSqrtPriceAtTick(targetTicks[i]);
         }
         return (
             batch.user, Currency.unwrap(batch.poolKey.currency0), Currency.unwrap(batch.poolKey.currency1),
-            uint256(batch.totalAmount), uint256(batch.totalAmount) - claimTokensSupply[dcaId],
-            prices, amounts, batch.isActive, claimTokensSupply[dcaId] == 0
+            uint256(batch.totalAmount), uint256(batch.totalAmount) - claimTokensSupply[batchId],
+            prices, amounts, batch.isActive, claimTokensSupply[batchId] == 0
         );
     }
 
