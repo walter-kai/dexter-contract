@@ -632,7 +632,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             priceDeviationMultiplier: priceDeviationMultiplier,
             baseSwapAmount: baseSwapAmount,
             swapOrderMultiplier: swapOrderMultiplier,
-            gasTank: gasTankAmount,
+            gasTank: gasTankAmount * 2, // Allocate 2x gas amount initially (likely to swap again)
             gasTankPercent: gasTankPercent,
             isStalled: false
         });
@@ -809,17 +809,19 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         address sellToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
 
         if (sellToken == address(0)) {
-            // For ETH swaps, require total amount + gas pool amount
-            if (msg.value < totalAmount + gasTankAmount) revert InsufficientETHForOrderPlusGas();
-            if (msg.value > totalAmount + gasTankAmount) {
-                (bool success, ) = payable(msg.sender).call{value: msg.value - totalAmount - gasTankAmount}("");
+            // For ETH swaps, require total amount + 2x gas pool amount
+            uint256 requiredETH = totalAmount + (gasTankAmount * 2);
+            if (msg.value < requiredETH) revert InsufficientETHForOrderPlusGas();
+            if (msg.value > requiredETH) {
+                (bool success, ) = payable(msg.sender).call{value: msg.value - requiredETH}("");
                 require(success, "ETH refund failed");
             }
         } else {
-            // For token swaps, require ETH for gas pool + token amount
-            if (msg.value < gasTankAmount) revert InsufficientGasTank();
-            if (msg.value > gasTankAmount) {
-                (bool success, ) = payable(msg.sender).call{value: msg.value - gasTankAmount}("");
+            // For token swaps, require ETH for 2x gas pool + token amount
+            uint256 requiredGas = gasTankAmount * 2;
+            if (msg.value < requiredGas) revert InsufficientGasTank();
+            if (msg.value > requiredGas) {
+                (bool success, ) = payable(msg.sender).call{value: msg.value - requiredGas}("");
                 require(success, "ETH refund failed");
             }
             IERC20(sellToken).safeTransferFrom(msg.sender, address(this), totalAmount);
@@ -966,9 +968,15 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             if (batch.isPerpetual && !batch.isStalled) {
                 uint256 estimatedGasCost = 50000; // Approximate gas for DCA execution
                 if (batch.gasTank < estimatedGasCost) {
-                    batch.isStalled = true;
-                    emit DCAStalled(batchId, batch.gasTank);
-                    continue; // Skip execution for stalled orders
+                    // Try to refill gas tank from claimable profits before stalling
+                    if (_tryRefillGasTankFromProfits(batchId, estimatedGasCost, zeroForOne)) {
+                        // Successfully refilled, continue execution
+                    } else {
+                        // No profits available, mark as stalled
+                        batch.isStalled = true;
+                        emit DCAStalled(batchId, batch.gasTank);
+                        continue; // Skip execution for stalled orders
+                    }
                 }
             }
             
@@ -1052,6 +1060,55 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         _createTakeProfitOrder(dcaId);
         
         emit DCASwapExecuted(dcaId, dcaCurrentLevel[dcaId], buyAmount, 0, batch.zeroForOne);
+    }
+
+    /**
+     * @dev Attempts to refill gas tank using claimable profits when tank is insufficient
+     * @param dcaId The DCA order ID
+     * @param requiredGas Minimum gas amount needed
+     * @param isForBuyOrder True if this refill is for a buy order (allocate 2x), false for sell order (exact amount)
+     * @return success True if gas tank was successfully refilled
+     */
+    function _tryRefillGasTankFromProfits(uint256 dcaId, uint256 requiredGas, bool isForBuyOrder) internal returns (bool success) {
+        BatchInfo storage batch = batchOrders[dcaId];
+        uint256 availableProfits = claimableOutputTokens[dcaId];
+        
+        if (availableProfits == 0) {
+            return false; // No profits available
+        }
+        
+        // Calculate how much gas we need based on order type
+        uint256 gasNeeded;
+        if (isForBuyOrder) {
+            // For buy orders, allocate 2x the amount (likely to swap again)
+            gasNeeded = requiredGas * 2;
+        } else {
+            // For sell orders, allocate exact amount needed
+            gasNeeded = requiredGas;
+        }
+        
+        // For simplicity, assume 1:1 ratio between profits and ETH value
+        // In production, this would need proper price oracle or conversion mechanism
+        uint256 profitsValueInETH = availableProfits;
+        
+        if (profitsValueInETH >= gasNeeded) {
+            // Use profits to refill gas tank
+            claimableOutputTokens[dcaId] -= gasNeeded;
+            batch.gasTank += gasNeeded;
+            
+            emit GasTankContribution(dcaId, gasNeeded);
+            return true;
+        } else if (profitsValueInETH > 0) {
+            // Use all available profits if less than needed but still something
+            claimableOutputTokens[dcaId] = 0;
+            batch.gasTank += profitsValueInETH;
+            
+            emit GasTankContribution(dcaId, profitsValueInETH);
+            // Check if partial refill is sufficient
+            return batch.gasTank >= requiredGas;
+        }
+        
+        return false; // Insufficient profits to refill
     }
 
     function _handleTakeProfitHit(uint256 dcaId, uint256 takeProfitAmount) internal {

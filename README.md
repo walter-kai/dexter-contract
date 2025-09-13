@@ -17,14 +17,18 @@ DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap 
 
 ## ⚠️ Caveats
 
-- **Stall Protection**: When a DCA order's gas tank is exhausted, the order becomes "stalled" and will not execute further automatic levels until manually topped up. This prevents failed executions but requires user intervention.
+- **Stall Protection**: When a DCA order's gas tank is exhausted AND no claimable profits are available for automatic refill, the order becomes "stalled" and will not execute further automatic levels until manually topped up. This prevents failed executions but requires user intervention only when both gas tank and profit backup are depleted.
 
 - **Gas Tank Economics**: 
-  - Gas tank only refills when running low (below 2x estimated gas cost) from a percentage of successful buy swap amounts (`gasTankPercent`)
-  - This efficient approach only "taxes" DCA buys when necessary, rather than on every execution
-  - Profits from take-profit sales go to claimable output for user redemption, NOT to gas tank
-  - No automatic gas tank refill when exhausted - orders must be canceled and recreated to add more gas
-  - Consider conservative `priceDeviationMultiplier` and reasonable `maxSwapOrders` to avoid rapid gas tank depletion
+  - **Automatic Refill**: Gas tank automatically refills from claimable profits when running low, serving as a backup mechanism
+  - **Initial Allocation**: At order creation, 2x the gas amount is allocated to ensure sufficient gas for multiple swaps
+  - **Smart Refill Logic**: 
+    - For buy orders: Attempts to refill with 2x required gas (likely to swap again)
+    - For sell orders: Refills with exact amount needed
+    - Only triggers refill when tank is insufficient for execution
+  - **Fallback**: If no claimable profits available for refill, order becomes stalled until manual intervention
+  - **Efficiency**: Gas contribution from successful buys only happens when tank is running low (below 2x estimated gas cost)
+  - Consider conservative `priceDeviationMultiplier` and reasonable `maxSwapOrders` to optimize gas usage
 
 
 ---
