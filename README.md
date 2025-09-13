@@ -38,35 +38,39 @@ In order to create a bot that can operate in perpetuity, a sophisticated **Gas T
 
 **DCA Execution Process:**
 
-1) Initial swap (immediate upon creation)
-  - Executes the base swap amount at market price.
-  - Creates a TAKE-PROFIT SELL order sized to the accumulated output.
-  - Creates the first BUY limit order at Level 1 deviation (first DCA level).
-  - Gas: the contract allocates 2x the user-provided `gasTankAmount` at creation. This provides an execution buffer so the strategy can continue for at least one additional execution without immediate top-up.
+1) **Initial swap** (`_initiateFirstDCASwap()`)
+  - Executes `order.baseSwapAmount` at market price via `poolManager.swap()`
+  - Updates `dcaAccumulatedInput[dcaId]` and `dcaAccumulatedOutput[dcaId]`
+  - Calls `_createTakeProfitOrder(dcaId)` to place initial take-profit sell order
+  - Creates first DCA buy level via `_calculateInitialDCALevel()` and stores in `pendingOrders[poolId][tick][zeroForOne]`
+  - Gas: `orders[dcaId].gasTank = gasTankAmount * 2` allocated at creation for execution buffer
 
-2) Level 1 (first buy) triggers
-  - When price reaches Level 1 tick, the buy executes.
-  - The contract updates accumulated position and re-calculates the TAKE-PROFIT SELL order (cancels old TP and places an updated one sized to new accumulated output).
-  - It then creates Level 2 (next buy) at the next deviation.
-  - Gas: before executing the DCA buy the contract deducts an estimated gas amount from the `gasTank`. If the tank is below the estimated amount, the contract will first attempt an automatic refill from `claimableOutputTokens`:
-    - For buy executions the refill attempts to allocate up to 2x the required gas from available profits (because another swap is likely to follow).
-    - For sell (take-profit) executions the refill uses the exact required gas amount.
-    - If available profits are insufficient to refill, the strategy is marked `isStalled` and will not execute further automatic orders until topped up.
+2) **Level 1 buy triggers** (`_executeLimitOrdersAtTick()` → `_handleDCAExecution()`)
+  - Price hits Level 1 tick, `_beforeSwap()` detects pending order and executes
+  - `_handleDCAExecution(dcaId, executeAmount)` updates accumulation and calls `_cancelTakeProfitOrder(dcaId)`
+  - `_createTakeProfitOrder(dcaId)` places new take-profit sized to updated `dcaAccumulatedOutput[dcaId]`
+  - `_calculateNextDCALevel(dcaId, poolKey)` creates Level 2, adds to `pendingOrders` and `tickToOrderIds`
+  - Gas: `order.gasTank -= gasCost` before execution; `_tryRefillGasTankFromProfits(dcaId, requiredGas, true)` if tank low:
+    - Buy refills: attempts `requiredGas * 2` from `claimableOutputTokens[dcaId]`
+    - If insufficient: `order.isStalled = true`, emits `DCAStalled(dcaId, order.gasTank)`
 
-3) Level 2 (second buy) triggers
-  - Same flow: execute buy → update accumulation → update TAKE-PROFIT SELL → create next buy level.
-  - Gas: successful buys will contribute a percentage (`gasTankPercent`) back into the tank, but only when the tank is running low (this minimizes unnecessary taxation of every swap).
+3) **Level 2+ buy triggers** (same `_handleDCAExecution()` flow)
+  - Execute buy → `dcaAccumulatedInput[dcaId] += amount`, `dcaAccumulatedOutput[dcaId] += outputAmount`
+  - `_cancelTakeProfitOrder()` → `_createTakeProfitOrder()` → `_calculateNextDCALevel()` if not `maxSwapOrders` reached
+  - Gas: opportunistic `order.gasTank += gasContribution` when tank below threshold (via `gasTankPercent`)
 
-4) TAKE-PROFIT hit (sell executes)
-  - Cancels all pending buy levels
-  - Settles profits to claimable output (available for user redemption via `redeemProfits`)
-  - Restarts the DCA cycle by reinvesting profits (creating a fresh initial swap and Level 1)
-  - Gas: take-profit sells use the same automatic refill logic prior to execution (exact gas amount if refill needed). Note: profits are primarily recorded as `claimableOutputTokens` and used as a backup source for gas refill when necessary — they are not automatically siphoned into the gas tank unless a refill is required.
+4) **Take-profit execution** (`_handleTakeProfitHit()`)
+  - Price hits `dcaTakeProfitTick[dcaId]`, opposite direction sell executes
+  - `_handleTakeProfitHit(dcaId, takeProfitAmount)` cancels all pending buy levels in `pendingOrders`
+  - Updates `claimableOutputTokens[dcaId] += profits` and calls `_restartDCAWithProfits(dcaId, profitAmount)`
+  - `_restartDCAWithProfits()` reinvests profits via new `_initiateFirstDCASwap()` and `_calculateInitialDCALevel()`
+  - Gas: `_tryRefillGasTankFromProfits(dcaId, requiredGas, false)` for exact gas amount before execution
 
-5) Manual Sell Now Override
-  - Users may call `sellNow` to cancel the existing take-profit limit order, cancel all pending DCA buy orders, and immediately sell all accumulated output at market price instead of waiting for the limit price to be hit.
-  - This also restarts the cycle with the sale proceeds.
-  - Cancellation refunds remaining `gasTank` balance to the user.
+5) **Manual override** (`sellNow()`)
+  - User calls `sellNow(dcaId)` to immediately sell `dcaAccumulatedOutput[dcaId]` at market price
+  - Cancels `dcaTakeProfitTick[dcaId]` via `_cancelTakeProfitOrder()` and clears all `pendingOrders` for this strategy
+  - Direct `poolManager.swap()` call, transfers proceeds to user, then `_restartDCAWithProfits(dcaId, amountOut)`
+  - Cancellation (`cancelDCAStrategy()`): refunds `order.gasTank` and remaining `pendingOrders` amounts to user
 
 This makes the lifecycle deterministic and easy to follow: initial swap → progressive buys (each buy creates the next level and updates TP) → TP hit (cancels pending buys, takes profit, restarts). Gas handling is automatic: initial 2x allocation, per-execution deduction, opportunistic refill from profits (2x for buys / exact for sells), contribution back to the tank when low, and stall/refund semantics when funds are exhausted.
 
