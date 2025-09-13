@@ -34,7 +34,7 @@ In order to create a bot that can operate in perpetuity, a sophisticated **Gas T
 
 ---
 
-## 🏗️ Architecture Evolution
+## 🏗️ Contract Architecture
 
 **DCA Execution Process:**
 
