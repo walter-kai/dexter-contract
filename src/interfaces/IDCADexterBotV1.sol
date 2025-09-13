@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 /**
  * @title IDCADexterBotV1
@@ -31,9 +32,12 @@ interface IDCADexterBotV1 {
         DCAParams calldata dca,
         uint32 slippage,
         uint256 expirationTime,
-    uint256 gasTankAmount,
-    uint32 gasTankPercent
+        uint256 gasTankAmount,
+        uint32 gasTankPercent
     ) external payable returns (uint256 dcaId);
+
+    // Immediate manual sell (market sell accumulated output and restart)
+    function sellNow(uint256 dcaId) external;
 
     // Cancel / redeem
     function cancelDCAOrder(uint256 dcaId) external;
@@ -87,4 +91,6 @@ interface IDCADexterBotV1 {
 
     // Pool helpers
     function getPoolCurrentTick(PoolId poolId) external view returns (int24);
+    function getAllPools() external view returns (PoolId[] memory poolIds, PoolKey[] memory poolKeys, int24[] memory ticks);
+    function getPoolCount() external view returns (uint256);
 }
