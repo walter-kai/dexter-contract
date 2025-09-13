@@ -1,302 +1,339 @@
-# Dexter Batch Limit Order Hook
-*Production-Ready Batch Limit Orders for Uniswap V4*
+# DCA Dexter Bot V1
+*Production-Ready DCA (Dollar Cost Averaging) Bot for Uniswap V4*
 
 ## 🎯 Overview
 
-Dexter is a **gas-optimized batch limit order system** built as a Uniswap V4 hook. It enables users to create limit orders across multiple price levels in a single transa## 🚦 Current Status
-
-**Production Readiness:** Production-ready with all tests passing ✅
-
-**Test Suite:** All 8/8 tests passing including gas fee collection
-
-**Next Steps:**
-1. Security audit
-2. Mainnet deployment preparation  
-3. Frontend integration
-4. Documentation finalizationtomatic execution via V4's native hook system.
+DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap V4 hook that enables automated dollar-cost averaging with dynamic take-profit management. Unlike traditional batch limit orders, this system implements true DCA semantics with progressive level creation, accumulated position tracking, and intelligent profit-taking.
 
 **Key Features:**
-- **Batch limit orders** across multiple price ticks in one transaction
-- **Native V4 hook integration** for automatic execution during swaps
-- **ERC-6909 claim tokens** for gas-efficient order proceeds management
-- **Gas fee pre-collection** with refund mechanism for failed executions
-- **Production-optimized** contract size (20.8KB deployment)
+- **Progressive DCA Execution**: Starts with initial swap, then creates buy levels progressively as price moves
+- **Dynamic Take-Profit Management**: Automatically adjusts take-profit orders based on accumulated average cost
+- **Gas Tank System**: Self-sustaining gas pool that refills from successful swaps
+- **Perpetual Operation**: Automatically restarts DCA cycle when take-profit is hit
+- **Manual Override**: Users can manually sell at market price and restart cycle
+- **Stall Protection**: Orders become "stalled" when gas tank is exhausted
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Architecture Evolution
 
-### Core Contract: LimitOrderBatch (20.8KB)
+### From Batch Limit Orders to Progressive DCA
 
-**Single-Contract Design**: Unlike the previous modular approach, the current implementation focuses on a single, highly optimized contract that handles all batch limit order functionality.
+**Previous System (Batch Limit Orders):**
+- Created all price levels simultaneously
+- Static limit orders without relationship between levels
+- Simple gas pre-collection system
+
+**Current System (Progressive DCA):**
+```
+Initial Swap → Create Level 1 → Execute Level 1 → Create Level 2 → Execute Level 2 → ...
+     ↓              ↓              ↓              ↓              ↓
+Take Profit    Take Profit    Take Profit    Take Profit    Take Profit
+   Order         Update         Update         Update         Update
+```
+
+### Core Contract: DCADexterBotV1 (23.97KB)
 
 ```solidity
-contract LimitOrderBatch is ILimitOrderBatch, ERC6909Base, BaseHook, IUnlockCallback
+contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallback
 ```
 
 **Hook Permissions:**
 ```solidity
 Hooks.Permissions({
-    beforeInitialize: true,  // Pool setup and fee configuration
-    afterInitialize: true,   // Track pool initialization
-    beforeSwap: true,        // Pre-swap order matching
-    afterSwap: true,         // Execute matched orders
-    afterSwapReturnDelta: true // Handle swap deltas
+    beforeInitialize: true,  // Pool setup and tracking
+    afterInitialize: true,   // Track pool state
+    beforeSwap: true,        // Execute DCA orders during swaps
+    afterSwap: true,         // Update pool state
+    // All others: false
 })
 ```
 
-### Storage Optimization
+---
 
-**Gas-Optimized Storage Layout:**
+## 🔄 DCA Flow Explained
+
+### 1. DCA Order Creation
 ```solidity
-struct BatchInfo {
-    address user;                    // 20 bytes
-    uint96 totalAmount;             // 12 bytes - packed with user
-    PoolKey poolKey;                // 32 bytes (separate slot)
-    uint64 expirationTime;          // 8 bytes 
-    uint32 maxSlippageBps;          // 4 bytes
-    uint32 bestPriceTimeout;        // 4 bytes
-    uint16 ticksLength;             // 2 bytes
-    bool zeroForOne;                // 1 byte
-    bool isActive;                  // 1 byte
-    uint256 minOutputAmount;        // 32 bytes (separate slot)
+function createDCAOrder(
+    PoolParams calldata pool,     // Pool configuration (currency0, currency1, fee)
+    DCAParams calldata dca,       // DCA parameters (direction, amounts, levels, etc.)
+    uint32 slippage,              // Slippage tolerance
+    uint256 expirationTime,       // Order expiration
+    uint256 gasTankAmount,        // Initial gas tank funding
+    uint32 gasTankPercent         // % of each swap that refills gas tank
+) external payable returns (uint256 dcaId)
+```
+
+**DCA Parameters:**
+```solidity
+struct DCAParams {
+    bool zeroForOne;                    // Swap direction
+    uint32 takeProfitPercent;          // Take profit % (0-50%)
+    uint8 maxSwapOrders;               // Max DCA levels (1-10)
+    uint32 priceDeviationPercent;      // Price deviation per level (0-20%)
+    uint32 priceDeviationMultiplier;   // Logarithmic scaling factor
+    uint256 swapOrderAmount;           // Base swap amount
+    uint32 swapOrderMultiplier;        // Amount scaling factor
 }
 ```
 
-**Separate Array Storage** to avoid dynamic array gas costs:
-- `mapping(uint256 => int24[]) public batchTargetTicks`
-- `mapping(uint256 => uint256[]) public batchTargetAmounts`
+### 2. Progressive DCA Execution
+
+**Step 1: Initial Swap**
+- Immediately executes swap at `swapOrderAmount`
+- Accumulates output tokens
+- Creates first take-profit order
+
+**Step 2: Progressive Level Creation**
+- Creates first DCA buy level below/above current price
+- Each subsequent execution creates the next level
+- Levels use logarithmic scaling for price and amount
+
+**Step 3: Dynamic Take-Profit Management**
+- Take-profit price adjusts based on accumulated average cost
+- Cancels old take-profit orders when creating new ones
+- Executes when price hits take-profit level
+
+**Step 4: Restart Cycle**
+- When take-profit is hit, cancels all pending orders
+- Reinvests profits into new DCA cycle
+- Process repeats perpetually
+
+### 3. Gas Tank System
+
+**Revolutionary Self-Sustaining Gas Management:**
+```
+User Provides Initial Gas Tank → Each Swap Contributes % → Gas Tank Refills
+                ↓                        ↓                        ↓
+    Execute DCA Level → Deduct Gas Cost → Check Tank Level → Stall if Empty
+```
+
+**Key Features:**
+- Initial gas tank provided by user
+- Each successful swap contributes percentage back to tank
+- Orders become "stalled" (not "failed") when tank is empty
+- Tank can be topped up to reactivate stalled orders
 
 ---
 
-## � Core Features
+## 💡 Key Innovations
 
-### 1. Batch Limit Orders
-
-Create multiple limit orders across different price levels in a single transaction:
-
-```solidity
-function createBatchOrder(
-    Currency currency0,
-    Currency currency1, 
-    uint24 fee,
-    bool zeroForOne,
-    uint256[] calldata targetPrices,
-    uint256[] calldata targetAmounts,
-    uint64 expirationTime,
-    uint32 bestPriceTimeout
-) external payable returns (uint256 batchId)
+### 1. Progressive vs. Batch Creation
+**Traditional Approach:**
+```
+Create Order: [Level1, Level2, Level3, Level4, Level5] // All at once
 ```
 
-**Benefits:**
-- Reduce gas costs by batching multiple orders
-- Distribute liquidity across multiple price points
-- Automatic execution via V4 hooks during pool swaps
-
-### 2. Gas Fee Management
-
-**Pre-Collection with Refunds:**
-```solidity
-uint256 estimatedGasFee = (tx.gasprice * ESTIMATED_EXECUTION_GAS * GAS_PRICE_BUFFER_MULTIPLIER) / 100;
-require(msg.value >= totalInputAmount + estimatedGasFee, "Insufficient ETH for gas");
+**DCA Dexter Approach:**
+```
+Create Order: [InitialSwap] → Execute → [Level1] → Execute → [Level2] → Execute → ...
 ```
 
-- Gas fees are pre-collected when creating orders
-- Unused gas is refunded after execution or cancellation
-- Protocol fee (0.35%) collected for successful executions
-
-### 3. ERC-6909 Claim Tokens
-
-**Efficient Proceed Management:**
+### 2. Accumulated Position Tracking
 ```solidity
-// User receives claim tokens for executed orders
-_mint(user, batchId, claimAmount);
-
-// Redeem claim tokens for output tokens
-function redeem(uint256 id, uint256 amount, address to) external
+mapping(uint256 => uint256) public dcaAccumulatedInput;  // Total input accumulated
+mapping(uint256 => uint256) public dcaAccumulatedOutput; // Total output accumulated
+mapping(uint256 => uint256) public dcaCurrentLevel;     // Current DCA level
+mapping(uint256 => int24) public dcaTakeProfitTick;     // Current take-profit price
 ```
 
-### 4. Hook-Based Execution
+### 3. Logarithmic Scaling
+**Price Deviation:** Each level is further from current price using logarithmic scaling
+**Amount Scaling:** Each level can have different amounts based on scaling formula
 
-**Automatic Execution During Swaps:**
 ```solidity
-function afterSwap(
-    address sender,
-    PoolKey calldata key,
-    SwapParams calldata params,
-    BalanceDelta delta,
-    bytes calldata hookData
-) external override onlyByPoolManager returns (bytes4, int128)
+function _calculateLogarithmicMultiplier(uint256 level, uint256 baseMultiplier) internal pure returns (uint256) {
+    // Formula: 10 + (baseMultiplier - 10) * (1 + log2(level))
+    // Ensures multiplier increases logarithmically with level
+}
 ```
 
-Orders execute automatically when pool swaps move the price through order levels.
+### 4. Smart Take-Profit Adjustment
+- Calculates average cost basis from accumulated positions
+- Adjusts take-profit price based on `takeProfitPercent`
+- Dynamically updates as more positions are accumulated
 
 ---
 
-## � Technical Specifications
+## 🔧 Usage Examples
+
+### Basic DCA Order Creation
+
+```solidity
+// Example: DCA buy ETH with USDC over 5 levels
+IDCADexterBotV1.PoolParams memory pool = IDCADexterBotV1.PoolParams({
+    currency0: address(USDC),
+    currency1: address(WETH),
+    fee: 3000  // 0.3%
+});
+
+IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+    zeroForOne: true,              // USDC → WETH
+    takeProfitPercent: 1000,       // 10% take profit
+    maxSwapOrders: 5,              // 5 DCA levels max
+    priceDeviationPercent: 500,    // 5% price deviation per level
+    priceDeviationMultiplier: 20,  // 2.0x logarithmic scaling
+    swapOrderAmount: 1000e6,       // 1000 USDC base amount
+    swapOrderMultiplier: 15        // 1.5x amount scaling
+});
+
+// Create DCA order with 0.01 ETH gas tank, 2% contribution rate
+uint256 dcaId = dcaBot.createDCAOrder{value: 0.01 ether}(
+    pool,
+    dca,
+    100,                    // 1% slippage
+    block.timestamp + 7 days, // 1 week expiration
+    0.01 ether,            // Gas tank amount
+    200                    // 2% gas tank contribution
+);
+```
+
+### Advanced Features
+
+```solidity
+// Manual sell at market price
+dcaBot.manualSell(dcaId);
+
+// Cancel entire DCA order (refunds tokens + gas tank)
+dcaBot.cancelDCAOrder(dcaId);
+
+// Redeem accumulated profits
+dcaBot.redeemProfits(dcaId, claimTokenAmount);
+
+// Check DCA status
+(address user, address currency0, address currency1, uint256 totalAmount,
+ uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
+ uint256 expirationTime, bool zeroForOne, uint256 totalBatches, uint24 currentFee,
+ uint256 gasTankAmount, uint32 gasTankPercent, bool isStalled) = 
+    dcaBot.getDCAInfoExtended(dcaId);
+```
+
+---
+
+## 📊 Technical Specifications
 
 ### Contract Details
 
 | Metric | Value |
 |--------|-------|
-| **Contract Size** | 20.8KB |
-| **Deployment Cost** | 4,009,496 gas |
-| **Test Coverage** | 8/8 tests passing |
-| **Hook Permissions** | 5 hooks implemented |
+| **Contract Size** | 23.97KB |
+| **Size Margin** | 605 bytes (under 24.576KB limit) |
+| **Test Coverage** | Production ready |
+| **Hook Permissions** | 4 hooks implemented |
 
-### Gas Usage (Mainnet Estimates)
+### Gas Tank Economics
 
-| Function | Gas Cost |
-|----------|----------|
-| `createBatchOrder` (1 level) | ~25,000 |
-| `createBatchOrder` (3 levels) | ~400,000 |
-| `createBatchOrder` (10 levels) | ~1,240,000 |
-| `cancelBatchOrder` | ~68,000 |
+| Action | Gas Tank Impact |
+|--------|-----------------|
+| **Create DCA Order** | User provides initial tank |
+| **Execute DCA Level** | Deducts ~50,000 gas equivalent |
+| **Successful Swap** | Contributes `gasTankPercent` back |
+| **Manual Sell** | Uses existing tank |
+| **Cancel Order** | Refunds remaining tank |
 
-### Constants
+### DCA Level Progression Example
 
-```solidity
-uint24 public constant BASE_FEE = 3000;                    // 0.3%
-uint256 public constant MAX_SLIPPAGE_BPS = 500;            // 5%
-uint256 public constant BASE_PROTOCOL_FEE_BPS = 35;        // 0.35%
-uint256 public constant ESTIMATED_EXECUTION_GAS = 150000;  // Conservative estimate
-uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether;      // Gas fee cap
+**Base Parameters:**
+- `swapOrderAmount`: 1000 USDC
+- `priceDeviationPercent`: 500 (5%)
+- Multipliers: 2.0x
+
+**Progressive Execution:**
+```
+Initial Swap: 1000 USDC → ETH (immediate)
+Level 1: 1500 USDC at -5% price (when triggered)
+Level 2: 2000 USDC at -7.5% price (when triggered)
+Level 3: 2500 USDC at -11.25% price (when triggered)
+...
 ```
 
 ---
 
-## � Usage Examples
-
-### Basic Batch Order Creation
-
-```solidity
-// Create a 3-level batch order: USDC → WETH
-uint256[] memory targetPrices = new uint256[](3);
-targetPrices[0] = 3000e6; // $3000 USDC per ETH
-targetPrices[1] = 3100e6; // $3100 USDC per ETH  
-targetPrices[2] = 3200e6; // $3200 USDC per ETH
-
-uint256[] memory targetAmounts = new uint256[](3);
-targetAmounts[0] = 1000e6; // 1000 USDC
-targetAmounts[1] = 1500e6; // 1500 USDC
-targetAmounts[2] = 2000e6; // 2000 USDC
-
-uint256 batchId = limitOrderBatch.createBatchOrder{value: 0.005 ether}(
-    Currency.wrap(address(USDC)),   // currency0
-    Currency.wrap(address(WETH)),   // currency1
-    3000 | 0x800000,               // 0.3% fee + dynamic fee flag
-    true,                          // zeroForOne (USDC → WETH)
-    targetPrices,
-    targetAmounts,
-    block.timestamp + 86400,       // 24 hour expiration
-    300                           // 5 minute best price timeout
-);
-```
-
-### Claiming Executed Orders
-
-```solidity
-// Check claimable amount
-uint256 claimAmount = limitOrderBatch.balanceOf(user, batchId);
-
-// Redeem executed orders for output tokens
-limitOrderBatch.redeem(batchId, claimAmount, user);
-```
-
-### Canceling Orders
-
-```solidity
-// Cancel active batch order
-limitOrderBatch.cancelBatchOrder(batchId);
-// Refunds remaining input tokens + unused gas fees
-```
-
----
-
-## � Development
-
-### Prerequisites
-
-- Foundry
-- Uniswap V4 Core & Periphery
-
-### Building
-
-```bash
-forge build
-```
-
-### Testing
-
-```bash
-forge test
-forge test --gas-report    # View gas usage
-forge test -vvv           # Verbose output
-```
-
-### Current Test Status
-
-```bash
-Ran 8 tests for test/SimpleTest.t.sol:SimpleTest
-[PASS] test_CanCancelOrder() (gas: 344599)
-[PASS] test_CanCreateBasicOrder() (gas: 413582)  
-[PASS] test_CanCreateMultiLevelOrder() (gas: 598077)
-[PASS] test_CanDeployHook() (gas: 12094)
-[PASS] test_GasFeeCollection() (gas: 436169) // ✅ Fixed!
-[PASS] test_HookPermissions() (gas: 13846)
-[PASS] test_InvalidInputs() (gas: 36324)
-[PASS] test_MaxLevelsOrder() (gas: 1282487)
-```
-
-### Deployment
-
-```bash
-# Deploy to local testnet
-forge script script/DeployHook.s.sol --broadcast --fork-url $ANVIL_RPC_URL
-
-# Deploy to mainnet (when ready)
-forge script script/DeployHook.s.sol --broadcast --verify --fork-url $MAINNET_RPC_URL
-```
-
----
-
-## 🔒 Security Considerations
+## 🔒 Security & Production Readiness
 
 ### Input Validation
-- Maximum slippage hardcoded to 5%
-- Gas fee capped at 0.01 ETH per order
-- Array length validation for batch orders
-- Expiration time validation
-
-### Access Control
-- Owner-only functions for emergency management
-- User-only cancellation and redemption
-- Pool manager-only hook execution
+- Take profit percentage: 0-50%
+- Max swap orders: 1-10 levels
+- Price deviation: 0-20%
+- Gas tank percentage: 0-10%
+- Comprehensive parameter validation
 
 ### Economic Security
-- Protocol fee collection (0.35%)
-- Gas fee pre-collection with refunds
-- Slippage protection on order execution
+- Gas tank system prevents failed executions
+- Stalled state instead of failed state
+- User-controlled gas tank contributions
+- Automatic refunds on cancellation
+
+### Access Control
+- User-only cancellation and manual sell
+- Owner restrictions on critical functions
+- Pool manager-only hook execution
+
+### Error Handling
+```solidity
+error InsufficientGasTank();
+error OrderStalled();
+error InvalidTakeProfitPercent();
+error InvalidMaxSwapOrders();
+error InvalidPriceDeviation();
+```
 
 ---
 
-## � Current Status
+## 🚀 Current Status
 
-**Production Readiness:** Near production-ready with minor test fixes needed
+**Production Readiness:** ✅ Production-ready and fully functional
 
-**Known Issues:**
-- Gas fee collection test failing (implementation vs test mismatch)
-- Single contract approach (no more tools contract)
-- Simplified feature set focused on core functionality
+**Contract Status:**
+- ✅ Compiles successfully with no errors
+- ✅ All DCA flow implemented and tested
+- ✅ Gas tank system fully operational
+- ✅ Progressive level creation working
+- ✅ Take-profit management functional
+- ✅ Manual sell and restart cycle operational
+
+**Key Features Implemented:**
+- ✅ Progressive DCA execution
+- ✅ Dynamic take-profit adjustment
+- ✅ Gas tank self-sustaining system
+- ✅ Stall protection mechanism
+- ✅ Manual sell functionality
+- ✅ Perpetual restart capability
+- ✅ ERC-6909 claim token system
 
 **Next Steps:**
-1. Fix gas fee collection logic
-2. Complete test suite 
-3. Security audit
-4. Mainnet deployment preparation
+1. Security audit
+2. Advanced testing scenarios
+3. Frontend integration
+4. Mainnet deployment
+
+---
+
+## 🔄 DCA vs Traditional Limit Orders
+
+| Feature | Traditional Limit Orders | DCA Dexter Bot |
+|---------|-------------------------|----------------|
+| **Order Creation** | All levels at once | Progressive creation |
+| **Execution** | Independent orders | Linked DCA progression |
+| **Take Profit** | Static separate orders | Dynamic adjustment |
+| **Gas Management** | Pre-collection only | Self-sustaining tank |
+| **Position Tracking** | None | Accumulated cost basis |
+| **Restart Logic** | Manual only | Automatic perpetual |
+| **Failure Handling** | Orders fail | Orders stall |
 
 ---
 
 ## 📝 License
 
 MIT License - see [LICENSE](./LICENSE) for details.
+
+---
+
+## 🔍 Understanding the Innovation
+
+DCA Dexter Bot represents a paradigm shift from static batch limit orders to intelligent, progressive DCA execution. The system mimics how sophisticated traders actually perform DCA - starting with an initial position, adding to it as price moves favorably, adjusting take-profit levels based on average cost, and automatically reinvesting profits.
+
+The gas tank system ensures sustainability without requiring users to monitor and refund failed transactions. Instead of failing when gas runs out, orders simply pause ("stall") until the tank is replenished by successful swaps or manual top-ups.
+
+This creates a truly "set-and-forget" DCA experience that can run perpetually with minimal user intervention.
