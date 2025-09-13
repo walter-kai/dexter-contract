@@ -1020,10 +1020,15 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         dcaAccumulatedInput[dcaId] += buyAmount;
         // Note: accumulated output will be updated when the actual buy swap happens
         
-        // Contribute to gas pool from buy amount
-        uint256 gasContribution = (buyAmount * batch.gasTankPercent) / 10000;
-        batch.gasTank += gasContribution;
-        emit GasTankContribution(dcaId, gasContribution);
+        // Only contribute to gas tank if it's running low (less than 2x estimated gas cost)
+        uint256 estimatedGasCost = 50000; // Should match the gas cost used in _executeLimitOrdersAtTick
+        uint256 gasThreshold = estimatedGasCost * 2; // Refill when below 2x gas cost
+        
+        if (batch.gasTank < gasThreshold) {
+            uint256 gasContribution = (buyAmount * batch.gasTankPercent) / 10000;
+            batch.gasTank += gasContribution;
+            emit GasTankContribution(dcaId, gasContribution);
+        }
         
         // Increment current level
         dcaCurrentLevel[dcaId]++;

@@ -6,12 +6,26 @@
 DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap V4 hook that enables automated dollar-cost averaging with dynamic take-profit management. This system implements true DCA strategies with progressive level creation, accumulated position tracking, and intelligent profit-taking.
 
 **Key Features:**
-- **Progressive DCA Execution**: Starts with initial swap, then creates buy levels progressively as price moves
+- **Progressive DCA Execution**: Starts with initial swap, then creates buy levels progressively as price moves down
 - **Dynamic Take-Profit Management**: Automatically adjusts take-profit orders based on accumulated average cost
 - **Gas Tank System**: Self-sustaining gas pool that refills from successful swaps
 - **Perpetual Operation**: Automatically restarts DCA cycle when take-profit is hit
-- **Manual Override**: Users can manually sell at market price and restart cycle
-- **Stall Protection**: Orders become "stalled" when gas tank is exhausted
+- **Manual Sell Now**: Users can manually sell at market price and restart cycle
+- **Manual Sell Now**: Users can manually sell at market price and restart cycle
+
+---
+
+## ⚠️ Caveats
+
+- **Stall Protection**: When a DCA order's gas tank is exhausted, the order becomes "stalled" and will not execute further automatic levels until manually topped up. This prevents failed executions but requires user intervention.
+
+- **Gas Tank Economics**: 
+  - Gas tank only refills when running low (below 2x estimated gas cost) from a percentage of successful buy swap amounts (`gasTankPercent`)
+  - This efficient approach only "taxes" DCA buys when necessary, rather than on every execution
+  - Profits from take-profit sales go to claimable output for user redemption, NOT to gas tank
+  - No automatic gas tank refill when exhausted - orders must be canceled and recreated to add more gas
+  - Consider conservative `priceDeviationMultiplier` and reasonable `maxSwapOrders` to avoid rapid gas tank depletion
+
 
 ---
 
@@ -25,12 +39,32 @@ DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap 
 - Simple gas pre-collection system
 
 **Current System (Progressive DCA):**
-```
-Initial Swap → Create Level 1 → Execute Level 1 → Create Level 2 → Execute Level 2 → ...
-     ↓              ↓              ↓              ↓              ↓
-Take Profit    Take Profit    Take Profit    Take Profit    Take Profit
-   Order         Update         Update         Update         Update
-```
+
+Typical Bot Lifecycle:
+
+1) Initial swap (immediate)
+  - Executes the base swap amount at market price.
+  - Creates a TAKE-PROFIT SELL order sized to the accumulated output.
+  - Creates the first BUY limit order at Level 1 deviation (first DCA level).
+
+2) Level 1 (first buy) triggers
+  - When price reaches Level 1 tick, the buy executes.
+  - The contract updates accumulated position and re-calculates the TAKE-PROFIT SELL order (cancels old TP and places an updated one sized to new accumulated output).
+  - It then creates Level 2 (next buy) at the next deviation.
+
+3) Level 2 (second buy) triggers
+  - Same flow: execute buy → update accumulation → update TAKE-PROFIT SELL → create next buy level.
+
+4) TAKE-PROFIT hit (sell executes)
+  - Cancels all pending buy levels
+  - Settles profits to claimable output (available for user redemption via `redeemProfits`)
+  - Restarts the DCA cycle by reinvesting profits (creating a fresh initial swap and Level 1)
+  - **Important**: Profits go to claimable output for user redemption, NOT to gas tank. Gas tank only refills from a percentage of successful buy swaps, never from profits.
+
+5) Manual overrides
+  - Users may call `sellNow` to trigger an immediate market sell of accumulated output. That also restarts the cycle with profits.
+
+This makes the lifecycle deterministic and easy to follow: initial swap → progressive buys (each buy creates the next level and updates TP) → TP hit (cancels pending buys, takes profit, restarts).
 
 ### Core Contract: DCADexterBotV1 (23.97KB)
 
