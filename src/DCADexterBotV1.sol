@@ -507,12 +507,13 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         targetTicks = new int24[](1);
         targetAmounts = new uint256[](1);
         
-        // Calculate first level deviation
-        uint256 levelMultiplier = _calculateLogarithmicMultiplier(1, uint256(priceDeviationMultiplier));
+        // Calculate first level deviation (level 1 = 1 * priceDeviationPercent)
+        // priceDeviationPercent is stored as basis points (500 = 5%)
+        uint256 level1DeviationBps = uint256(priceDeviationPercent); // Level 1 uses base deviation
         
         // Calculate tick deviation for first level
         int24 tickDeviation = int24(int256(
-            (uint256(priceDeviationPercent) * levelMultiplier * uint256(int256(key.tickSpacing))) / (10000 * 10)
+            (level1DeviationBps * uint256(int256(key.tickSpacing))) / 10000
         ));
         
         // Set target tick based on direction
@@ -524,8 +525,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             targetTicks[0] = currentTick + tickDeviation;
         }
 
-        // Calculate amount for first level
-        uint256 amountLevelMultiplier = _calculateLogarithmicMultiplier(1, uint256(swapOrderMultiplier));
+        // Calculate amount for first level using exponential multiplier
+        // Level 1: base * multiplier^1
+        uint256 amountLevelMultiplier = _calculateExponentialMultiplier(1, uint256(swapOrderMultiplier));
         targetAmounts[0] = (baseSwapAmount * amountLevelMultiplier) / 10;
         
         totalAmount = baseSwapAmount + targetAmounts[0]; // Initial swap + first DCA level
@@ -546,11 +548,12 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Get current price
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         
-        // Calculate deviation for next level
-        uint256 levelMultiplier = _calculateLogarithmicMultiplier(nextLevel + 1, uint256(batch.priceDeviationMultiplier));
+        // Calculate deviation for next level (linear scaling)
+        // Level N gets N * priceDeviationPercent deviation
+        uint256 levelDeviationBps = uint256(batch.priceDeviationPercent) * (nextLevel + 1);
         
         int24 tickDeviation = int24(int256(
-            (uint256(batch.priceDeviationPercent) * levelMultiplier * uint256(int256(key.tickSpacing))) / (10000 * 10)
+            (levelDeviationBps * uint256(int256(key.tickSpacing))) / 10000
         ));
         
         // Set target tick
@@ -560,28 +563,24 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             nextTick = currentTick + tickDeviation;
         }
 
-        // Calculate amount for next level
-        uint256 amountLevelMultiplier = _calculateLogarithmicMultiplier(nextLevel + 1, uint256(batch.swapOrderMultiplier));
+        // Calculate amount for next level using exponential multiplier
+        uint256 amountLevelMultiplier = _calculateExponentialMultiplier(nextLevel + 1, uint256(batch.swapOrderMultiplier));
         nextAmount = (batch.baseSwapAmount * amountLevelMultiplier) / 10;
     }
 
-    function _calculateLogarithmicMultiplier(uint256 level, uint256 baseMultiplier) internal pure returns (uint256) {
-        // Logarithmic scaling: effect increases at higher levels
-        // Formula: 10 + (baseMultiplier - 10) * (1 + log2(level))
-        // This ensures multiplier is always >= 1.0 and increases logarithmically
+    function _calculateExponentialMultiplier(uint256 level, uint256 baseMultiplier) internal pure returns (uint256) {
+        // Exponential scaling: multiplier = baseMultiplier^level
+        // baseMultiplier is stored as e.g. 20 for 2.0x
+        // Level 1: 2^1 = 2, Level 2: 2^2 = 4, Level 3: 2^3 = 8
+        // We scale by 10, so: Level 1: 20, Level 2: 40, Level 3: 80
         
-        uint256 logLevel = 0;
-        uint256 tempLevel = level;
+        if (level == 0) return 10; // 1.0x for level 0
         
-        // Simple log2 calculation
-        while (tempLevel > 1) {
-            logLevel++;
-            tempLevel >>= 1;
+        uint256 result = baseMultiplier; // Start with base (e.g. 20 for 2.0x)
+        for (uint256 i = 1; i < level; i++) {
+            result = (result * baseMultiplier) / 10; // Multiply by base, keeping scale
         }
-        
-        // Calculate final multiplier
-        uint256 multiplier = 10 + ((baseMultiplier - 10) * (10 + logLevel * 5)) / 10;
-        return multiplier;
+        return result;
     }
 
     function _createPoolKey(address currency0, address currency1, uint24 fee)
