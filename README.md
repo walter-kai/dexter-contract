@@ -3,7 +3,7 @@
 
 ## 🎯 Overview
 
-DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap V4 hook that enables automated dollar-cost averaging with dynamic take-profit management. Unlike traditional batch limit orders, this system implements true DCA semantics with progressive level creation, accumulated position tracking, and intelligent profit-taking.
+DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap V4 hook that enables automated dollar-cost averaging with dynamic take-profit management. This system implements true DCA strategies with progressive level creation, accumulated position tracking, and intelligent profit-taking.
 
 **Key Features:**
 - **Progressive DCA Execution**: Starts with initial swap, then creates buy levels progressively as price moves
