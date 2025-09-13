@@ -1,7 +1,8 @@
+    error InsufficientETHForOrderPlusGas();
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/*  ----------  imports (unchanged)  ----------  */
+/*  ----------  imports  ----------  */
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IDCADexterBotV1} from "./interfaces/IDCADexterBotV1.sol";
@@ -38,9 +39,11 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     mapping(uint256 => uint256) public claimTokensSupply;
     mapping(PoolId => mapping(int24 => mapping(bool => uint256[]))) internal tickToBatchIds;
 
-    mapping(uint256 => uint256) public preCollectedGasFees;
-    mapping(uint256 => uint256) public actualGasCosts;
-    mapping(uint256 => bool) public gasRefundProcessed;
+    // DCA state tracking
+    mapping(uint256 => uint256) public dcaAccumulatedInput; // Total input amount accumulated
+    mapping(uint256 => uint256) public dcaAccumulatedOutput; // Total output amount accumulated  
+    mapping(uint256 => uint256) public dcaCurrentLevel; // Current DCA level (0 = initial swap done)
+    mapping(uint256 => int24) public dcaTakeProfitTick; // Current take profit tick
 
     struct BatchInfo {
         address user;
@@ -54,11 +57,14 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         bool zeroForOne;
         bool isActive;
         bool isPerpetual; // NEW - indicates this is a perpetual DCA order
+        bool isStalled; // NEW - indicates gas pool is exhausted
         // DCA-specific parameters
         uint32 priceDeviationPercent; // NEW
         uint32 priceDeviationMultiplier; // NEW
         uint256 baseSwapAmount; // NEW - base swap amount
         uint32 swapOrderMultiplier; // NEW
+    uint256 gasTank; // NEW - gas tank for DCA executions
+    uint32 gasTankPercent; // NEW - percentage of each swap that goes to gas tank
     }
 
     mapping(uint256 => int24[]) public batchTargetTicks;
@@ -86,10 +92,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     error NotAuthorized();
     error NoTokensToCancel();
     error BatchAlreadyExecutedUseRedeem();
-    error NothingToCancel();
     error InsufficientClaimTokenBalance();
-    error InsufficientETHForOrderPlusGas();
-    error InsufficientETHForGasFee();
     error InvalidFeeRecipient();
     error InvalidExecutorAddress();
     error ExpiredDeadline();
@@ -101,6 +104,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     error InvalidMaxSwapOrders();
     error InvalidPriceDeviation();
     error InvalidMultiplier();
+    error InsufficientGasTank();
+    error OrderStalled();
 
     /* ==========================================================
        EVENTS – DCA system events
@@ -108,15 +113,17 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     event DCAOrderCreated(uint256 indexed dcaId, address indexed user, address currency0, address currency1, 
                          uint256 totalAmount, uint32 takeProfitPercent, uint8 maxSwapOrders);
     event DCASwapExecuted(uint256 indexed dcaId, uint256 level, uint256 amountIn, uint256 amountOut, bool direction);
+    event DCARestarted(uint256 indexed dcaId, uint256 profitAmount);
+    event GasTankContribution(uint256 indexed dcaId, uint256 amount);
+    event DCAStalled(uint256 indexed dcaId, uint256 gasTankRemaining);
     event BatchOrderCancelledOptimized(uint256 indexed batchId, address indexed user);
     event TokensRedeemedOptimized(uint256 indexed batchId, address indexed user, uint256 amount);
-    event GasFeePreCollected(uint256 indexed batchId, uint256 estimatedGasFee);
-    event GasFeeRefunded(uint256 indexed batchId, address indexed user, uint256 refundAmount);
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
 
     modifier validBatchOrder(uint256 batchId) {
         if (!(batchId > 0 && batchId < nextBatchOrderId)) revert InvalidBatchId();
         if (!batchOrders[batchId].isActive) revert OrderNotActive();
+        if (batchOrders[batchId].isStalled) revert OrderStalled();
         _;
     }
 
@@ -135,7 +142,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         IDCADexterBotV1.PoolParams calldata pool,
         IDCADexterBotV1.DCAParams calldata dca,
         uint32 slippage,
-        uint256 expirationTime
+        uint256 expirationTime,
+        uint256 gasTankAmount,
+        uint32 gasTankPercent
     ) external payable virtual returns (uint256 dcaId) {
         return _createDCAOrderInternal(
         pool.currency0,
@@ -149,7 +158,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         dca.swapOrderAmount,
         dca.swapOrderMultiplier,
             slippage,
-            expirationTime
+            expirationTime,
+            gasTankAmount,
+            gasTankPercent
         );
     }
 
@@ -165,28 +176,30 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint256 swapOrderAmount,
         uint32 swapOrderMultiplier,
     uint32 slippage,
-    uint256 expirationTime
+    uint256 expirationTime,
+        uint256 gasTankAmount,
+        uint32 gasTankPercent
     ) internal returns (uint256 dcaId) {
     _validateDCAInputs(takeProfitPercent, maxSwapOrders, priceDeviationPercent, 
               priceDeviationMultiplier, swapOrderAmount, swapOrderMultiplier, 
-              expirationTime, currency0, currency1);
+              expirationTime, currency0, currency1, gasTankAmount, gasTankPercent);
         
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
         _ensurePoolInitialized(key);
         
-        // Calculate DCA levels and amounts
+        // Calculate only the first DCA level for now - progressive creation
         (int24[] memory targetTicks, uint256[] memory targetAmounts, uint256 totalAmount) = 
-            _calculateDCALevels(key, zeroForOne, maxSwapOrders, priceDeviationPercent, 
+            _calculateInitialDCALevel(key, zeroForOne, priceDeviationPercent, 
                                priceDeviationMultiplier, swapOrderAmount, swapOrderMultiplier);
 
     dcaId = _createDCABatch(key, targetTicks, targetAmounts, totalAmount,
                    zeroForOne, slippage, expirationTime, takeProfitPercent, maxSwapOrders,
                                priceDeviationPercent, priceDeviationMultiplier, 
-                               swapOrderAmount, swapOrderMultiplier);
+                               swapOrderAmount, swapOrderMultiplier, gasTankAmount, gasTankPercent);
 
-        _handleTokenDeposit(key, zeroForOne, totalAmount);
+        _handleTokenDeposit(key, zeroForOne, totalAmount, gasTankAmount);
 
-        // TODO: Start initial buy swap immediately at swapOrderAmount
+        // Start initial buy swap immediately at swapOrderAmount
         _initiateFirstDCASwap(dcaId);
 
         emit DCAOrderCreated(dcaId, msg.sender, currency0, currency1, totalAmount, 
@@ -195,50 +208,139 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
          
     /* ==========================================================
-       CANCEL / REDEEM – identical to previous file
+       CANCEL / REDEEM FUNCTIONS
        ========================================================== */
+    /// Cancel the DCA order completely.
+    /// - Cancels ALL pending buy levels for this DCA.
+    /// - Cancels the pending take-profit sell order (if any).
+    /// - Refunds all unspent input tokens to the user.
+    /// - Burns the user's claim tokens and deactivates the order.
     function cancelDCAOrder(uint256 dcaOrderId) external validBatchOrder(dcaOrderId) {
-        /*  identical implementation  */
         BatchInfo storage batch = batchOrders[dcaOrderId];
         if (batch.user != msg.sender) revert NotAuthorized();
+
+        PoolId poolId = batch.poolKey.toId();
+        uint256 totalPendingInput; // total unspent input to refund
+
+        // Cancel all pending buy orders (input side)
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[dcaOrderId][i];
+            uint256 pendingAtTick = pendingBatchOrders[poolId][tick][batch.zeroForOne];
+            if (pendingAtTick > 0) {
+                totalPendingInput += pendingAtTick;
+                pendingBatchOrders[poolId][tick][batch.zeroForOne] = 0;
+                _removeBatchIdFromTick(poolId, tick, batch.zeroForOne, dcaOrderId);
+            }
+        }
+
+        // Cancel pending take-profit order if it exists (opposite direction)
+        if (dcaTakeProfitTick[dcaOrderId] != 0) {
+            _cancelTakeProfitOrder(dcaOrderId);
+        }
+
+        if (totalPendingInput == 0) revert BatchAlreadyExecutedUseRedeem();
+
+        // Burn all claim tokens the user holds for this DCA (full cancellation semantics)
         uint256 userClaimBalance = balanceOf[msg.sender][dcaOrderId];
         if (userClaimBalance == 0) revert NoTokensToCancel();
-        PoolId poolId = batch.poolKey.toId();
-        uint256 totalPendingAmount;
-        for (uint256 i = 0; i < batch.ticksLength; i++) {
-            totalPendingAmount += pendingBatchOrders[poolId][batchTargetTicks[dcaOrderId][i]][batch.zeroForOne];
+        _burn(msg.sender, address(uint160(dcaOrderId)), userClaimBalance);
+        if (claimTokensSupply[dcaOrderId] >= userClaimBalance) {
+            claimTokensSupply[dcaOrderId] -= userClaimBalance;
+        } else {
+            claimTokensSupply[dcaOrderId] = 0;
         }
-        if (totalPendingAmount == 0) revert BatchAlreadyExecutedUseRedeem();
-        uint256 cancellableAmount = userClaimBalance * totalPendingAmount / uint256(batch.totalAmount);
-        if (cancellableAmount == 0) revert NothingToCancel();
-        _burn(msg.sender, address(uint160(dcaOrderId)), cancellableAmount);
-        for (uint256 i = 0; i < batch.ticksLength; i++) {
-            int24 targetTick = batchTargetTicks[dcaOrderId][i];
-            uint256 levelPending = pendingBatchOrders[poolId][targetTick][batch.zeroForOne];
-            if (levelPending > 0) {
-                uint256 levelCancellation = cancellableAmount * levelPending / totalPendingAmount;
-                pendingBatchOrders[poolId][targetTick][batch.zeroForOne] -= levelCancellation;
-            }
-        }
-        claimTokensSupply[dcaOrderId] -= cancellableAmount;
-        if (totalPendingAmount == cancellableAmount) batch.isActive = false;
+
+        // Mark order inactive
+        batch.isActive = false;
+
+        // Refund unspent input tokens
         Currency inputCurrency = batch.zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
         if (Currency.unwrap(inputCurrency) == address(0)) {
-            (bool success, ) = payable(msg.sender).call{value: cancellableAmount}("");
+            (bool success, ) = payable(msg.sender).call{value: totalPendingInput}("");
             require(success, "ETH send failed");
         } else {
-            IERC20(Currency.unwrap(inputCurrency)).safeTransfer(msg.sender, cancellableAmount);
+            IERC20(Currency.unwrap(inputCurrency)).safeTransfer(msg.sender, totalPendingInput);
         }
-        if (totalPendingAmount == cancellableAmount && !gasRefundProcessed[dcaOrderId]) {
-            uint256 gasRefund = preCollectedGasFees[dcaOrderId];
-            if (gasRefund > 0) {
-                gasRefundProcessed[dcaOrderId] = true;
-                (bool success, ) = payable(msg.sender).call{value: gasRefund}("");
-                require(success, "ETH refund failed");
-                emit GasFeeRefunded(dcaOrderId, msg.sender, gasRefund);
+
+        // Refund remaining gas pool
+        uint256 gasTankRefund = batch.gasTank;
+        if (gasTankRefund > 0) {
+            batch.gasTank = 0;
+            (bool success, ) = payable(msg.sender).call{value: gasTankRefund}("");
+            require(success, "Gas pool refund failed");
+        }
+
+        emit BatchOrderCancelledOptimized(dcaOrderId, msg.sender);
+    }
+
+
+
+    /// Manual sell: Cancel the take-profit order and swap accumulated output at current market price.
+    /// Then cancel all pending buy orders and restart the DCA cycle.
+    /// This allows users to take profits immediately instead of waiting for the limit order.
+    function manualSell(uint256 dcaId) external validBatchOrder(dcaId) {
+        BatchInfo storage batch = batchOrders[dcaId];
+        if (batch.user != msg.sender) revert NotAuthorized();
+
+        // Must have accumulated output to sell
+        uint256 sellAmount = dcaAccumulatedOutput[dcaId];
+        require(sellAmount > 0, "Nothing to sell");
+
+        // Determine sell direction (opposite of the original DCA direction)
+        bool sellZeroForOne = !batch.zeroForOne;
+
+        // Cancel existing take-profit order first
+        if (dcaTakeProfitTick[dcaId] != 0) {
+            _cancelTakeProfitOrder(dcaId);
+        }
+
+        // Cancel all pending DCA buy orders
+        PoolId poolId = batch.poolKey.toId();
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[dcaId][i];
+            uint256 pendingAmount = pendingBatchOrders[poolId][tick][batch.zeroForOne];
+            
+            if (pendingAmount > 0) {
+                pendingBatchOrders[poolId][tick][batch.zeroForOne] = 0;
+                _removeBatchIdFromTick(poolId, tick, batch.zeroForOne, dcaId);
             }
         }
-        emit BatchOrderCancelledOptimized(dcaOrderId, msg.sender);
+
+        // Perform the market sell via a direct swap
+        SwapParams memory swapParams = SwapParams({
+            zeroForOne: sellZeroForOne,
+            amountSpecified: int256(sellAmount),
+            sqrtPriceLimitX96: 0 // Market price
+        });
+
+        bytes memory data = abi.encode(batch.poolKey, swapParams);
+        uint256 amountOut;
+        try poolManager.unlock(data) returns (bytes memory result) {
+            BalanceDelta delta = abi.decode(result, (BalanceDelta));
+            // Compute output based on direction
+            amountOut = sellZeroForOne
+                ? uint256(int256(-delta.amount1()))
+                : uint256(int256(-delta.amount0()));
+        } catch {
+            revert("Manual sell swap failed");
+        }
+
+        // Reset accumulated output since we sold it all
+        dcaAccumulatedOutput[dcaId] = 0;
+
+        // Transfer proceeds to the user (in original input currency)
+        Currency proceedsToken = batch.zeroForOne ? batch.poolKey.currency0 : batch.poolKey.currency1;
+        if (Currency.unwrap(proceedsToken) == address(0)) {
+            (bool success, ) = payable(msg.sender).call{value: amountOut}("");
+            require(success, "ETH send failed");
+        } else {
+            IERC20(Currency.unwrap(proceedsToken)).safeTransfer(msg.sender, amountOut);
+        }
+
+        // Restart the DCA cycle with profits
+        _restartDCAWithProfits(dcaId, amountOut);
+
+        emit DCASwapExecuted(dcaId, 1000, sellAmount, amountOut, sellZeroForOne); // 1000 == manual sell marker
     }
 
     function redeemProfits(uint256 dcaOrderId, uint256 inputAmountToClaimFor) external {
@@ -258,10 +360,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
 
     /* ==========================================================
-       CALLBACK + HOOKS – identical to previous file
+       CALLBACK + HOOKS
        ========================================================== */
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
-        // same decode logic as before
         if (data.length > 64) {
             (string memory operationType) = abi.decode(data, (string));
             if (keccak256(bytes(operationType)) == keccak256("general_liquidity")) {
@@ -340,7 +441,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
 
     /* ==========================================================
-       INTERNAL HELPERS – identical to previous file
+       INTERNAL HELPERS
        ========================================================== */
     function _processLimitOrdersBeforeSwap(PoolKey calldata key, SwapParams calldata params)
         internal returns (BeforeSwapDelta)
@@ -375,7 +476,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint32 swapOrderMultiplier,
         uint256 expirationTime,
         address currency0,
-        address currency1
+        address currency1,
+        uint256 gasTankAmount,
+        uint32 gasTankPercent
     ) internal view {
         if (takeProfitPercent == 0 || takeProfitPercent > 5000) revert InvalidTakeProfitPercent(); // 0-50%
         if (maxSwapOrders == 0 || maxSwapOrders > 10) revert InvalidMaxSwapOrders(); // 1-10 levels
@@ -385,12 +488,13 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         if (swapOrderMultiplier < 10 || swapOrderMultiplier > 100) revert InvalidMultiplier(); // 0.1-10.0
     if (expirationTime <= block.timestamp) revert ExpiredDeadline();
         if (currency0 == currency1) revert SameCurrencies();
+        if (gasTankAmount == 0) revert InsufficientGasTank();
+        if (gasTankPercent == 0 || gasTankPercent > 1000) revert InvalidMultiplier(); // 0-10%
     }
 
-    function _calculateDCALevels(
+    function _calculateInitialDCALevel(
         PoolKey memory key,
         bool zeroForOne,
-        uint8 maxSwapOrders,
         uint32 priceDeviationPercent,
         uint32 priceDeviationMultiplier,
         uint256 baseSwapAmount,
@@ -399,40 +503,66 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Get current price
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         
-        targetTicks = new int24[](maxSwapOrders);
-        targetAmounts = new uint256[](maxSwapOrders);
-        totalAmount = 0;
-
-        // Convert multipliers from basis points to actual multipliers
-        uint256 deviationMultiplier = uint256(priceDeviationMultiplier); // 10-100 (0.1-10.0)
-        uint256 amountMultiplier = uint256(swapOrderMultiplier); // 10-100 (0.1-10.0)
-
-        for (uint8 i = 0; i < maxSwapOrders; i++) {
-            // Calculate price deviation with logarithmic spacing
-            // Higher levels get exponentially larger spacing
-            uint256 levelMultiplier = _calculateLogarithmicMultiplier(i + 1, deviationMultiplier);
-            
-            // Calculate tick deviation
-            int24 tickDeviation = int24(int256(
-                (uint256(priceDeviationPercent) * levelMultiplier * uint256(int256(key.tickSpacing))) / (10000 * 10)
-            ));
-            
-            // Set target tick based on direction
-            if (zeroForOne) {
-                // Selling: set buy levels below current price
-                targetTicks[i] = currentTick - tickDeviation;
-            } else {
-                // Buying: set sell levels above current price  
-                targetTicks[i] = currentTick + tickDeviation;
-            }
-
-            // Calculate amount with logarithmic multiplier effect
-            // Higher levels get exponentially larger amounts
-            uint256 amountLevelMultiplier = _calculateLogarithmicMultiplier(i + 1, amountMultiplier);
-            targetAmounts[i] = (baseSwapAmount * amountLevelMultiplier) / 10;
-            
-            totalAmount += targetAmounts[i];
+        // Create only the first DCA level
+        targetTicks = new int24[](1);
+        targetAmounts = new uint256[](1);
+        
+        // Calculate first level deviation
+        uint256 levelMultiplier = _calculateLogarithmicMultiplier(1, uint256(priceDeviationMultiplier));
+        
+        // Calculate tick deviation for first level
+        int24 tickDeviation = int24(int256(
+            (uint256(priceDeviationPercent) * levelMultiplier * uint256(int256(key.tickSpacing))) / (10000 * 10)
+        ));
+        
+        // Set target tick based on direction
+        if (zeroForOne) {
+            // Selling: set first buy level below current price
+            targetTicks[0] = currentTick - tickDeviation;
+        } else {
+            // Buying: set first sell level above current price  
+            targetTicks[0] = currentTick + tickDeviation;
         }
+
+        // Calculate amount for first level
+        uint256 amountLevelMultiplier = _calculateLogarithmicMultiplier(1, uint256(swapOrderMultiplier));
+        targetAmounts[0] = (baseSwapAmount * amountLevelMultiplier) / 10;
+        
+        totalAmount = baseSwapAmount + targetAmounts[0]; // Initial swap + first DCA level
+    }
+
+    function _calculateNextDCALevel(
+        uint256 dcaId,
+        PoolKey memory key
+    ) internal view returns (int24 nextTick, uint256 nextAmount) {
+        BatchInfo storage batch = batchOrders[dcaId];
+        uint256 nextLevel = dcaCurrentLevel[dcaId] + 1;
+        
+        // Don't exceed max swap orders
+        if (nextLevel >= batch.maxSwapOrders) {
+            return (0, 0);
+        }
+        
+        // Get current price
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        
+        // Calculate deviation for next level
+        uint256 levelMultiplier = _calculateLogarithmicMultiplier(nextLevel + 1, uint256(batch.priceDeviationMultiplier));
+        
+        int24 tickDeviation = int24(int256(
+            (uint256(batch.priceDeviationPercent) * levelMultiplier * uint256(int256(key.tickSpacing))) / (10000 * 10)
+        ));
+        
+        // Set target tick
+        if (batch.zeroForOne) {
+            nextTick = currentTick - tickDeviation;
+        } else {
+            nextTick = currentTick + tickDeviation;
+        }
+
+        // Calculate amount for next level
+        uint256 amountLevelMultiplier = _calculateLogarithmicMultiplier(nextLevel + 1, uint256(batch.swapOrderMultiplier));
+        nextAmount = (batch.baseSwapAmount * amountLevelMultiplier) / 10;
     }
 
     function _calculateLogarithmicMultiplier(uint256 level, uint256 baseMultiplier) internal pure returns (uint256) {
@@ -479,7 +609,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint32 priceDeviationPercent,
         uint32 priceDeviationMultiplier,
         uint256 baseSwapAmount,
-        uint32 swapOrderMultiplier
+        uint32 swapOrderMultiplier,
+        uint256 gasTankAmount,
+        uint32 gasTankPercent
     ) internal returns (uint256 dcaId) {
         dcaId = nextBatchOrderId++;
         batchTargetTicks[dcaId] = targetTicks;
@@ -500,7 +632,10 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             priceDeviationPercent: priceDeviationPercent,
             priceDeviationMultiplier: priceDeviationMultiplier,
             baseSwapAmount: baseSwapAmount,
-            swapOrderMultiplier: swapOrderMultiplier
+            swapOrderMultiplier: swapOrderMultiplier,
+            gasTank: gasTankAmount,
+            gasTankPercent: gasTankPercent,
+            isStalled: false
         });
 
 
@@ -516,15 +651,154 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
 
     function _initiateFirstDCASwap(uint256 dcaId) internal {
-        // TODO: Implement immediate first swap at base swap amount
-        // This should execute the first DCA level immediately
         BatchInfo storage batch = batchOrders[dcaId];
         
-        // For now, just emit an event - actual swap implementation would go here
-        emit DCASwapExecuted(dcaId, 0, batch.baseSwapAmount, 0, batch.zeroForOne);
+        // Execute immediate swap at base amount
+        SwapParams memory swapParams = SwapParams({
+            zeroForOne: batch.zeroForOne,
+            amountSpecified: int256(batch.baseSwapAmount),
+            sqrtPriceLimitX96: 0 // No price limit for initial swap
+        });
+        
+        bytes memory data = abi.encode(batch.poolKey, swapParams);
+        
+        try poolManager.unlock(data) returns (bytes memory result) {
+            BalanceDelta delta = abi.decode(result, (BalanceDelta));
+            uint256 amountOut = batch.zeroForOne ? uint256(int256(-delta.amount1())) : uint256(int256(-delta.amount0()));
+            
+            // Update DCA tracking
+            dcaAccumulatedInput[dcaId] = batch.baseSwapAmount;
+            dcaAccumulatedOutput[dcaId] = amountOut;
+            dcaCurrentLevel[dcaId] = 0; // Initial swap completed
+            
+            // Update claimable output tokens with swap result
+            claimableOutputTokens[dcaId] += amountOut;
+            
+            // Create take profit order at calculated margin
+            _createTakeProfitOrder(dcaId);
+            
+            emit DCASwapExecuted(dcaId, 0, batch.baseSwapAmount, amountOut, batch.zeroForOne);
+        } catch {
+            // If swap fails, just emit with 0 output
+            emit DCASwapExecuted(dcaId, 0, batch.baseSwapAmount, 0, batch.zeroForOne);
+        }
     }
 
-    // Removed unused helpers: _pricesToTicks, _sumAmounts
+    function _createTakeProfitOrder(uint256 dcaId) internal {
+        BatchInfo storage batch = batchOrders[dcaId];
+        PoolId poolId = batch.poolKey.toId();
+        
+        // Get current tick and calculate take profit tick
+        (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, poolId);
+        
+        // Calculate take profit tick based on percentage
+        int24 takeProfitTickOffset = int24(int256(
+            (uint256(batch.takeProfitPercent) * uint256(int256(batch.poolKey.tickSpacing))) / 100
+        ));
+        
+        int24 takeProfitTick;
+        if (batch.zeroForOne) {
+            // If we're selling token0 for token1, take profit by selling token1 back for token0
+            takeProfitTick = currentTick - takeProfitTickOffset;
+        } else {
+            // If we're buying token0 with token1, take profit by selling token0 for token1
+            takeProfitTick = currentTick + takeProfitTickOffset;
+        }
+        
+        // Cancel previous take profit order if exists
+        if (dcaTakeProfitTick[dcaId] != 0) {
+            _cancelTakeProfitOrder(dcaId);
+        }
+        
+        // Create new take profit order with accumulated output
+        uint256 takeProfitAmount = dcaAccumulatedOutput[dcaId];
+        bool takeProfitDirection = !batch.zeroForOne; // Opposite direction
+        
+        pendingBatchOrders[poolId][takeProfitTick][takeProfitDirection] += takeProfitAmount;
+        tickToBatchIds[poolId][takeProfitTick][takeProfitDirection].push(dcaId);
+        
+        // Update tracking
+        dcaTakeProfitTick[dcaId] = takeProfitTick;
+    }
+
+    function _cancelTakeProfitOrder(uint256 dcaId) internal {
+        BatchInfo storage batch = batchOrders[dcaId];
+        PoolId poolId = batch.poolKey.toId();
+        int24 oldTakeProfitTick = dcaTakeProfitTick[dcaId];
+        
+        if (oldTakeProfitTick != 0) {
+            bool takeProfitDirection = !batch.zeroForOne;
+            
+            // Remove from pending orders
+            uint256 oldAmount = dcaAccumulatedOutput[dcaId];
+            if (pendingBatchOrders[poolId][oldTakeProfitTick][takeProfitDirection] >= oldAmount) {
+                pendingBatchOrders[poolId][oldTakeProfitTick][takeProfitDirection] -= oldAmount;
+            }
+            
+            // Remove from tick tracking
+            _removeBatchIdFromTick(poolId, oldTakeProfitTick, takeProfitDirection, dcaId);
+            
+            dcaTakeProfitTick[dcaId] = 0;
+        }
+    }
+
+    /// Restart the DCA cycle after manual sell by reinvesting profits.
+    /// This creates a new initial swap and updates the accumulation tracking.
+    function _restartDCAWithProfits(uint256 dcaId, uint256 profitAmount) internal {
+        BatchInfo storage batch = batchOrders[dcaId];
+        
+        // Only restart if this is a perpetual DCA order
+        if (!batch.isPerpetual) return;
+        
+        // Update accumulated input with the profit amount
+        dcaAccumulatedInput[dcaId] += profitAmount;
+        
+        // Reset the current level to restart progression
+        dcaCurrentLevel[dcaId] = 0;
+        
+        // Create the first level with the profit amount
+        (int24[] memory newTargetTicks, uint256[] memory newTargetAmounts,) = _calculateInitialDCALevel(
+            batch.poolKey,
+            batch.zeroForOne,
+            batch.priceDeviationPercent,
+            batch.priceDeviationMultiplier,
+            profitAmount, // Use profit as new base amount
+            batch.swapOrderMultiplier
+        );
+        
+        // Add the new level to pending orders
+        if (newTargetTicks.length > 0) {
+            PoolId poolId = batch.poolKey.toId();
+            pendingBatchOrders[poolId][newTargetTicks[0]][batch.zeroForOne] += newTargetAmounts[0];
+            tickToBatchIds[poolId][newTargetTicks[0]][batch.zeroForOne].push(dcaId);
+            
+            // Update batch target arrays
+            batchTargetTicks[dcaId].push(newTargetTicks[0]);
+            batchTargetAmounts[dcaId].push(newTargetAmounts[0]);
+            batch.ticksLength++;
+        }
+        
+        // Create new take profit order based on updated accumulation
+        _createTakeProfitOrder(dcaId);
+        
+        emit DCARestarted(dcaId, profitAmount);
+    }
+
+    function _removeBatchIdFromTick(PoolId poolId, int24 tick, bool zeroForOne, uint256 batchOrderId) internal {
+        uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
+        for (uint256 i = 0; i < batchIds.length; i++) {
+            if (batchIds[i] == batchOrderId) {
+                batchIds[i] = batchIds[batchIds.length - 1];
+                batchIds.pop();
+                break;
+            }
+        }
+        
+        // Clean up empty tick mapping
+        if (batchIds.length == 0 && pendingBatchOrders[poolId][tick][zeroForOne] == 0) {
+            delete tickToBatchIds[poolId][tick][zeroForOne];
+        }
+    }
 
     function _ensurePoolInitialized(PoolKey memory key) internal view {
         (uint160 currentPrice, , , ) = StateLibrary.getSlot0(poolManager, key.toId());
@@ -532,27 +806,25 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         revert();
     }
 
-    function _handleTokenDeposit(PoolKey memory key, bool zeroForOne, uint256 totalAmount) internal {
+    function _handleTokenDeposit(PoolKey memory key, bool zeroForOne, uint256 totalAmount, uint256 gasTankAmount) internal {
         address sellToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
-        uint256 estimatedGasFee = _calculateEstimatedGasFee();
-        uint256 batchId = nextBatchOrderId - 1;
-        preCollectedGasFees[batchId] = estimatedGasFee;
 
         if (sellToken == address(0)) {
-            if (msg.value < totalAmount + estimatedGasFee) revert InsufficientETHForOrderPlusGas();
-            if (msg.value > totalAmount + estimatedGasFee) {
-                (bool success, ) = payable(msg.sender).call{value: msg.value - totalAmount - estimatedGasFee}("");
+            // For ETH swaps, require total amount + gas pool amount
+            if (msg.value < totalAmount + gasTankAmount) revert InsufficientETHForOrderPlusGas();
+            if (msg.value > totalAmount + gasTankAmount) {
+                (bool success, ) = payable(msg.sender).call{value: msg.value - totalAmount - gasTankAmount}("");
                 require(success, "ETH refund failed");
             }
         } else {
-            if (msg.value < estimatedGasFee) revert InsufficientETHForGasFee();
-            if (msg.value > estimatedGasFee) {
-                (bool success, ) = payable(msg.sender).call{value: msg.value - estimatedGasFee}("");
+            // For token swaps, require ETH for gas pool + token amount
+            if (msg.value < gasTankAmount) revert InsufficientGasTank();
+            if (msg.value > gasTankAmount) {
+                (bool success, ) = payable(msg.sender).call{value: msg.value - gasTankAmount}("");
                 require(success, "ETH refund failed");
             }
             IERC20(sellToken).safeTransferFrom(msg.sender, address(this), totalAmount);
         }
-        emit GasFeePreCollected(batchId, estimatedGasFee);
     }
 
 
@@ -615,7 +887,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
 
     /* ==========================================================
-       LIMIT ORDER HELPERS – unchanged
+       LIMIT ORDER HELPERS
        ========================================================== */
     function _getTargetTick(uint160 sqrtPriceLimitX96, bool zeroForOne) internal pure returns (int24) {
         if (sqrtPriceLimitX96 == 0)
@@ -685,16 +957,42 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         pendingBatchOrders[poolId][tick][zeroForOne] -= amountToExecute;
         uint256[] storage batchIds = tickToBatchIds[poolId][tick][zeroForOne];
         uint256 remainingToExecute = amountToExecute;
+        
         for (uint256 i = 0; i < batchIds.length && remainingToExecute > 0; i++) {
             uint256 batchId = batchIds[i];
             BatchInfo storage batch = batchOrders[batchId];
             if (!batch.isActive) continue;
+            
+            // Check if DCA order has sufficient gas pool for execution
+            if (batch.isPerpetual && !batch.isStalled) {
+                uint256 estimatedGasCost = 50000; // Approximate gas for DCA execution
+                if (batch.gasTank < estimatedGasCost) {
+                    batch.isStalled = true;
+                    emit DCAStalled(batchId, batch.gasTank);
+                    continue; // Skip execution for stalled orders
+                }
+            }
+            
+            // Check if this is a take profit order execution
+            if (dcaTakeProfitTick[batchId] == tick && zeroForOne == (!batch.zeroForOne)) {
+                // Take profit hit! Handle restart
+                _handleTakeProfitHit(batchId, remainingToExecute);
+                continue;
+            }
+            
             for (uint256 j = 0; j < batch.ticksLength; j++) {
                 if (batchTargetTicks[batchId][j] == tick) {
                     uint256 batchAmountAtTick = batchTargetAmounts[batchId][j];
                     uint256 executeFromBatch = _min(batchAmountAtTick, remainingToExecute);
                     claimableOutputTokens[batchId] += executeFromBatch;
                     remainingToExecute -= executeFromBatch;
+                    
+                    // Deduct gas cost from gas pool before DCA execution
+                    if (batch.isPerpetual && executeFromBatch > 0) {
+                        uint256 gasCost = 50000; // Approximate gas cost
+                        batch.gasTank -= gasCost;
+                        _handleDCABuyExecution(batchId, executeFromBatch);
+                    }
                     break;
                 }
             }
@@ -716,6 +1014,69 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         return a < b ? a : b;
     }
 
+    function _handleDCABuyExecution(uint256 dcaId, uint256 buyAmount) internal {
+        BatchInfo storage batch = batchOrders[dcaId];
+        
+        // Update accumulated position
+        dcaAccumulatedInput[dcaId] += buyAmount;
+        // Note: accumulated output will be updated when the actual buy swap happens
+        
+        // Contribute to gas pool from buy amount
+        uint256 gasContribution = (buyAmount * batch.gasTankPercent) / 10000;
+        batch.gasTank += gasContribution;
+        emit GasTankContribution(dcaId, gasContribution);
+        
+        // Increment current level
+        dcaCurrentLevel[dcaId]++;
+        
+        // Create next DCA level if we haven't reached max
+        (int24 nextTick, uint256 nextAmount) = _calculateNextDCALevel(dcaId, batch.poolKey);
+        if (nextTick != 0 && nextAmount > 0) {
+            PoolId poolId = batch.poolKey.toId();
+            
+            // Add next level to pending orders
+            pendingBatchOrders[poolId][nextTick][batch.zeroForOne] += nextAmount;
+            tickToBatchIds[poolId][nextTick][batch.zeroForOne].push(dcaId);
+            
+            // Update batch target arrays to include new level
+            batchTargetTicks[dcaId].push(nextTick);
+            batchTargetAmounts[dcaId].push(nextAmount);
+            batch.ticksLength++;
+        }
+        
+        // Recreate take profit order with updated accumulated position
+        _createTakeProfitOrder(dcaId);
+        
+        emit DCASwapExecuted(dcaId, dcaCurrentLevel[dcaId], buyAmount, 0, batch.zeroForOne);
+    }
+
+    function _handleTakeProfitHit(uint256 dcaId, uint256 takeProfitAmount) internal {
+        BatchInfo storage batch = batchOrders[dcaId];
+        PoolId poolId = batch.poolKey.toId();
+        
+        // Cancel all pending DCA buy orders
+        for (uint256 i = 0; i < batch.ticksLength; i++) {
+            int24 tick = batchTargetTicks[dcaId][i];
+            uint256 pendingAmount = pendingBatchOrders[poolId][tick][batch.zeroForOne];
+            
+            if (pendingAmount > 0) {
+                pendingBatchOrders[poolId][tick][batch.zeroForOne] = 0;
+                _removeBatchIdFromTick(poolId, tick, batch.zeroForOne, dcaId);
+            }
+        }
+        
+        // Clear take profit order
+        _cancelTakeProfitOrder(dcaId);
+        
+        // Mark as completed for now - restart logic can be added later
+        batch.isActive = false;
+        
+        // Update claimable tokens with take profit execution
+        claimableOutputTokens[dcaId] += takeProfitAmount;
+        
+        emit DCASwapExecuted(dcaId, 999, takeProfitAmount, 0, !batch.zeroForOne); // 999 indicates take profit
+    }
+
     function _calculateEstimatedGasFee() internal view returns (uint256) {
         uint256 estimatedCost = ESTIMATED_EXECUTION_GAS * tx.gasprice;
         estimatedCost = (estimatedCost * GAS_PRICE_BUFFER_MULTIPLIER) / 100;
@@ -724,14 +1085,16 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
 
     /* ==========================================================
-       VIEW FUNCTIONS – unchanged
+       VIEW FUNCTIONS
        ========================================================== */
-    function getGasRefundInfo(uint256 batchId) external view returns (uint256 preCollected, uint256 actualUsed, uint256 refundable, bool processed) {
-        preCollected = preCollectedGasFees[batchId];
-        actualUsed = actualGasCosts[batchId];
-        processed = gasRefundProcessed[batchId];
-        refundable = (preCollected > actualUsed && !processed) ? preCollected - actualUsed : 0;
-    }
+
+    // function getGasRefundInfo(uint256 batchId) external view returns (uint256 preCollected, uint256 actualUsed, uint256 refundable, bool processed) {
+    //     // Deprecated: Old gas refund system removed
+    //     preCollected = 0;
+    //     actualUsed = 0;
+    //     processed = false;
+    //     refundable = 0;
+    // }
 
     function getPoolCurrentTick(PoolId poolId) external view returns (int24) {
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, poolId);
@@ -770,23 +1133,21 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         );
     }
 
+
     function getDCAInfoExtended(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
         uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalBatches, uint24 currentFee,
-        uint256 preCollectedGasFee, uint256 actualGasCost, uint256 gasRefundable
+        uint256 gasTankAmount, uint256 gasTankPercent, bool isStalled
     ) {
         BatchInfo storage batch = batchOrders[dcaId];
         if (batch.user == address(0)) revert InvalidBatch();
         uint256 execAmount = uint256(batch.totalAmount) - claimTokensSupply[dcaId];
-        uint256 refundable = (preCollectedGasFees[dcaId] > actualGasCosts[dcaId] && !gasRefundProcessed[dcaId])
-            ? preCollectedGasFees[dcaId] - actualGasCosts[dcaId]
-            : 0;
         return (
             batch.user, Currency.unwrap(batch.poolKey.currency0), Currency.unwrap(batch.poolKey.currency1),
             uint256(batch.totalAmount), execAmount, claimableOutputTokens[dcaId], batch.isActive,
             claimTokensSupply[dcaId] == 0, uint256(batch.expirationTime), batch.zeroForOne,
-            nextBatchOrderId - 1, batch.poolKey.fee, preCollectedGasFees[dcaId], actualGasCosts[dcaId], refundable
+            nextBatchOrderId - 1, batch.poolKey.fee, batch.gasTank, batch.gasTankPercent, batch.isStalled
         );
     }
 

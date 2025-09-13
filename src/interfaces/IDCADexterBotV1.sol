@@ -30,7 +30,9 @@ interface IDCADexterBotV1 {
         PoolParams calldata pool,
         DCAParams calldata dca,
         uint32 slippage,
-        uint256 expirationTime
+        uint256 expirationTime,
+    uint256 gasTankAmount,
+    uint32 gasTankPercent
     ) external payable returns (uint256 dcaId);
 
     // Cancel / redeem
@@ -66,9 +68,9 @@ interface IDCADexterBotV1 {
         bool zeroForOne,
         uint256 totalBatches,
         uint24 currentFee,
-        uint256 preCollectedGasFee,
-        uint256 actualGasCost,
-        uint256 gasRefundable
+        uint256 gasTankAmount,
+        uint256 gasTankPercent,
+        bool isStalled
     );
 
     function getDCAOrder(uint256 dcaId) external view returns (
