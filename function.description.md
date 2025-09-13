@@ -1,1 +1,0 @@
-_validateOrderInputs :: validate length deadline and different currency 

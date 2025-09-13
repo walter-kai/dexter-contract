@@ -72,13 +72,13 @@ struct DCAParams {
     uint32 takeProfitPercent;          // Take profit % (0-50%)
     uint8 maxSwapOrders;               // Max DCA levels (1-10)
     uint32 priceDeviationPercent;      // Price deviation per level (0-20%)
-    uint32 priceDeviationMultiplier;   // Logarithmic scaling factor
+    uint32 priceDeviationMultiplier;   // Amount scaling factor
     uint256 swapOrderAmount;           // Base swap amount
     uint32 swapOrderMultiplier;        // Amount scaling factor
 }
 ```
 
-### 2. Progressive DCA Execution
+### 2. DCA Execution Process
 
 **Step 1: Initial Swap**
 - Immediately executes swap at `swapOrderAmount`
@@ -102,7 +102,7 @@ struct DCAParams {
 
 ### 3. Gas Tank System
 
-**Revolutionary Self-Sustaining Gas Management:**
+**Self-Sustaining Gas Management:**
 ```
 User Provides Initial Gas Tank → Each Swap Contributes % → Gas Tank Refills
                 ↓                        ↓                        ↓
@@ -138,15 +138,25 @@ mapping(uint256 => uint256) public dcaCurrentLevel;     // Current DCA level
 mapping(uint256 => int24) public dcaTakeProfitTick;     // Current take-profit price
 ```
 
-### 3. Logarithmic Scaling
-**Price Deviation:** Each level is further from current price using logarithmic scaling
-**Amount Scaling:** Each level can have different amounts based on scaling formula
+### 3. Exponential Amount Scaling
+**Price Deviation:** Each level is further from current price using simple linear scaling
+**Amount Scaling:** Each level increases amount exponentially based on multiplier
 
 ```solidity
-function _calculateLogarithmicMultiplier(uint256 level, uint256 baseMultiplier) internal pure returns (uint256) {
-    // Formula: 10 + (baseMultiplier - 10) * (1 + log2(level))
-    // Ensures multiplier increases logarithmically with level
-}
+// Price deviation increases linearly with level
+// Level 0 (initial): 0% deviation
+// Level 1: priceDeviationPercent * 1
+// Level 2: priceDeviationPercent * 2
+// Level 3: priceDeviationPercent * 3
+// etc.
+
+// Amount scaling increases exponentially
+// If priceDeviationMultiplier = 20 (2.0x):
+// Level 1: baseAmount * 2^1 = baseAmount * 2
+// Level 2: baseAmount * 2^2 = baseAmount * 4  
+// Level 3: baseAmount * 2^3 = baseAmount * 8
+// Level 4: baseAmount * 2^4 = baseAmount * 16
+// etc.
 ```
 
 ### 4. Smart Take-Profit Adjustment
@@ -235,18 +245,49 @@ dcaBot.redeemProfits(dcaId, claimTokenAmount);
 ### DCA Level Progression Example
 
 **Base Parameters:**
-- `swapOrderAmount`: 1000 USDC
+- `swapOrderAmount`: 1000 USDC (base amount)
 - `priceDeviationPercent`: 500 (5%)
-- Multipliers: 2.0x
+- `priceDeviationMultiplier`: 20 (2.0x)
+- Current ETH price: $3000
+
+**Exponential Scaling Formulas:**
+```solidity
+// Price deviation for level N (linear)
+priceDeviation = priceDeviationPercent * level / 10000
+levelPrice = currentPrice * (1 - priceDeviation)  // for buy orders
+
+// Amount for level N (exponential)
+amountMultiplier = multiplier^level  // where multiplier = priceDeviationMultiplier/10
+levelAmount = baseAmount * amountMultiplier
+```
 
 **Progressive Execution:**
 ```
-Initial Swap: 1000 USDC → ETH (immediate)
-Level 1: 1500 USDC at -5% price (when triggered)
-Level 2: 2000 USDC at -7.5% price (when triggered)
-Level 3: 2500 USDC at -11.25% price (when triggered)
-...
+Initial Swap: 1000 USDC → ETH at $3000 (immediate, 0% deviation)
+
+Level 1: at $2850 (-5% price)
+  - Price deviation: 5% * 1 = 5%
+  - Amount: 1000 * 2^1 = 1000 * 2 = 2000 USDC
+
+Level 2: at $2700 (-10% price) 
+  - Price deviation: 5% * 2 = 10%
+  - Amount: 1000 * 2^2 = 1000 * 4 = 4000 USDC
+
+Level 3: at $2550 (-15% price)
+  - Price deviation: 5% * 3 = 15% 
+  - Amount: 1000 * 2^3 = 1000 * 8 = 8000 USDC
+
+Level 4: at $2400 (-20% price)
+  - Price deviation: 5% * 4 = 20%
+  - Amount: 1000 * 2^4 = 1000 * 16 = 16000 USDC
 ```
+
+**Take-Profit Calculation:**
+After initial + Level 1 execution:
+- Total ETH: (1000/3000) + (2000/2850) ≈ 0.333 + 0.702 = 1.035 ETH
+- Total cost: 1000 + 2000 = 3000 USDC  
+- Average cost: 3000 / 1.035 ≈ $2899
+- Take-profit (10%): $2899 * 1.10 ≈ $3189
 
 ---
 
