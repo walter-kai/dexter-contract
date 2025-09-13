@@ -15,7 +15,9 @@ DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap 
 
 ---
 
-## ⚠️ Caveats
+## ⚠️ Gas Caveats
+
+In order to create a bot that can operate in perpetuity, a sophisticated **Gas Tank system** was devised.
 
 - **Stall Protection**: When a DCA order's gas tank is exhausted AND no claimable profits are available for automatic refill, the order becomes "stalled" and will not execute further automatic levels until manually topped up. This prevents failed executions but requires user intervention only when both gas tank and profit backup are depleted.
 
@@ -35,40 +37,39 @@ DCA Dexter Bot is a **sophisticated progressive DCA system** built as a Uniswap 
 
 ## 🏗️ Architecture Evolution
 
-### From Batch Limit Orders to Progressive DCA
+**Typical Bot Lifecycle:**
 
-**Previous System (Batch Limit Orders):**
-- Created all price levels simultaneously
-- Static limit orders without relationship between levels
-- Simple gas pre-collection system
-
-**Current System (Progressive DCA):**
-
-Typical Bot Lifecycle:
-
-1) Initial swap (immediate)
+1) Initial swap (immediate upon creation)
   - Executes the base swap amount at market price.
   - Creates a TAKE-PROFIT SELL order sized to the accumulated output.
   - Creates the first BUY limit order at Level 1 deviation (first DCA level).
+  - Gas: the contract allocates 2x the user-provided `gasTankAmount` at creation. This provides an execution buffer so the order can continue for at least one additional execution without immediate top-up.
 
 2) Level 1 (first buy) triggers
   - When price reaches Level 1 tick, the buy executes.
   - The contract updates accumulated position and re-calculates the TAKE-PROFIT SELL order (cancels old TP and places an updated one sized to new accumulated output).
   - It then creates Level 2 (next buy) at the next deviation.
+  - Gas: before executing the DCA buy the contract deducts an estimated gas amount from the `gasTank`. If the tank is below the estimated amount, the contract will first attempt an automatic refill from `claimableOutputTokens`:
+    - For buy executions the refill attempts to allocate up to 2x the required gas from available profits (because another swap is likely to follow).
+    - For sell (take-profit) executions the refill uses the exact required gas amount.
+    - If available profits are insufficient to refill, the order is marked `isStalled` and will not execute further automatic levels until topped up.
 
 3) Level 2 (second buy) triggers
   - Same flow: execute buy → update accumulation → update TAKE-PROFIT SELL → create next buy level.
+  - Gas: successful buys will contribute a percentage (`gasTankPercent`) back into the tank, but only when the tank is running low (this minimizes unnecessary taxation of every swap).
 
 4) TAKE-PROFIT hit (sell executes)
   - Cancels all pending buy levels
   - Settles profits to claimable output (available for user redemption via `redeemProfits`)
   - Restarts the DCA cycle by reinvesting profits (creating a fresh initial swap and Level 1)
-  - **Important**: Profits go to claimable output for user redemption, NOT to gas tank. Gas tank only refills from a percentage of successful buy swaps, never from profits.
+  - Gas: take-profit sells use the same automatic refill logic prior to execution (exact gas amount if refill needed). Note: profits are primarily recorded as `claimableOutputTokens` and used as a backup source for gas refill when necessary — they are not automatically siphoned into the gas tank unless a refill is required.
 
-5) Manual overrides
-  - Users may call `sellNow` to trigger an immediate market sell of accumulated output. That also restarts the cycle with profits.
+5) Manual Sell Now Override
+  - Users may call `sellNow` to cancel the existing take-profit limit order, cancel all pending DCA buy orders, and immediately sell all accumulated output at market price instead of waiting for the limit price to be hit.
+  - This also restarts the cycle with the sale proceeds.
+  - Cancellation refunds remaining `gasTank` balance to the user.
 
-This makes the lifecycle deterministic and easy to follow: initial swap → progressive buys (each buy creates the next level and updates TP) → TP hit (cancels pending buys, takes profit, restarts).
+This makes the lifecycle deterministic and easy to follow: initial swap → progressive buys (each buy creates the next level and updates TP) → TP hit (cancels pending buys, takes profit, restarts). Gas handling is automatic: initial 2x allocation, per-execution deduction, opportunistic refill from profits (2x for buys / exact for sells), contribution back to the tank when low, and stall/refund semantics when funds are exhausted.
 
 ### Core Contract: DCADexterBotV1 (23.97KB)
 
