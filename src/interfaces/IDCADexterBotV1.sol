@@ -27,7 +27,7 @@ interface IDCADexterBotV1 {
     }
 
     // Create a new perpetual DCA order
-    function createDCAOrder(
+    function createDCAStrategy(
         PoolParams calldata pool,
         DCAParams calldata dca,
         uint32 slippage,
@@ -39,9 +39,8 @@ interface IDCADexterBotV1 {
     // Immediate manual sell (market sell accumulated output and restart)
     function sellNow(uint256 dcaId) external;
 
-    // Cancel / redeem
-    function cancelDCAOrder(uint256 dcaId) external;
-    function redeemProfits(uint256 dcaId, uint256 inputAmountToClaimFor) external;
+    // Cancel
+    function cancelDCAStrategy(uint256 dcaId) external;
 
     // Views for DCA orders
     function getDCAInfo(uint256 dcaId) external view returns (
