@@ -278,7 +278,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     /// Manual sell: Cancel the take-profit order and swap accumulated output at current market price.
     /// Then cancel all pending buy orders and restart the DCA cycle.
     /// This allows users to take profits immediately instead of waiting for the limit order.
-    function manualSell(uint256 dcaId) external validBatchOrder(dcaId) {
+    function sellNow(uint256 dcaId) external validBatchOrder(dcaId) {
         BatchInfo storage batch = batchOrders[dcaId];
         if (batch.user != msg.sender) revert NotAuthorized();
 
