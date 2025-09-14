@@ -14,22 +14,19 @@ DCA Dexter Bot is a **sophisticated progressive DCA strategy system** built as a
 
 ---
 
-## ⚠️ Gas Caveats
+## ⚠️ Gas Management
 
-In order to create a bot that can operate in perpetuity, a sophisticated **Gas Tank system** was devised.
+In order to create a bot that can operate in perpetuity, a sophisticated **Central Gas Tank system** was devised.
 
-- **Stall Protection**: When a DCA strategy's gas tank is exhausted AND no claimable profits are available for automatic refill, the strategy becomes "stalled" and will not execute further automatic orders until manually topped up. This prevents failed executions but requires user intervention only when both gas tank and profit backup are depleted.
+- **Central Gas Tank**: A unified gas management system that holds all gas required for strategy execution, eliminating individual gas management complexity.
 
 - **Gas Tank Economics**: 
-  - **Automatic Refill**: Gas tank automatically refills from claimable profits when running low, serving as a backup mechanism
-  - **Initial Allocation**: At strategy creation, 2x the gas amount is allocated to ensure sufficient gas for multiple swaps
-  - **Smart Refill Logic**: 
-    - For buy orders: Attempts to refill with 2x required gas (likely to swap again)
-    - For sell orders: Refills with exact amount needed
-    - Only triggers refill when tank is insufficient for execution
-  - **Fallback**: If no claimable profits available for refill, strategy becomes stalled until manual intervention
-  - **Efficiency**: Gas contribution from successful buys only happens when tank is running low (below 2x estimated gas cost)
-  - Consider conservative `priceDeviationMultiplier` and reasonable `maxSwapOrders` to optimize gas usage
+  - **Central Management**: All DCA strategies pre-allocate total estimated gas to a central gasTank that handles ALL contract operations
+  - **Pre-Allocation**: Each strategy estimates total gas required (initial swap + DCA levels + take profit + 20% buffer) and allocates upfront
+  - **Real-time Deduction**: Gas is deducted from the tank for each swap operation during strategy execution
+  - **Settlement on Completion**: When strategy completes (take profit or cancellation), unused gas is credited to user profits or deficit is debited
+  - **Unified Operations**: All gas for swaps, limit orders, and contract operations comes from the central tank
+  - **No External Dependencies**: Self-contained gas management without relying on external swapper compensation
 
 
 ---
@@ -43,14 +40,14 @@ In order to create a bot that can operate in perpetuity, a sophisticated **Gas T
   - Updates `dcaAccumulatedInput[dcaId]` and `dcaAccumulatedOutput[dcaId]`
   - Calls `_createTakeProfitOrder(dcaId)` to place initial take-profit sell order
   - Creates first DCA buy level via `_calculateInitialDCALevel()` and stores in `pendingOrders[poolId][tick][zeroForOne]`
-  - Gas: `orders[dcaId].gasTank = gasTankAmount * 2` allocated at creation for execution buffer
+  - Gas: `gasTank += totalEstimatedGas` central tank pre-allocated at creation to handle all strategy operations
 
 2) **Level 1 buy triggers** (`_executeLimitOrdersAtTick()` → `_handleDCAExecution()`)
   - Price hits Level 1 tick, `_beforeSwap()` detects pending order and executes
   - `_handleDCAExecution(dcaId, executeAmount)` updates accumulation and calls `_cancelTakeProfitOrder(dcaId)`
   - `_createTakeProfitOrder(dcaId)` places new take-profit sized to updated `dcaAccumulatedOutput[dcaId]`
   - `_calculateNextDCALevel(dcaId, poolKey)` creates Level 2, adds to `pendingOrders` and `tickToOrderIds`
-  - Gas: `order.gasTank -= gasCost` before execution; `_tryRefillGasTankFromProfits(dcaId, requiredGas, true)` if tank low:
+  - Gas: `gasTank -= swapGasCost` deducted for actual swap execution; `_settleGasAccounting(dcaId)` handles surplus/deficit on completion
     - Buy refills: attempts `requiredGas * 2` from `claimableOutputTokens[dcaId]`
     - If insufficient: `order.isStalled = true`, emits `DCAStalled(dcaId, order.gasTank)`
 
@@ -147,7 +144,7 @@ This section documents the contract's external and public ABI: functions (signat
 ### Public / External Functions (ABI)
 Below are the key externally-callable functions and their shapes. For full parameter docs see the `DCAParams` and `PoolParams` structures in `IDCADexterBotV1.sol`.
 
-- `function createDCAStrategy(PoolParams calldata pool, DCAParams calldata dca, uint32 slippage, uint256 expirationTime, uint256 gasTankAmount, uint32 gasTankPercent) external payable returns (uint256 dcaId)`
+- `function createDCAStrategy(PoolParams calldata pool, DCAParams calldata dca, uint32 slippage, uint256 expirationTime, uint256 gasBaseAmount) external payable returns (uint256 dcaId)`
   - Creates a perpetual DCA order. `msg.value` must include required ETH for gasTank (2x) and optionally ETH input if `currency0`/`currency1` is ETH.
   - Returns newly created `dcaId`.
 
@@ -167,7 +164,7 @@ Below are the key externally-callable functions and their shapes. For full param
 - `function getDCAInfo(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee)`
   - Returns common DCA metadata and execution state.
 
-- `function getDCAInfoExtended(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee, uint256 gasTankAmount, uint256 gasTankPercent, bool isStalled)`
+- `function getDCAInfoExtended(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee, uint256 gasAllocated, uint256 gasUsed, bool isStalled)`
   - Extended view including gas tank and stall state.
 
 - `function getDCAOrder(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts, bool isActive, bool isFullyExecuted)`
@@ -180,7 +177,7 @@ Below are the key externally-callable functions and their shapes. For full param
 ### Quick Examples (ABI usage)
 - Create a DCA order (JS/ethers):
 ```js
-const tx = await dcaBot.createDCAStrategy(poolParams, dcaParams, slippage, expiration, gasTankAmountInWei, gasTankPercent);
+const tx = await dcaBot.createDCAStrategy(poolParams, dcaParams, slippage, expiration, gasBaseAmountInWei);
 const receipt = await tx.wait();
 // Parse DCAStrategyCreated event to obtain dcaId
 ```
@@ -188,7 +185,7 @@ const receipt = await tx.wait();
 - Read extended info:
 ```js
 const info = await dcaBot.getDCAInfoExtended(dcaId);
-console.log(info.gasTankAmount, info.isStalled);
+console.log(info.gasContribution, info.isStalled);
 ```
 
 ---
@@ -221,7 +218,7 @@ struct DCAParams {
 Notes on `createDCAStrategy` parameters:
 - `slippage` (uint32) — maximum allowed slippage in bps for on-chain swaps (e.g., 100 = 1%)
 - `expirationTime` (uint256) — UNIX timestamp after which the order cannot be created (must be > block.timestamp)
-- `gasTankAmount` (uint256) — initial ETH amount to fund the internal gas tank; the contract expects `gasTankAmount * 2` to be sent (pre-funded) via `msg.value` to ensure an initial buffer
+- `gasBaseAmount` (uint256) — Base gas amount for single swap operation; total strategy gas is calculated as: initial swap + (DCA levels * gasBaseAmount) + take profit + 20% buffer, then allocated to central gasTank
 - `gasTankPercent` (uint32) — percentage (bps) of successful buy amounts that can be opportunistically routed back to the gas tank when the tank is low (for example, 100 = 1%)
 
 ### Events decoding table (examples)
@@ -237,7 +234,7 @@ This table shows typical event payloads and how a UI or integration should inter
 
 ### Suggested integration checklist
 - After creating an order, subscribe to `DCASwapExecuted` and `DCAStalled` for that `dcaId`.
-- Poll `getDCAInfoExtended(dcaId)` periodically to show `gasTankAmount` and `isStalled` in UIs.
+- Poll `getDCAInfoExtended(dcaId)` periodically to show `gasContribution` and shared pool status in UIs.
 ### Suggested integration checklist
 - After creating an order, subscribe to `DCASwapExecuted` and `DCAStalled` for that `dcaId`.
 - When a user cancels or redeems, listen for `BatchOrderCancelledOptimized` to confirm on-chain settlement.

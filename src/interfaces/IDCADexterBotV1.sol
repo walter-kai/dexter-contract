@@ -32,8 +32,7 @@ interface IDCADexterBotV1 {
         DCAParams calldata dca,
         uint32 slippage,
         uint256 expirationTime,
-        uint256 gasTankAmount,
-        uint32 gasTankPercent
+        uint256 gasBaseAmount
     ) external payable returns (uint256 dcaId);
 
     // Immediate manual sell (market sell accumulated output and restart)
