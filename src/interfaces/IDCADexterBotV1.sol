@@ -39,8 +39,7 @@ interface IDCADexterBotV1 {
         PoolParams calldata pool,
         DCAParams calldata dca,
         uint32 slippage,
-        uint256 expirationTime,
-        uint256 gasBaseAmount
+        uint256 expirationTime
     ) external payable returns (uint256 dcaId);
 
     // Immediate manual sell (market sell accumulated output and restart)
@@ -79,7 +78,8 @@ interface IDCADexterBotV1 {
         uint256 totalBatches,
         uint24 currentFee,
         uint256 gasAllocated,
-        uint256 gasUsed
+        uint256 gasUsed,
+        uint256 gasBorrowedFromTank
     );
 
     function getDCAOrder(uint256 dcaId) external view returns (
