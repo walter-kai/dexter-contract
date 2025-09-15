@@ -71,6 +71,26 @@ In order to create a bot that can operate in perpetuity, a sophisticated **Centr
 
 This makes the lifecycle deterministic and easy to follow: initial swap → progressive buys (each buy creates the next level and updates TP) → TP hit (cancels pending buys, takes profit, restarts). Gas handling is automatic: initial 2x allocation, per-execution deduction, opportunistic refill from profits (2x for buys / exact for sells), contribution back to the tank when low, and stall/refund semantics when funds are exhausted.
 
+---
+
+## 📊 Order Status System
+
+**OrderStatus Enum Values:**
+- **ACTIVE**: Order is running normally and processing DCA levels
+- **COMPLETED**: Order finished successfully when take-profit was hit
+- **CANCELLED**: Order was manually cancelled by user via `cancelDCAStrategy()`
+- **STALLED**: Order is stalled due to insufficient gas in the central tank
+
+**Status Transitions:**
+- Creation → **ACTIVE** (when `createDCAStrategy()` is called)
+- **ACTIVE** → **COMPLETED** (when take-profit target is reached)
+- **ACTIVE** → **CANCELLED** (when user calls `cancelDCAStrategy()`)
+- **ACTIVE** → **STALLED** (when gas tank has insufficient funds for next operation)
+
+This unified status system replaces the previous separate `isActive` and `isStalled` boolean flags, providing clearer order lifecycle management.
+
+---
+
 ### Core Contract: DCADexterBotV1 (23.97KB)
 
 ```solidity
@@ -161,13 +181,13 @@ Below are the key externally-callable functions and their shapes. For full param
 - `function getAllPools() external view returns (PoolId[] memory poolIds, PoolKey[] memory poolKeys, int24[] memory ticks)` — helper listing tracked pools.
 - `function getPoolCount() external view returns (uint256)` — tracked pool count.
 
-- `function getDCAInfo(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee)`
-  - Returns common DCA metadata and execution state.
+- `function getDCAInfo(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, OrderStatus status, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee)`
+  - Returns common DCA metadata and execution state. Status enum values: ACTIVE, COMPLETED, CANCELLED, STALLED.
 
-- `function getDCAInfoExtended(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee, uint256 gasAllocated, uint256 gasUsed, bool isStalled)`
-  - Extended view including gas tank and stall state.
+- `function getDCAInfoExtended(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount, OrderStatus status, bool isFullyExecuted, uint256 expirationTime, bool zeroForOne, uint256 totalLevels, uint24 currentFee, uint256 gasAllocated, uint256 gasUsed)`
+  - Extended view including gas allocation and usage tracking.
 
-- `function getDCAOrder(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts, bool isActive, bool isFullyExecuted)`
+- `function getDCAOrder(uint256 dcaId) external view returns (address user, address currency0, address currency1, uint256 totalAmount, uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts, OrderStatus status, bool isFullyExecuted)`
   - Returns per-order target ticks/prices and amounts.
 
 ### Internal Gas / Execution Notes (for integrators)

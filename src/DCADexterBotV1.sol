@@ -58,9 +58,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint16 ticksLength;
         uint8 maxSwapOrders; // NEW - max DCA levels
         bool zeroForOne;
-        bool isActive;
+        IDCADexterBotV1.OrderStatus status; // Combined status instead of separate isActive/isStalled flags
         bool isPerpetual; // NEW - indicates this is a perpetual DCA order
-        bool isStalled; // NEW - indicates order is stalled (no longer used with shared gas pool)
         // DCA-specific parameters
         uint32 priceDeviationPercent; // NEW
         uint32 priceDeviationMultiplier; // NEW
@@ -126,8 +125,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
 
     modifier validOrder(uint256 orderId) {
         if (!(orderId > 0 && orderId < nextOrderId)) revert InvalidOrderId();
-        if (!orders[orderId].isActive) revert OrderNotActive();
-        if (orders[orderId].isStalled) revert OrderStalled();
+        if (orders[orderId].status != IDCADexterBotV1.OrderStatus.ACTIVE) revert OrderNotActive();
         _;
     }
 
@@ -254,8 +252,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             claimTokensSupply[dcaOrderId] = 0;
         }
 
-        // Mark order inactive
-        order.isActive = false;
+        // Mark order as cancelled
+        order.status = IDCADexterBotV1.OrderStatus.CANCELLED;
 
         // Refund unspent input tokens with gas settlement
         uint256 adjustedRefund = _settleGasAccounting(dcaOrderId, totalPendingInput);
@@ -634,9 +632,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             ticksLength: uint16(targetTicks.length),
             maxSwapOrders: maxSwapOrders,
             zeroForOne: zeroForOne,
-            isActive: true,
+            status: IDCADexterBotV1.OrderStatus.ACTIVE,
             isPerpetual: true, // DCA orders are perpetual
-            isStalled: false, // Will be set if gas runs out
             priceDeviationPercent: priceDeviationPercent,
             priceDeviationMultiplier: priceDeviationMultiplier,
             baseSwapAmount: baseSwapAmount,
@@ -667,7 +664,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Deduct gas from tank for initial swap
         uint256 swapGasCost = _calculateSwapGasCost();
         if (gasTank < swapGasCost) {
-            order.isStalled = true;
+            order.status = IDCADexterBotV1.OrderStatus.STALLED;
             return; // Cannot execute without gas
         }
         
@@ -988,14 +985,14 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         for (uint256 i = 0; i < orderIds.length && remainingToExecute > 0; i++) {
             uint256 orderId = orderIds[i];
             OrderInfo storage order = orders[orderId];
-            if (!order.isActive) continue;
+            if (order.status != IDCADexterBotV1.OrderStatus.ACTIVE) continue;
             
             // Check if gas tank has sufficient funds for execution
-            if (order.isPerpetual && !order.isStalled) {
+            if (order.isPerpetual && order.status == IDCADexterBotV1.OrderStatus.ACTIVE) {
                 uint256 estimatedGasCost = _calculateSwapGasCost();
                 if (gasTank < estimatedGasCost) {
                     // Mark order as stalled - no gas available
-                    order.isStalled = true;
+                    order.status = IDCADexterBotV1.OrderStatus.STALLED;
                     continue; // Skip execution
                 }
             }
@@ -1127,8 +1124,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Clear take profit order
         _cancelTakeProfitOrder(dcaId);
         
-        // Mark as completed for now - restart logic can be added later
-        order.isActive = false;
+        // Mark as completed - take profit was hit
+        order.status = IDCADexterBotV1.OrderStatus.COMPLETED;
         
         // Update claimable tokens with take profit execution
         claimableOutputTokens[dcaId] += takeProfitAmount;
@@ -1178,7 +1175,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
 
     function getDCAInfo(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
-        uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
+        uint256 executedAmount, uint256 claimableAmount, IDCADexterBotV1.OrderStatus status, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalOrders, uint24 currentFee
     ) {
         OrderInfo storage order = orders[dcaId];
@@ -1187,7 +1184,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         return (
             order.user, Currency.unwrap(order.poolKey.currency0), Currency.unwrap(order.poolKey.currency1),
             uint256(order.totalAmount), execAmount, claimableOutputTokens[dcaId],
-            order.isActive, claimTokensSupply[dcaId] == 0, uint256(order.expirationTime),
+            order.status, claimTokensSupply[dcaId] == 0, uint256(order.expirationTime),
             order.zeroForOne, nextOrderId - 1, order.poolKey.fee
         );
     }
@@ -1195,25 +1192,25 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
 
     function getDCAInfoExtended(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
-        uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
+        uint256 executedAmount, uint256 claimableAmount, IDCADexterBotV1.OrderStatus status, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalOrders, uint24 currentFee,
-        uint256 gasAllocated, uint256 gasUsed, bool isStalled
+        uint256 gasAllocated, uint256 gasUsed
     ) {
         OrderInfo storage order = orders[dcaId];
         if (order.user == address(0)) revert InvalidOrder();
         uint256 execAmount = uint256(order.totalAmount) - claimTokensSupply[dcaId];
         return (
             order.user, Currency.unwrap(order.poolKey.currency0), Currency.unwrap(order.poolKey.currency1),
-            uint256(order.totalAmount), execAmount, claimableOutputTokens[dcaId], order.isActive,
+            uint256(order.totalAmount), execAmount, claimableOutputTokens[dcaId], order.status,
             claimTokensSupply[dcaId] == 0, uint256(order.expirationTime), order.zeroForOne,
-            nextOrderId - 1, order.poolKey.fee, order.gasAllocated, order.gasUsed, order.isStalled
+            nextOrderId - 1, order.poolKey.fee, order.gasAllocated, order.gasUsed
         );
     }
 
     function getDCAOrder(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
         uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts,
-        bool isActive, bool isFullyExecuted
+        IDCADexterBotV1.OrderStatus status, bool isFullyExecuted
     ) {
         OrderInfo storage order = orders[dcaId];
         int24[] memory targetTicks = orderTargetTicks[dcaId];
@@ -1225,7 +1222,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         return (
             order.user, Currency.unwrap(order.poolKey.currency0), Currency.unwrap(order.poolKey.currency1),
             uint256(order.totalAmount), uint256(order.totalAmount) - claimTokensSupply[dcaId],
-            prices, amounts, order.isActive, claimTokensSupply[dcaId] == 0
+            prices, amounts, order.status, claimTokensSupply[dcaId] == 0
         );
     }
 
