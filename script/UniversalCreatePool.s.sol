@@ -14,15 +14,16 @@ contract UniversalCreatePool is Script {
 
     function run() external {
         vm.startBroadcast();
-        
+
         // Read environment variables for pool parameters
-        IPoolManager poolManager = IPoolManager(vm.envOr("POOL_MANAGER_ADDRESS", address(0x000000000004444c5dc75cB358380D2e3dE08A90)));
+        IPoolManager poolManager =
+            IPoolManager(vm.envOr("POOL_MANAGER_ADDRESS", address(0x000000000004444c5dc75cB358380D2e3dE08A90)));
         address token0 = vm.envAddress("POOL_TOKEN0");
         address token1 = vm.envAddress("POOL_TOKEN1");
         uint24 fee = uint24(vm.envUint("POOL_FEE"));
         string memory token0Name = vm.envString("POOL_TOKEN0_NAME");
         string memory token1Name = vm.envString("POOL_TOKEN1_NAME");
-        
+
         // Read hook address if available, default to zero address
         address hookAddress;
         try vm.envAddress("LIMIT_ORDER_BATCH_ADDRESS") returns (address hook) {
@@ -32,18 +33,18 @@ contract UniversalCreatePool is Script {
             hookAddress = address(0);
             console2.log("No hook address provided, using zero address");
         }
-        
+
         console2.log("=== Creating Universal Pool ===");
         console2.log("Token 0:", token0Name, "->", token0);
         console2.log("Token 1:", token1Name, "->", token1);
         console2.log("Fee:", fee);
-        
+
         // Ensure proper ordering (lower address first)
         if (token0 > token1) {
             (token0, token1) = (token1, token0);
             console2.log("Tokens reordered for proper address ordering");
         }
-        
+
         PoolKey memory key = PoolKey({
             currency0: Currency.wrap(token0),
             currency1: Currency.wrap(token1),
@@ -51,10 +52,10 @@ contract UniversalCreatePool is Script {
             tickSpacing: 60,
             hooks: IHooks(hookAddress)
         });
-        
+
         // Calculate initial price (1:1 ratio at tick 0)
         uint160 sqrtPriceX96 = 79228162514264337593543950336; // sqrt(1) * 2^96
-        
+
         try poolManager.initialize(key, sqrtPriceX96) {
             PoolId poolId = key.toId();
             console2.log("Pool created successfully!");
@@ -70,7 +71,7 @@ contract UniversalCreatePool is Script {
         } catch (bytes memory) {
             console2.log("Pool creation failed with low-level error - pool might already exist");
         }
-        
+
         vm.stopBroadcast();
     }
 }

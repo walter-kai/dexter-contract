@@ -11,11 +11,11 @@ abstract contract ERC6909Base is IERC6909Claims {
     /// @notice ERC-6909 balances per user per currency
     /// @dev Mapping from user => currency ID => balance
     mapping(address => mapping(uint256 => uint256)) public balanceOf;
-    
+
     /// @notice ERC-6909 allowances per user per spender per currency
     /// @dev Mapping from owner => spender => currency ID => allowance
     mapping(address => mapping(address => mapping(uint256 => uint256))) public allowance;
-    
+
     /// @notice ERC-6909 operator approvals per user
     /// @dev Mapping from owner => operator => approved
     mapping(address => mapping(address => bool)) public isOperator;
@@ -28,10 +28,10 @@ abstract contract ERC6909Base is IERC6909Claims {
     function transfer(address receiver, uint256 id, uint256 amount) external override returns (bool) {
         require(receiver != address(0), "ERC6909: transfer to zero address");
         require(balanceOf[msg.sender][id] >= amount, "ERC6909: insufficient balance");
-        
+
         balanceOf[msg.sender][id] -= amount;
         balanceOf[receiver][id] += amount;
-        
+
         emit Transfer(msg.sender, msg.sender, receiver, id, amount);
         return true;
     }
@@ -42,19 +42,23 @@ abstract contract ERC6909Base is IERC6909Claims {
     /// @param id The id of the token (currency address as uint256).
     /// @param amount The amount of the token.
     /// @return bool True, always, unless the function reverts
-    function transferFrom(address sender, address receiver, uint256 id, uint256 amount) external override returns (bool) {
+    function transferFrom(address sender, address receiver, uint256 id, uint256 amount)
+        external
+        override
+        returns (bool)
+    {
         require(receiver != address(0), "ERC6909: transfer to zero address");
         require(balanceOf[sender][id] >= amount, "ERC6909: insufficient balance");
-        
+
         // Check allowance unless caller is the sender or an operator
         if (msg.sender != sender && !isOperator[sender][msg.sender]) {
             require(allowance[sender][msg.sender][id] >= amount, "ERC6909: insufficient allowance");
             allowance[sender][msg.sender][id] -= amount;
         }
-        
+
         balanceOf[sender][id] -= amount;
         balanceOf[receiver][id] += amount;
-        
+
         emit Transfer(msg.sender, sender, receiver, id, amount);
         return true;
     }

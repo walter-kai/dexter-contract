@@ -12,10 +12,11 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 interface IDCADexterBotV1 {
     // Order execution status
     enum OrderStatus {
-        ACTIVE,     // Order is running normally
-        COMPLETED,  // Order finished successfully (take profit hit)
-        CANCELLED,  // Order was manually cancelled
-        STALLED     // Order is stalled due to insufficient gas
+        ACTIVE, // Order is running normally
+        COMPLETED, // Order finished successfully (take profit hit)
+        CANCELLED, // Order was manually cancelled
+        STALLED // Order is stalled due to insufficient gas
+
     }
 
     struct PoolParams {
@@ -49,53 +50,65 @@ interface IDCADexterBotV1 {
     function cancelDCAStrategy(uint256 dcaId) external;
 
     // Views for DCA orders
-    function getDCAInfo(uint256 dcaId) external view returns (
-        address user,
-        address currency0,
-        address currency1,
-        uint256 totalAmount,
-        uint256 executedAmount,
-        uint256 claimableAmount,
-        IDCADexterBotV1.OrderStatus status,
-        bool isFullyExecuted,
-        uint256 expirationTime,
-        bool zeroForOne,
-        uint256 totalBatches,
-        uint24 currentFee
-    );
+    function getDCAInfo(uint256 dcaId)
+        external
+        view
+        returns (
+            address user,
+            address currency0,
+            address currency1,
+            uint256 totalAmount,
+            uint256 executedAmount,
+            uint256 claimableAmount,
+            IDCADexterBotV1.OrderStatus status,
+            bool isFullyExecuted,
+            uint256 expirationTime,
+            bool zeroForOne,
+            uint256 totalBatches,
+            uint24 currentFee
+        );
 
-    function getDCAInfoExtended(uint256 dcaId) external view returns (
-        address user,
-        address currency0,
-        address currency1,
-        uint256 totalAmount,
-        uint256 executedAmount,
-        uint256 claimableAmount,
-        IDCADexterBotV1.OrderStatus status,
-        bool isFullyExecuted,
-        uint256 expirationTime,
-        bool zeroForOne,
-        uint256 totalBatches,
-        uint24 currentFee,
-        uint256 gasAllocated,
-        uint256 gasUsed,
-        uint256 gasBorrowedFromTank
-    );
+    function getDCAInfoExtended(uint256 dcaId)
+        external
+        view
+        returns (
+            address user,
+            address currency0,
+            address currency1,
+            uint256 totalAmount,
+            uint256 executedAmount,
+            uint256 claimableAmount,
+            IDCADexterBotV1.OrderStatus status,
+            bool isFullyExecuted,
+            uint256 expirationTime,
+            bool zeroForOne,
+            uint256 totalBatches,
+            uint24 currentFee,
+            uint256 gasAllocated,
+            uint256 gasUsed,
+            uint256 gasBorrowedFromTank
+        );
 
-    function getDCAOrder(uint256 dcaId) external view returns (
-        address user,
-        address currency0,
-        address currency1,
-        uint256 totalAmount,
-        uint256 executedAmount,
-        uint256[] memory targetPrices,
-        uint256[] memory targetAmounts,
-        IDCADexterBotV1.OrderStatus status,
-        bool isFullyExecuted
-    );
+    function getDCAOrder(uint256 dcaId)
+        external
+        view
+        returns (
+            address user,
+            address currency0,
+            address currency1,
+            uint256 totalAmount,
+            uint256 executedAmount,
+            uint256[] memory targetPrices,
+            uint256[] memory targetAmounts,
+            IDCADexterBotV1.OrderStatus status,
+            bool isFullyExecuted
+        );
 
     // Pool helpers
     function getPoolCurrentTick(PoolId poolId) external view returns (int24);
-    function getAllPools() external view returns (PoolId[] memory poolIds, PoolKey[] memory poolKeys, int24[] memory ticks);
+    function getAllPools()
+        external
+        view
+        returns (PoolId[] memory poolIds, PoolKey[] memory poolKeys, int24[] memory ticks);
     function getPoolCount() external view returns (uint256);
 }
