@@ -45,26 +45,29 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     mapping(uint256 => uint256) public dcaCurrentLevel; // Current DCA level (0 = initial swap done)
     mapping(uint256 => int24) public dcaTakeProfitTick; // Current take profit tick
 
+    // Gas management system
+    uint256 public gasTank; // Central gas pool for executions
+
     struct OrderInfo {
         address user;
         uint96 totalAmount;
         PoolKey poolKey;
         uint64 expirationTime;
         uint32 maxSlippageBps;
-        uint32 takeProfitPercent; // NEW - take profit %
+        uint32 takeProfitPercent; // Take profit %
         uint16 ticksLength;
-        uint8 maxSwapOrders; // NEW - max DCA levels
+        uint8 maxSwapOrders; // Max DCA levels
         bool zeroForOne;
-        bool isActive;
-        bool isPerpetual; // NEW - indicates this is a perpetual DCA order
-        bool isStalled; // NEW - indicates gas pool is exhausted
+        IDCADexterBotV1.OrderStatus status; // Combined status instead of separate isActive/isStalled flags
+        bool isPerpetual; // Perpetual DCA order
         // DCA-specific parameters
-        uint32 priceDeviationPercent; // NEW
-        uint32 priceDeviationMultiplier; // NEW
-        uint256 baseSwapAmount; // NEW - base swap amount
+        uint32 priceDeviationPercent;
+        uint32 priceDeviationMultiplier;
+        uint256 baseSwapAmount;
         uint32 swapOrderMultiplier; // NEW
-    uint256 gasTank; // NEW - gas tank for DCA executions
-    uint32 gasTankPercent; // NEW - percentage of each swap that goes to gas tank
+        uint256 gasAllocated; // Total gas for strategy execution
+        uint256 gasUsed; // Gas consumed by swaps
+        uint256 gasBorrowedFromTank; // Gas borrowed from central tank
     }
 
     mapping(uint256 => int24[]) public orderTargetTicks;
@@ -79,9 +82,6 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     /* ==========================================================
        CONSTANTS – updated to remove BASE_FEE since we use pool fee parameter
        ========================================================== */
-    uint256 public constant ESTIMATED_EXECUTION_GAS = 150000;
-    uint256 public constant GAS_PRICE_BUFFER_MULTIPLIER = 120;
-    uint256 public constant MAX_GAS_FEE_ETH = 0.01 ether;
 
     /* ==========================================================
        ERRORS – DCA system errors
@@ -114,15 +114,12 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
                          uint256 totalAmount, uint32 takeProfitPercent, uint8 maxSwapOrders);
     event DCASwapExecuted(uint256 indexed dcaId, uint256 level, uint256 amountIn, uint256 amountOut, bool direction);
     event DCARestarted(uint256 indexed dcaId, uint256 profitAmount);
-    event GasTankContribution(uint256 indexed dcaId, uint256 amount);
-    event DCAStalled(uint256 indexed dcaId, uint256 gasTankRemaining);
     event OrderCancelledOptimized(uint256 indexed orderId, address indexed user);
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
 
     modifier validOrder(uint256 orderId) {
         if (!(orderId > 0 && orderId < nextOrderId)) revert InvalidOrderId();
-        if (!orders[orderId].isActive) revert OrderNotActive();
-        if (orders[orderId].isStalled) revert OrderStalled();
+        if (orders[orderId].status != IDCADexterBotV1.OrderStatus.ACTIVE) revert OrderNotActive();
         _;
     }
 
@@ -141,10 +138,11 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         IDCADexterBotV1.PoolParams calldata pool,
         IDCADexterBotV1.DCAParams calldata dca,
         uint32 slippage,
-        uint256 expirationTime,
-        uint256 gasTankAmount,
-        uint32 gasTankPercent
+        uint256 expirationTime
     ) external payable virtual returns (uint256 dcaId) {
+        // Calculate gas internally based on strategy parameters
+        uint256 gasBaseAmount = _calculateSwapGasCost();
+        
         return _createDCAStrategyInternal(
         pool.currency0,
         pool.currency1,
@@ -158,8 +156,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         dca.swapOrderMultiplier,
             slippage,
             expirationTime,
-            gasTankAmount,
-            gasTankPercent
+            gasBaseAmount
         );
     }
 
@@ -176,17 +173,19 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint32 swapOrderMultiplier,
     uint32 slippage,
     uint256 expirationTime,
-        uint256 gasTankAmount,
-        uint32 gasTankPercent
+        uint256 gasBaseAmount
     ) internal returns (uint256 dcaId) {
     _validateDCAInputs(takeProfitPercent, maxSwapOrders, priceDeviationPercent, 
               priceDeviationMultiplier, swapOrderAmount, swapOrderMultiplier, 
-              expirationTime, currency0, currency1, gasTankAmount, gasTankPercent);
+              expirationTime, currency0, currency1, gasBaseAmount);
+        
+        // Calculate total estimated gas for entire strategy
+        uint256 totalEstimatedGas = _calculateTotalStrategyGas(gasBaseAmount, maxSwapOrders);
         
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
         _ensurePoolInitialized(key);
         
-        // Calculate only the first DCA level for now - progressive creation
+        // Calculate first DCA level - progressive creation
         (int24[] memory targetTicks, uint256[] memory targetAmounts, uint256 totalAmount) = 
             _calculateInitialDCALevel(key, zeroForOne, priceDeviationPercent, 
                                priceDeviationMultiplier, swapOrderAmount, swapOrderMultiplier);
@@ -194,9 +193,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     dcaId = _createDCAStrategy(key, targetTicks, targetAmounts, totalAmount,
                    zeroForOne, slippage, expirationTime, takeProfitPercent, maxSwapOrders,
                                priceDeviationPercent, priceDeviationMultiplier, 
-                               swapOrderAmount, swapOrderMultiplier, gasTankAmount, gasTankPercent);
+                               swapOrderAmount, swapOrderMultiplier, totalEstimatedGas);
 
-        _handleTokenDeposit(key, zeroForOne, totalAmount, gasTankAmount);
+        _handleTokenDeposit(key, zeroForOne, totalAmount, totalEstimatedGas);
 
         // Start initial buy swap immediately at swapOrderAmount
         _initiateFirstDCASwap(dcaId);
@@ -232,7 +231,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             }
         }
 
-        // Cancel pending take-profit order if it exists (opposite direction)
+        // Cancel pending take-profit order if exists
         if (dcaTakeProfitTick[dcaOrderId] != 0) {
             _cancelTakeProfitOrder(dcaOrderId);
         }
@@ -249,26 +248,21 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             claimTokensSupply[dcaOrderId] = 0;
         }
 
-        // Mark order inactive
-        order.isActive = false;
+        // Mark order as cancelled
+        order.status = IDCADexterBotV1.OrderStatus.CANCELLED;
 
-        // Refund unspent input tokens
+        // Refund unspent input tokens with gas settlement
+        uint256 adjustedRefund = _settleGasAccounting(dcaOrderId, totalPendingInput);
         Currency inputCurrency = order.zeroForOne ? order.poolKey.currency0 : order.poolKey.currency1;
         if (Currency.unwrap(inputCurrency) == address(0)) {
-            (bool success, ) = payable(msg.sender).call{value: totalPendingInput}("");
+            (bool success, ) = payable(msg.sender).call{value: adjustedRefund}("");
             require(success, "ETH send failed");
         } else {
-            IERC20(Currency.unwrap(inputCurrency)).safeTransfer(msg.sender, totalPendingInput);
+            IERC20(Currency.unwrap(inputCurrency)).safeTransfer(msg.sender, adjustedRefund);
         }
 
-        // Refund remaining gas pool
-        uint256 gasTankRefund = order.gasTank;
-        if (gasTankRefund > 0) {
-            order.gasTank = 0;
-            (bool success, ) = payable(msg.sender).call{value: gasTankRefund}("");
-            require(success, "Gas pool refund failed");
-        }
-
+        // Gas settlement handled above
+        
         emit OrderCancelledOptimized(dcaOrderId, msg.sender);
     }
 
@@ -288,7 +282,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Determine sell direction (opposite of the original DCA direction)
         bool sellZeroForOne = !order.zeroForOne;
 
-        // Cancel existing take-profit order first
+        // Cancel existing take-profit order
         if (dcaTakeProfitTick[dcaId] != 0) {
             _cancelTakeProfitOrder(dcaId);
         }
@@ -327,13 +321,14 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Reset accumulated output since we sold it all
         dcaAccumulatedOutput[dcaId] = 0;
 
-        // Transfer proceeds to the user (in original input currency)
+        // Transfer proceeds with gas settlement
+        uint256 adjustedProceeds = _settleGasAccounting(dcaId, amountOut);
         Currency proceedsToken = order.zeroForOne ? order.poolKey.currency0 : order.poolKey.currency1;
         if (Currency.unwrap(proceedsToken) == address(0)) {
-            (bool success, ) = payable(msg.sender).call{value: amountOut}("");
+            (bool success, ) = payable(msg.sender).call{value: adjustedProceeds}("");
             require(success, "ETH send failed");
         } else {
-            IERC20(Currency.unwrap(proceedsToken)).safeTransfer(msg.sender, amountOut);
+            IERC20(Currency.unwrap(proceedsToken)).safeTransfer(msg.sender, adjustedProceeds);
         }
 
         // Restart the DCA cycle with profits
@@ -418,12 +413,17 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         return (BaseHook.beforeSwap.selector, delta, 0);
     }
 
-    function _afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
+    function _afterSwap(address swapper, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
         internal override returns (bytes4, int128)
     {
         if (msg.sender == address(this)) return (BaseHook.afterSwap.selector, 0);
+        
+        // Update last tick
         (, int24 currentTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         lastTicks[key.toId()] = currentTick;
+        
+        // Gas managed internally through gasTank
+        
         return (BaseHook.afterSwap.selector, 0);
     }
 
@@ -464,8 +464,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint256 expirationTime,
         address currency0,
         address currency1,
-        uint256 gasTankAmount,
-        uint32 gasTankPercent
+        uint256 gasBaseAmount
     ) internal view {
         if (takeProfitPercent == 0 || takeProfitPercent > 5000) revert InvalidTakeProfitPercent(); // 0-50%
         if (maxSwapOrders == 0 || maxSwapOrders > 10) revert InvalidMaxSwapOrders(); // 1-10 levels
@@ -475,8 +474,54 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         if (swapOrderMultiplier < 10 || swapOrderMultiplier > 100) revert InvalidMultiplier(); // 0.1-10.0
     if (expirationTime <= block.timestamp) revert ExpiredDeadline();
         if (currency0 == currency1) revert SameCurrencies();
-        if (gasTankAmount == 0) revert InsufficientGasTank();
-        if (gasTankPercent == 0 || gasTankPercent > 1000) revert InvalidMultiplier(); // 0-10%
+        if (gasBaseAmount == 0) revert InsufficientGasTank();
+    }
+
+    function _calculateTotalStrategyGas(uint256 gasBaseAmount, uint8 maxSwapOrders) internal pure returns (uint256) {
+        return (gasBaseAmount * (2 + maxSwapOrders) * 120) / 100; // 20% buffer included
+    }
+
+    function _calculateSwapGasCost() internal view returns (uint256) {
+        return 150000 * tx.gasprice; // ESTIMATED_EXECUTION_GAS inlined
+    }
+
+    // Deduct gas using pre-allocation first, then gasTank
+    function _deductGasForOrder(uint256 dcaId, uint256 gasCost) internal returns (bool success) {
+        OrderInfo storage order = orders[dcaId];
+        
+        // Check if pre-allocation covers this gas cost
+        if (order.gasUsed + gasCost <= order.gasAllocated) {
+            order.gasUsed += gasCost;
+            return true;
+        }
+        
+        // Pre-allocation insufficient - borrow from gasTank
+        uint256 shortfall = (order.gasUsed + gasCost) - order.gasAllocated;
+        
+        if (gasTank >= shortfall) {
+            gasTank -= shortfall;
+            order.gasUsed += gasCost;
+            order.gasBorrowedFromTank += shortfall;
+            return true;
+        }
+        
+        return false;
+    }
+
+    // Reverse gas deduction when a swap fails
+    function _reverseGasDeduction(uint256 dcaId, uint256 gasCost) internal {
+        OrderInfo storage order = orders[dcaId];
+        
+        // If gas was borrowed from tank, reduce the borrowed amount
+        if (order.gasBorrowedFromTank > 0) {
+            uint256 borrowedToReverse = gasCost > order.gasBorrowedFromTank ? 
+                order.gasBorrowedFromTank : gasCost;
+            gasTank += borrowedToReverse;
+            order.gasBorrowedFromTank -= borrowedToReverse;
+            gasCost -= borrowedToReverse;
+        }
+        
+        order.gasUsed -= gasCost;
     }
 
     function _calculateInitialDCALevel(
@@ -596,8 +641,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         uint32 priceDeviationMultiplier,
         uint256 baseSwapAmount,
         uint32 swapOrderMultiplier,
-        uint256 gasTankAmount,
-        uint32 gasTankPercent
+        uint256 gasAllocated
     ) internal returns (uint256 dcaId) {
         dcaId = nextOrderId++;
         orderTargetTicks[dcaId] = targetTicks;
@@ -613,17 +657,20 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             ticksLength: uint16(targetTicks.length),
             maxSwapOrders: maxSwapOrders,
             zeroForOne: zeroForOne,
-            isActive: true,
+            status: IDCADexterBotV1.OrderStatus.ACTIVE,
             isPerpetual: true, // DCA orders are perpetual
             priceDeviationPercent: priceDeviationPercent,
             priceDeviationMultiplier: priceDeviationMultiplier,
             baseSwapAmount: baseSwapAmount,
             swapOrderMultiplier: swapOrderMultiplier,
-            gasTank: gasTankAmount * 2, // Allocate 2x gas amount initially (likely to swap again)
-            gasTankPercent: gasTankPercent,
-            isStalled: false
+            gasAllocated: gasAllocated,
+            gasUsed: 0, // Track actual gas consumption
+            gasBorrowedFromTank: 0 // Track gas borrowed from central tank when allocation insufficient
         });
 
+
+        // Allocate gas for this strategy to the central gas tank
+        gasTank += gasAllocated;
 
         // Register pending orders
         PoolId poolId = key.toId();
@@ -638,6 +685,13 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
 
     function _initiateFirstDCASwap(uint256 dcaId) internal {
         OrderInfo storage order = orders[dcaId];
+        
+        // Use pre-allocation first, fallback to gasTank if needed
+        uint256 swapGasCost = _calculateSwapGasCost();
+        if (!_deductGasForOrder(dcaId, swapGasCost)) {
+            order.status = IDCADexterBotV1.OrderStatus.STALLED;
+            return; // Cannot execute without gas
+        }
         
         // Execute immediate swap at base amount
         SwapParams memory swapParams = SwapParams({
@@ -665,7 +719,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
             
             emit DCASwapExecuted(dcaId, 0, order.baseSwapAmount, amountOut, order.zeroForOne);
         } catch {
-            // If swap fails, just emit with 0 output
+            // If swap fails, reverse gas deduction properly
+            _reverseGasDeduction(dcaId, swapGasCost);
             emit DCASwapExecuted(dcaId, 0, order.baseSwapAmount, 0, order.zeroForOne);
         }
     }
@@ -792,25 +847,26 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         revert();
     }
 
-    function _handleTokenDeposit(PoolKey memory key, bool zeroForOne, uint256 totalAmount, uint256 gasTankAmount) internal {
+    function _handleTokenDeposit(PoolKey memory key, bool zeroForOne, uint256 totalAmount, uint256 gasAllocation) internal {
         address sellToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
 
         if (sellToken == address(0)) {
-            // For ETH swaps, require total amount + 2x gas pool amount
-            uint256 requiredETH = totalAmount + (gasTankAmount * 2);
+            // For ETH swaps, require total amount + gas allocation
+            uint256 requiredETH = totalAmount + gasAllocation;
             if (msg.value < requiredETH) revert InsufficientETHForOrderPlusGas();
             if (msg.value > requiredETH) {
                 (bool success, ) = payable(msg.sender).call{value: msg.value - requiredETH}("");
                 require(success, "ETH refund failed");
             }
+            // Gas is already allocated to gasTank in _createDCAStrategy
         } else {
-            // For token swaps, require ETH for 2x gas pool + token amount
-            uint256 requiredGas = gasTankAmount * 2;
-            if (msg.value < requiredGas) revert InsufficientGasTank();
-            if (msg.value > requiredGas) {
-                (bool success, ) = payable(msg.sender).call{value: msg.value - requiredGas}("");
+            // For token swaps, require ETH for gas allocation + token amount
+            if (msg.value < gasAllocation) revert InsufficientGasTank();
+            if (msg.value > gasAllocation) {
+                (bool success, ) = payable(msg.sender).call{value: msg.value - gasAllocation}("");
                 require(success, "ETH refund failed");
             }
+            // Gas is already allocated to gasTank in _createDCAStrategy
             IERC20(sellToken).safeTransferFrom(msg.sender, address(this), totalAmount);
         }
     }
@@ -949,21 +1005,19 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         for (uint256 i = 0; i < orderIds.length && remainingToExecute > 0; i++) {
             uint256 orderId = orderIds[i];
             OrderInfo storage order = orders[orderId];
-            if (!order.isActive) continue;
+            if (order.status != IDCADexterBotV1.OrderStatus.ACTIVE) continue;
             
-            // Check if DCA order has sufficient gas pool for execution
-            if (order.isPerpetual && !order.isStalled) {
-                uint256 estimatedGasCost = 50000; // Approximate gas for DCA execution
-                if (order.gasTank < estimatedGasCost) {
-                    // Try to refill gas tank from claimable profits before stalling
-                    if (_tryRefillGasTankFromProfits(orderId, estimatedGasCost, zeroForOne)) {
-                        // Successfully refilled, continue execution
-                    } else {
-                        // No profits available, mark as stalled
-                        order.isStalled = true;
-                        emit DCAStalled(orderId, order.gasTank);
-                        continue; // Skip execution for stalled orders
-                    }
+            // Check if order can afford gas (allocation + tank availability)
+            if (order.isPerpetual && order.status == IDCADexterBotV1.OrderStatus.ACTIVE) {
+                uint256 estimatedGasCost = _calculateSwapGasCost();
+                uint256 remainingAllocation = order.gasAllocated > order.gasUsed ? 
+                    order.gasAllocated - order.gasUsed : 0;
+                uint256 shortfall = estimatedGasCost > remainingAllocation ? 
+                    estimatedGasCost - remainingAllocation : 0;
+                
+                if (shortfall > 0 && gasTank < shortfall) {
+                    order.status = IDCADexterBotV1.OrderStatus.STALLED;
+                    continue;
                 }
             }
             
@@ -981,10 +1035,15 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
                     claimableOutputTokens[orderId] += executeFromOrder;
                     remainingToExecute -= executeFromOrder;
                     
-                    // Deduct gas cost from gas pool before DCA execution
+                    // Use pre-allocation first, fallback to gasTank if needed
+                    uint256 limitOrderGasCost = _calculateSwapGasCost();
+                    if (!_deductGasForOrder(orderId, limitOrderGasCost)) {
+                        order.status = IDCADexterBotV1.OrderStatus.STALLED;
+                        continue;
+                    }
+                    
+                    // Execute DCA processing
                     if (order.isPerpetual && executeFromOrder > 0) {
-                        uint256 gasCost = 50000; // Approximate gas cost
-                        order.gasTank -= gasCost;
                         _handleDCAExecution(orderId, executeFromOrder);
                     }
                     break;
@@ -1015,16 +1074,6 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         dcaAccumulatedInput[dcaId] += buyAmount;
         // Note: accumulated output will be updated when the actual buy swap happens
         
-        // Only contribute to gas tank if it's running low (less than 2x estimated gas cost)
-        uint256 estimatedGasCost = 50000; // Should match the gas cost used in _executeLimitOrdersAtTick
-        uint256 gasThreshold = estimatedGasCost * 2; // Refill when below 2x gas cost
-        
-        if (order.gasTank < gasThreshold) {
-            uint256 gasContribution = (buyAmount * order.gasTankPercent) / 10000;
-            order.gasTank += gasContribution;
-            emit GasTankContribution(dcaId, gasContribution);
-        }
-        
         // Increment current level
         dcaCurrentLevel[dcaId]++;
         
@@ -1049,53 +1098,44 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         emit DCASwapExecuted(dcaId, dcaCurrentLevel[dcaId], buyAmount, 0, order.zeroForOne);
     }
 
-    /**
-     * @dev Attempts to refill gas tank using claimable profits when tank is insufficient
-     * @param dcaId The DCA order ID
-     * @param requiredGas Minimum gas amount needed
-     * @param isForBuyOrder True if this refill is for a buy order (allocate 2x), false for sell order (exact amount)
-     * @return success True if gas tank was successfully refilled
-     */
-    function _tryRefillGasTankFromProfits(uint256 dcaId, uint256 requiredGas, bool isForBuyOrder) internal returns (bool success) {
+    // Settle gas accounting when order completes
+    function _settleGasAccounting(uint256 dcaId, uint256 profitAmount) internal returns (uint256 adjustedAmount) {
         OrderInfo storage order = orders[dcaId];
-        uint256 availableProfits = claimableOutputTokens[dcaId];
+        uint256 remainingProfit = profitAmount;
         
-        if (availableProfits == 0) {
-            return false; // No profits available
+        // First, repay any gas borrowed from tank
+        if (order.gasBorrowedFromTank > 0) {
+            if (remainingProfit >= order.gasBorrowedFromTank) {
+                gasTank += order.gasBorrowedFromTank;
+                remainingProfit -= order.gasBorrowedFromTank;
+                order.gasBorrowedFromTank = 0;
+            } else {
+                gasTank += remainingProfit;
+                order.gasBorrowedFromTank -= remainingProfit;
+                remainingProfit = 0;
+            }
         }
         
-        // Calculate how much gas we need based on order type
-        uint256 gasNeeded;
-        if (isForBuyOrder) {
-            // For buy orders, allocate 2x the amount (likely to swap again)
-            gasNeeded = requiredGas * 2;
+        // Then handle gas allocation accounting
+        if (order.gasUsed <= order.gasAllocated) {
+            // Under-used gas: refund excess to profit
+            uint256 gasRefund = order.gasAllocated - order.gasUsed;
+            gasTank -= gasRefund; // Remove unused allocation from tank
+            adjustedAmount = remainingProfit + gasRefund;
         } else {
-            // For sell orders, allocate exact amount needed
-            gasNeeded = requiredGas;
+        // Over-used gas: deduct deficit from profit
+            uint256 gasDeficit = order.gasUsed - order.gasAllocated;
+            if (remainingProfit >= gasDeficit) {
+                adjustedAmount = remainingProfit - gasDeficit;
+                gasTank += gasDeficit; // User pays back the deficit
+            } else {
+                // Profit insufficient to cover deficit - user pays what they can
+                gasTank += remainingProfit;
+                adjustedAmount = 0;
+            }
         }
         
-        // For simplicity, assume 1:1 ratio between profits and ETH value
-        // In production, this would need proper price oracle or conversion mechanism
-        uint256 profitsValueInETH = availableProfits;
-        
-        if (profitsValueInETH >= gasNeeded) {
-            // Use profits to refill gas tank
-            claimableOutputTokens[dcaId] -= gasNeeded;
-            order.gasTank += gasNeeded;
-            
-            emit GasTankContribution(dcaId, gasNeeded);
-            return true;
-        } else if (profitsValueInETH > 0) {
-            // Use all available profits if less than needed but still something
-            claimableOutputTokens[dcaId] = 0;
-            order.gasTank += profitsValueInETH;
-            
-            emit GasTankContribution(dcaId, profitsValueInETH);
-            // Check if partial refill is sufficient
-            return order.gasTank >= requiredGas;
-        }
-        
-        return false; // Insufficient profits to refill
+        return adjustedAmount;
     }
 
     function _handleTakeProfitHit(uint256 dcaId, uint256 takeProfitAmount) internal {
@@ -1116,8 +1156,8 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         // Clear take profit order
         _cancelTakeProfitOrder(dcaId);
         
-        // Mark as completed for now - restart logic can be added later
-        order.isActive = false;
+        // Mark as completed - take profit was hit
+        order.status = IDCADexterBotV1.OrderStatus.COMPLETED;
         
         // Update claimable tokens with take profit execution
         claimableOutputTokens[dcaId] += takeProfitAmount;
@@ -1126,9 +1166,9 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
     }
 
     function _calculateEstimatedGasFee() internal view returns (uint256) {
-        uint256 estimatedCost = ESTIMATED_EXECUTION_GAS * tx.gasprice;
-        estimatedCost = (estimatedCost * GAS_PRICE_BUFFER_MULTIPLIER) / 100;
-        if (estimatedCost > MAX_GAS_FEE_ETH) estimatedCost = MAX_GAS_FEE_ETH;
+        uint256 estimatedCost = 150000 * tx.gasprice; // ESTIMATED_EXECUTION_GAS inlined
+        estimatedCost = (estimatedCost * 120) / 100; // GAS_PRICE_BUFFER_MULTIPLIER inlined
+        if (estimatedCost > 0.01 ether) estimatedCost = 0.01 ether; // MAX_GAS_FEE_ETH inlined
         return estimatedCost;
     }
 
@@ -1167,7 +1207,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
 
     function getDCAInfo(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
-        uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
+        uint256 executedAmount, uint256 claimableAmount, IDCADexterBotV1.OrderStatus status, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalOrders, uint24 currentFee
     ) {
         OrderInfo storage order = orders[dcaId];
@@ -1176,7 +1216,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         return (
             order.user, Currency.unwrap(order.poolKey.currency0), Currency.unwrap(order.poolKey.currency1),
             uint256(order.totalAmount), execAmount, claimableOutputTokens[dcaId],
-            order.isActive, claimTokensSupply[dcaId] == 0, uint256(order.expirationTime),
+            order.status, claimTokensSupply[dcaId] == 0, uint256(order.expirationTime),
             order.zeroForOne, nextOrderId - 1, order.poolKey.fee
         );
     }
@@ -1184,25 +1224,25 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
 
     function getDCAInfoExtended(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
-        uint256 executedAmount, uint256 claimableAmount, bool isActive, bool isFullyExecuted,
+        uint256 executedAmount, uint256 claimableAmount, IDCADexterBotV1.OrderStatus status, bool isFullyExecuted,
         uint256 expirationTime, bool zeroForOne, uint256 totalOrders, uint24 currentFee,
-        uint256 gasTankAmount, uint256 gasTankPercent, bool isStalled
+        uint256 gasAllocated, uint256 gasUsed, uint256 gasBorrowedFromTank
     ) {
         OrderInfo storage order = orders[dcaId];
         if (order.user == address(0)) revert InvalidOrder();
         uint256 execAmount = uint256(order.totalAmount) - claimTokensSupply[dcaId];
         return (
             order.user, Currency.unwrap(order.poolKey.currency0), Currency.unwrap(order.poolKey.currency1),
-            uint256(order.totalAmount), execAmount, claimableOutputTokens[dcaId], order.isActive,
+            uint256(order.totalAmount), execAmount, claimableOutputTokens[dcaId], order.status,
             claimTokensSupply[dcaId] == 0, uint256(order.expirationTime), order.zeroForOne,
-            nextOrderId - 1, order.poolKey.fee, order.gasTank, order.gasTankPercent, order.isStalled
+            nextOrderId - 1, order.poolKey.fee, order.gasAllocated, order.gasUsed, order.gasBorrowedFromTank
         );
     }
 
     function getDCAOrder(uint256 dcaId) external view returns (
         address user, address currency0, address currency1, uint256 totalAmount,
         uint256 executedAmount, uint256[] memory targetPrices, uint256[] memory targetAmounts,
-        bool isActive, bool isFullyExecuted
+        IDCADexterBotV1.OrderStatus status, bool isFullyExecuted
     ) {
         OrderInfo storage order = orders[dcaId];
         int24[] memory targetTicks = orderTargetTicks[dcaId];
@@ -1214,7 +1254,7 @@ contract DCADexterBotV1 is IDCADexterBotV1, ERC6909Base, BaseHook, IUnlockCallba
         return (
             order.user, Currency.unwrap(order.poolKey.currency0), Currency.unwrap(order.poolKey.currency1),
             uint256(order.totalAmount), uint256(order.totalAmount) - claimTokensSupply[dcaId],
-            prices, amounts, order.isActive, claimTokensSupply[dcaId] == 0
+            prices, amounts, order.status, claimTokensSupply[dcaId] == 0
         );
     }
 

@@ -10,6 +10,14 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
  *         customizable pool and DCA parameters, and batch execution with advanced controls.
  */
 interface IDCADexterBotV1 {
+    // Order execution status
+    enum OrderStatus {
+        ACTIVE,     // Order is running normally
+        COMPLETED,  // Order finished successfully (take profit hit)
+        CANCELLED,  // Order was manually cancelled
+        STALLED     // Order is stalled due to insufficient gas
+    }
+
     struct PoolParams {
         address currency0;
         address currency1;
@@ -31,9 +39,7 @@ interface IDCADexterBotV1 {
         PoolParams calldata pool,
         DCAParams calldata dca,
         uint32 slippage,
-        uint256 expirationTime,
-        uint256 gasTankAmount,
-        uint32 gasTankPercent
+        uint256 expirationTime
     ) external payable returns (uint256 dcaId);
 
     // Immediate manual sell (market sell accumulated output and restart)
@@ -50,7 +56,7 @@ interface IDCADexterBotV1 {
         uint256 totalAmount,
         uint256 executedAmount,
         uint256 claimableAmount,
-        bool isActive,
+        IDCADexterBotV1.OrderStatus status,
         bool isFullyExecuted,
         uint256 expirationTime,
         bool zeroForOne,
@@ -65,15 +71,15 @@ interface IDCADexterBotV1 {
         uint256 totalAmount,
         uint256 executedAmount,
         uint256 claimableAmount,
-        bool isActive,
+        IDCADexterBotV1.OrderStatus status,
         bool isFullyExecuted,
         uint256 expirationTime,
         bool zeroForOne,
         uint256 totalBatches,
         uint24 currentFee,
-        uint256 gasTankAmount,
-        uint256 gasTankPercent,
-        bool isStalled
+        uint256 gasAllocated,
+        uint256 gasUsed,
+        uint256 gasBorrowedFromTank
     );
 
     function getDCAOrder(uint256 dcaId) external view returns (
@@ -84,7 +90,7 @@ interface IDCADexterBotV1 {
         uint256 executedAmount,
         uint256[] memory targetPrices,
         uint256[] memory targetAmounts,
-        bool isActive,
+        IDCADexterBotV1.OrderStatus status,
         bool isFullyExecuted
     );
 
