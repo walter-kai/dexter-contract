@@ -5,11 +5,11 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 /**
- * @title IDCADexterBotV1
+ * @title IDexterHook
  * @notice Interface for a DCA (Dollar Cost Averaging) bot supporting perpetual orders,
  *         customizable pool and DCA parameters, and batch execution with advanced controls.
  */
-interface IDCADexterBotV1 {
+interface IDexterHook {
     // Order execution status
     enum OrderStatus {
         ACTIVE, // Order is running normally
@@ -60,7 +60,7 @@ interface IDCADexterBotV1 {
             uint256 totalAmount,
             uint256 executedAmount,
             uint256 claimableAmount,
-            IDCADexterBotV1.OrderStatus status,
+            IDexterHook.OrderStatus status,
             bool isFullyExecuted,
             uint256 expirationTime,
             bool zeroForOne,
@@ -78,15 +78,14 @@ interface IDCADexterBotV1 {
             uint256 totalAmount,
             uint256 executedAmount,
             uint256 claimableAmount,
-            IDCADexterBotV1.OrderStatus status,
+            IDexterHook.OrderStatus status,
             bool isFullyExecuted,
             uint256 expirationTime,
             bool zeroForOne,
             uint256 totalBatches,
             uint24 currentFee,
             uint256 gasAllocated,
-            uint256 gasUsed,
-            uint256 gasBorrowedFromTank
+            uint256 gasUsed
         );
 
     function getDCAOrder(uint256 dcaId)
@@ -100,7 +99,7 @@ interface IDCADexterBotV1 {
             uint256 executedAmount,
             uint256[] memory targetPrices,
             uint256[] memory targetAmounts,
-            IDCADexterBotV1.OrderStatus status,
+            IDexterHook.OrderStatus status,
             bool isFullyExecuted
         );
 

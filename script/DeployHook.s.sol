@@ -6,7 +6,7 @@ import {console2} from "forge-std/console2.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {HookMiner} from "@uniswap/v4-periphery/utils/HookMiner.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
-import {DCADexterBotV1} from "../src/DCADexterBotV1.sol";
+import {DexterHook} from "../src/DexterHook.sol";
 
 /**
  * @title DeployHookContract
@@ -45,20 +45,20 @@ contract DeployHookContract is Script {
 
         // Mine a salt that will produce a hook address with the correct flags
         (address hookAddress, bytes32 salt) =
-            HookMiner.find(CREATE2_DEPLOYER, flags, type(DCADexterBotV1).creationCode, constructorArgs);
+            HookMiner.find(CREATE2_DEPLOYER, flags, type(DexterHook).creationCode, constructorArgs);
 
         console2.log("Found valid hook address:", hookAddress);
         console2.log("Using salt:", vm.toString(salt));
 
         // Deploy the hook using CREATE2 with the mined salt
-        DCADexterBotV1 dcaDexterBot = new DCADexterBotV1{salt: salt}(poolManager, feeRecipient, deployer);
+        DexterHook dexterHook = new DexterHook{salt: salt}(poolManager, feeRecipient, deployer);
 
         // Verify the deployed address matches the mined address
-        require(address(dcaDexterBot) == hookAddress, "Hook address mismatch!");
-        console2.log("Deployed hook address:", address(dcaDexterBot));
+        require(address(dexterHook) == hookAddress, "Hook address mismatch!");
+        console2.log("Deployed hook address:", address(dexterHook));
 
         vm.stopBroadcast();
 
-        console2.log(unicode"✅ DCADexterBotV1 hook deployed at: ", address(dcaDexterBot));
+        console2.log(unicode"✅ DexterHook hook deployed at: ", address(dexterHook));
     }
 }

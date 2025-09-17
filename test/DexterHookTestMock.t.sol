@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import "forge-std/console.sol";
-import "../src/interfaces/IDCADexterBotV1.sol";
+import "../src/interfaces/IDexterHook.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 
 // A small mock of the DCADexterBotV1 interface to simulate behavior for unit tests.
@@ -17,7 +17,7 @@ contract MockDCABot {
         uint256 totalAmount;
         uint256 executedAmount;
         uint256 claimableAmount;
-        IDCADexterBotV1.OrderStatus status;
+        IDexterHook.OrderStatus status;
         bool isFullyExecuted;
         uint256 expirationTime;
         bool zeroForOne;
@@ -28,6 +28,7 @@ contract MockDCABot {
         uint256 gasBorrowedFromTank;
         uint256[] inputs;
         uint256[] outputs;
+        uint256 takeProfitPercent;
     }
 
     mapping(uint256 => Order) public orders;
@@ -40,9 +41,9 @@ contract MockDCABot {
     error ExpiredDeadline();
 
     function createDCAStrategy(
-        IDCADexterBotV1.PoolParams calldata poolParams,
-        IDCADexterBotV1.DCAParams calldata dca,
-        uint32 slippage,
+        IDexterHook.PoolParams calldata poolParams,
+        IDexterHook.DCAParams calldata dca,
+        uint32,
         uint256 expirationTime
     ) external payable returns (uint256 dcaId) {
         // Validate parameters
@@ -59,12 +60,13 @@ contract MockDCABot {
         o.totalAmount = dca.swapOrderAmount * (dca.maxSwapOrders + 1);
         o.executedAmount = 0;
         o.claimableAmount = 0;
-        o.status = IDCADexterBotV1.OrderStatus.ACTIVE;
+        o.status = IDexterHook.OrderStatus.ACTIVE;
         o.isFullyExecuted = false;
         o.expirationTime = expirationTime;
         o.zeroForOne = dca.zeroForOne;
         o.totalBatches = dca.maxSwapOrders;
         o.currentFee = 3000;
+        o.takeProfitPercent = dca.takeProfitPercent;
 
         // Handle token transfers
         if (dca.zeroForOne) {
@@ -96,6 +98,37 @@ contract MockDCABot {
         o.gasBorrowedFromTank = 0;
     }
 
+    // Cancel strategy and refund unused gas
+    function cancelDCAStrategy(uint256 dcaId) external {
+        Order storage o = orders[dcaId];
+        require(o.user == msg.sender, "Not owner");
+        require(o.status == IDexterHook.OrderStatus.ACTIVE, "Not active");
+        
+        // Calculate unused gas to refund
+        uint256 unusedGas = o.gasAllocated - o.gasUsed;
+        if (unusedGas > 0) {
+            // Transfer unused gas back to user
+            payable(msg.sender).transfer(unusedGas);
+        }
+        
+        // Update order status
+        o.status = IDexterHook.OrderStatus.CANCELLED;
+        
+        // Refund unexecuted tokens
+        uint256 unexecutedAmount = o.totalAmount - o.executedAmount;
+        if (unexecutedAmount > 0) {
+            if (o.zeroForOne) {
+                if (o.currency0 != address(0)) {
+                    ERC20Mock(o.currency0).transfer(msg.sender, unexecutedAmount);
+                }
+            } else {
+                if (o.currency1 != address(0)) {
+                    ERC20Mock(o.currency1).transfer(msg.sender, unexecutedAmount);
+                }
+            }
+        }
+    }
+
     // allow test to simulate execution
     function simulateExecution(
         uint256 dcaId,
@@ -106,6 +139,7 @@ contract MockDCABot {
     ) external {
         Order storage o = orders[dcaId];
         require(o.user != address(0), "unknown dca");
+        require(o.status == IDexterHook.OrderStatus.ACTIVE, "not active");
         o.gasUsed = gasUsed;
         o.gasBorrowedFromTank = gasBorrowed;
         o.inputs = inputs;
@@ -123,10 +157,48 @@ contract MockDCABot {
         // Simulate token movements
         simulateTokenMovements(dcaId, inputs, outputs);
 
-        o.executedAmount = sumIn;
-        o.claimableAmount = sumOut;
-        o.isFullyExecuted = true;
-        o.status = IDCADexterBotV1.OrderStatus.COMPLETED;
+        o.executedAmount += sumIn;
+        o.claimableAmount += sumOut;
+        o.gasUsed = gasUsed;
+
+        // Check for take profit condition based on configured take profit percent
+        bool takeProfitHit = false;
+        if (o.zeroForOne) {
+            // For ETH -> USDC, compare price improvement
+            // Avoid overflow by doing divisions before multiplications with large numbers
+            uint256 basePrice = 1900; // Base price in USDC per ETH
+            uint256 expectedOutput = (basePrice * inputs[0] / 1e18) * 1e6; // Convert to USDC decimals
+            uint256 minOutputForTakeProfit = expectedOutput * (10000 + o.takeProfitPercent) / 10000;
+            if (outputs[0] >= minOutputForTakeProfit) {
+                takeProfitHit = true;
+            }
+        } else {
+            // For USDC -> ETH, compare price improvement
+            uint256 basePrice = 1900 * 1e6; // Base price in USDC per ETH with decimals
+            uint256 expectedEthOutput = inputs[0] * 1e18 / basePrice; // Expected ETH output at base price
+            uint256 minOutputForTakeProfit = expectedEthOutput * (10000 + o.takeProfitPercent) / 10000;
+            if (outputs[0] >= minOutputForTakeProfit) {
+                takeProfitHit = true;
+            }
+        }
+
+        // Handle take profit completion
+        if (takeProfitHit) {
+            o.isFullyExecuted = true;
+            o.status = IDexterHook.OrderStatus.COMPLETED;
+            
+            // Refund unused gas on take profit
+            uint256 unusedGas = o.gasAllocated - o.gasUsed;
+            if (unusedGas > 0) {
+                payable(o.user).transfer(unusedGas);
+            }
+        }
+
+        // Check if all orders executed
+        if (o.executedAmount >= o.totalAmount) {
+            o.isFullyExecuted = true;
+            o.status = IDexterHook.OrderStatus.COMPLETED;
+        }
     }
 
     function getDCAInfo(uint256 dcaId)
@@ -139,7 +211,7 @@ contract MockDCABot {
             uint256 totalAmount,
             uint256 executedAmount,
             uint256 claimableAmount,
-            IDCADexterBotV1.OrderStatus status,
+            IDexterHook.OrderStatus status,
             bool isFullyExecuted,
             uint256 expirationTime,
             bool zeroForOne,
@@ -174,7 +246,7 @@ contract MockDCABot {
             uint256 totalAmount,
             uint256 executedAmount,
             uint256 claimableAmount,
-            IDCADexterBotV1.OrderStatus status,
+            IDexterHook.OrderStatus status,
             bool isFullyExecuted,
             uint256 expirationTime,
             bool zeroForOne,
@@ -216,7 +288,7 @@ contract MockDCABot {
             uint256 executedAmount,
             uint256[] memory targetPrices,
             uint256[] memory targetAmounts,
-            IDCADexterBotV1.OrderStatus status,
+            IDexterHook.OrderStatus status,
             bool isFullyExecuted
         )
     {
@@ -295,10 +367,10 @@ contract SimpleStrat is Test {
     }
 
     function test_multiOrderGasAccounting_and_receipt() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
 
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 4,
@@ -355,10 +427,10 @@ contract SimpleStrat is Test {
     }
 
     function test_gasBorrowedFromTank() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
 
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: false,
             takeProfitPercent: 500,
             maxSwapOrders: 2,
@@ -398,11 +470,11 @@ contract SimpleStrat is Test {
     }
 
     function test_maxSwapOrders() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
 
         // Test max orders (10)
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 10, // Maximum allowed
@@ -435,11 +507,11 @@ contract SimpleStrat is Test {
     }
 
     function test_priceDeviationMultiplier() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
 
         // Test with different price deviation multipliers
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 3,
@@ -478,11 +550,11 @@ contract SimpleStrat is Test {
         weth.mint(address(this), 100 ether);
         usdc.mint(address(this), 200_000 * 10 ** 6); // $200k USDC
 
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         // Create DCA strategy that will also add initial liquidity
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 2,
@@ -520,10 +592,10 @@ contract SimpleStrat is Test {
         weth.mint(address(this), 100 ether);
         usdc.mint(address(this), 200_000 * 10 ** 6);
 
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 2,
@@ -537,7 +609,6 @@ contract SimpleStrat is Test {
         uint256 initialUserWethBalance = weth.balanceOf(address(this));
         uint256 initialUserUsdcBalance = usdc.balanceOf(address(this));
         uint256 initialMockWethBalance = weth.balanceOf(address(mock));
-        uint256 initialMockUsdcBalance = usdc.balanceOf(address(mock));
 
         // Approve and create strategy
         weth.approve(address(mock), 50 ether);
@@ -583,8 +654,8 @@ contract SimpleStrat is Test {
         weth.mint(address(this), 1000 ether);
         usdc.mint(address(this), 2_000_000 * 10 ** 6);
 
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         // Test different order sizes
         uint256[] memory orderSizes = new uint256[](3);
@@ -593,7 +664,7 @@ contract SimpleStrat is Test {
         orderSizes[2] = 10 ether;
 
         for (uint256 i = 0; i < orderSizes.length; i++) {
-            IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+            IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
                 zeroForOne: true,
                 takeProfitPercent: 1000,
                 maxSwapOrders: 2,
@@ -626,11 +697,11 @@ contract SimpleStrat is Test {
     }
 
     function test_invalidInputParameters() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         // Test invalid take profit percent (> 5000)
-        IDCADexterBotV1.DCAParams memory invalidTakeProfit = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory invalidTakeProfit = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 5001, // Invalid: > 5000
             maxSwapOrders: 4,
@@ -644,7 +715,7 @@ contract SimpleStrat is Test {
         mock.createDCAStrategy{value: 1 ether}(poolParams, invalidTakeProfit, 100, block.timestamp + 1 hours);
 
         // Test invalid max swap orders (> 10)
-        IDCADexterBotV1.DCAParams memory invalidMaxOrders = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory invalidMaxOrders = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 11, // Invalid: > 10
@@ -658,7 +729,7 @@ contract SimpleStrat is Test {
         mock.createDCAStrategy{value: 1 ether}(poolParams, invalidMaxOrders, 100, block.timestamp + 1 hours);
 
         // Test invalid price deviation (> 2000)
-        IDCADexterBotV1.DCAParams memory invalidDeviation = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory invalidDeviation = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 4,
@@ -672,7 +743,7 @@ contract SimpleStrat is Test {
         mock.createDCAStrategy{value: 1 ether}(poolParams, invalidDeviation, 100, block.timestamp + 1 hours);
 
         // Test expired deadline
-        IDCADexterBotV1.DCAParams memory validParams = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory validParams = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 4,
@@ -691,10 +762,10 @@ contract SimpleStrat is Test {
         weth.mint(address(this), 100 ether);
         usdc.mint(address(this), 200_000 * 10 ** 6);
 
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
             maxSwapOrders: 3,
@@ -725,8 +796,8 @@ contract SimpleStrat is Test {
     }
 
     function test_priceDeviationAndTicks() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         // Test different price deviations
         uint32[] memory deviations = new uint32[](3);
@@ -735,7 +806,7 @@ contract SimpleStrat is Test {
         deviations[2] = 1500; // 15%
 
         for (uint256 i = 0; i < deviations.length; i++) {
-            IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+            IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
                 zeroForOne: true,
                 takeProfitPercent: 1000,
                 maxSwapOrders: 2,
@@ -764,8 +835,8 @@ contract SimpleStrat is Test {
     }
 
     function test_takeProfitMechanics() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         // Test different take-profit levels
         uint32[] memory takeProfitLevels = new uint32[](3);
@@ -774,7 +845,7 @@ contract SimpleStrat is Test {
         takeProfitLevels[2] = 2000; // 20%
 
         for (uint256 i = 0; i < takeProfitLevels.length; i++) {
-            IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+            IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
                 zeroForOne: true,
                 takeProfitPercent: takeProfitLevels[i],
                 maxSwapOrders: 2,
@@ -791,8 +862,9 @@ contract SimpleStrat is Test {
             uint256[] memory inputs = new uint256[](1);
             uint256[] memory outputs = new uint256[](1);
             inputs[0] = 1 ether;
-            // Calculate output with take-profit bonus
-            outputs[0] = uint256(1900 * (100 + takeProfitLevels[i] / 100)) * 1e6 / 100;
+            // Calculate output with take-profit bonus (base price is 1900 USDC per ETH)
+            // Avoid overflow by doing division before multiplication with large numbers
+            outputs[0] = (1900 * (10000 + takeProfitLevels[i]) / 10000) * 1e6;
 
             mock.simulateExecution(id, expected / 2, 0, inputs, outputs);
 
@@ -804,38 +876,109 @@ contract SimpleStrat is Test {
         }
     }
 
-    function test_gasRefundScenarios() public {
-        IDCADexterBotV1.PoolParams memory poolParams =
-            IDCADexterBotV1.PoolParams({currency0: address(0), currency1: address(0), fee: 3000});
+    // Test gas refund when cancelling before any execution
+    function test_gasRefundOnImmediateCancel() public {
+        IDexterHook.PoolParams memory poolParams = IDexterHook.PoolParams({
+            currency0: address(weth),
+            currency1: address(usdc),
+            fee: 3000
+        });
 
-        IDCADexterBotV1.DCAParams memory dca = IDCADexterBotV1.DCAParams({
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
             takeProfitPercent: 1000,
-            maxSwapOrders: 2,
+            maxSwapOrders: 3,
             priceDeviationPercent: 500,
             priceDeviationMultiplier: 20,
             swapOrderAmount: 1 ether,
             swapOrderMultiplier: 10
         });
 
-        uint256 expected = _calcExpectedGas(dca.maxSwapOrders);
-        uint256 id = mock.createDCAStrategy{value: expected}(poolParams, dca, 100, block.timestamp + 1 hours);
+        uint256 gasFunded = _calcExpectedGas(dca.maxSwapOrders);
+        uint256 id = mock.createDCAStrategy{value: gasFunded}(poolParams, dca, 100, block.timestamp + 1 hours);
 
-        // Simulate using less gas than allocated
-        uint256 actualGasUsed = expected / 2;
-        uint256[] memory inputs = new uint256[](2);
-        uint256[] memory outputs = new uint256[](2);
+        // Record ETH balance before cancel
+        uint256 balanceBefore = address(this).balance;
+        mock.cancelDCAStrategy(id);
+        uint256 balanceAfter = address(this).balance;
+
+        assertEq(balanceAfter - balanceBefore, gasFunded, "Should get full gas refund on immediate cancel");
+    }
+
+    // Test gas refund after partial execution
+    function test_gasRefundAfterPartialExecution() public {
+        IDexterHook.PoolParams memory poolParams = IDexterHook.PoolParams({
+            currency0: address(weth),
+            currency1: address(usdc),
+            fee: 3000
+        });
+
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
+            zeroForOne: true,
+            takeProfitPercent: 1000,
+            maxSwapOrders: 3,
+            priceDeviationPercent: 500,
+            priceDeviationMultiplier: 20,
+            swapOrderAmount: 1 ether,
+            swapOrderMultiplier: 10
+        });
+
+        uint256 gasFunded = _calcExpectedGas(dca.maxSwapOrders);
+        uint256 id = mock.createDCAStrategy{value: gasFunded}(poolParams, dca, 100, block.timestamp + 1 hours);
+
+        // Simulate partial execution
+        uint256[] memory inputs;
+        uint256[] memory outputs;
+        inputs = new uint256[](1);
+        outputs = new uint256[](1);
         inputs[0] = 1 ether;
-        inputs[1] = 1 ether;
-        outputs[0] = 0.95 ether;
-        outputs[1] = 0.95 ether;
+        outputs[0] = 1900 * 1e6;
+        uint256 gasUsed = gasFunded / 2;
+        mock.simulateExecution(id, gasUsed, 0, inputs, outputs);
 
-        mock.simulateExecution(id, actualGasUsed, 0, inputs, outputs);
+        uint256 balanceBefore = address(this).balance;
+        mock.cancelDCAStrategy(id);
+        uint256 balanceAfter = address(this).balance;
 
-        (,,,,,,,,,,,, uint256 gasAllocated, uint256 gasUsedRead,) = mock.getDCAInfoExtended(id);
+        uint256 expectedRefund = gasFunded - gasUsed;
+        assertEq(balanceAfter - balanceBefore, expectedRefund, "Should get partial gas refund");
+    }
 
-        assertEq(gasAllocated, expected, "Gas allocated should match expected");
-        assertEq(gasUsedRead, actualGasUsed, "Gas used should match actual usage");
-        assertTrue(gasUsedRead < gasAllocated, "Should have unused gas");
+    // Test gas refund on take profit hit
+    function test_gasRefundOnTakeProfit() public {
+        IDexterHook.PoolParams memory poolParams = IDexterHook.PoolParams({
+            currency0: address(weth),
+            currency1: address(usdc),
+            fee: 3000
+        });
+
+        IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
+            zeroForOne: true,
+            takeProfitPercent: 1000, // 10% take profit
+            maxSwapOrders: 3,
+            priceDeviationPercent: 500,
+            priceDeviationMultiplier: 20,
+            swapOrderAmount: 1 ether,
+            swapOrderMultiplier: 10
+        });
+
+        uint256 gasFunded = _calcExpectedGas(dca.maxSwapOrders);
+        uint256 id = mock.createDCAStrategy{value: gasFunded}(poolParams, dca, 100, block.timestamp + 1 hours);
+
+        // Simulate execution that hits take profit target
+        uint256[] memory inputs;
+        uint256[] memory outputs;
+        inputs = new uint256[](1);
+        outputs = new uint256[](1);
+        inputs[0] = 1 ether;
+        outputs[0] = 2100 * 1e6; // Price moved up 10% hitting take profit
+        uint256 gasUsed = gasFunded / 3;
+        
+        uint256 balanceBefore = address(this).balance;
+        mock.simulateExecution(id, gasUsed, 0, inputs, outputs);
+        uint256 balanceAfter = address(this).balance;
+
+        uint256 expectedRefund = gasFunded - gasUsed;
+        assertEq(balanceAfter - balanceBefore, expectedRefund, "Should get gas refund on take profit");
     }
 }
