@@ -29,18 +29,11 @@ library BatchOrderLogic {
 
     /// @notice Events
     event OrderExecutedFromQueue(
-        uint256 indexed batchOrderId,
-        int24 originalTick,
-        int24 executionTick,
-        uint256 amount,
-        bool wasTimeout
+        uint256 indexed batchOrderId, int24 originalTick, int24 executionTick, uint256 amount, bool wasTimeout
     );
 
     event OrderQueuedForBestExecution(
-        uint256 indexed batchOrderId,
-        int24 currentTick,
-        int24 targetTick,
-        uint256 amount
+        uint256 indexed batchOrderId, int24 currentTick, int24 targetTick, uint256 amount
     );
 
     /**
@@ -49,7 +42,6 @@ library BatchOrderLogic {
      * @param currentTick Current pool tick
      * @param bestPriceQueue Storage reference to the queue
      * @param queueIndex Storage reference to queue index
-     * @param poolManager Pool manager instance
      * @param contractAddress Address of the calling contract
      */
     function processQueuedOrders(
@@ -57,18 +49,17 @@ library BatchOrderLogic {
         int24 currentTick,
         mapping(PoolId => QueuedOrder[]) storage bestPriceQueue,
         mapping(PoolId => uint256) storage queueIndex,
-        IPoolManager poolManager,
         address contractAddress
     ) external {
         PoolId poolId = key.toId();
         QueuedOrder[] storage queue = bestPriceQueue[poolId];
         uint256 currentIndex = queueIndex[poolId];
-        
+
         // Process orders in queue
         while (currentIndex < queue.length) {
             QueuedOrder storage order = queue[currentIndex];
             bool shouldExecute = false;
-            
+
             // Check if best execution achieved or timeout
             if (order.zeroForOne && currentTick >= order.targetTick) {
                 shouldExecute = true; // Better sell price for token0
@@ -77,10 +68,10 @@ library BatchOrderLogic {
             } else if (block.timestamp >= order.maxWaitTime) {
                 shouldExecute = true; // Timeout - execute at current price
             }
-            
+
             if (shouldExecute) {
                 // Execute the order using delegatecall to maintain context
-                (bool success, ) = contractAddress.delegatecall(
+                (bool success,) = contractAddress.delegatecall(
                     abi.encodeWithSignature(
                         "_executeBatchOrderWithId(PoolKey,int24,bool,uint256,uint256)",
                         key,
@@ -90,7 +81,7 @@ library BatchOrderLogic {
                         order.batchOrderId
                     )
                 );
-                
+
                 if (success) {
                     emit OrderExecutedFromQueue(
                         order.batchOrderId,
@@ -100,18 +91,18 @@ library BatchOrderLogic {
                         block.timestamp >= order.maxWaitTime
                     );
                 }
-                
+
                 // Remove from queue
                 queue[currentIndex] = queue[queue.length - 1];
                 queue.pop();
             } else {
                 currentIndex++;
             }
-            
+
             // Prevent infinite loops
             if (gasleft() < 50000) break;
         }
-        
+
         queueIndex[poolId] = currentIndex;
     }
 
@@ -139,7 +130,7 @@ library BatchOrderLogic {
         int24 BEST_EXECUTION_TICKS
     ) external {
         PoolId poolId = key.toId();
-        
+
         // Calculate target tick for better price
         int24 targetTick;
         if (zeroForOne) {
@@ -149,26 +140,26 @@ library BatchOrderLogic {
             // For selling token1, wait for lower tick (better price)
             targetTick = currentTick - (BEST_EXECUTION_TICKS * key.tickSpacing);
         }
-        
+
         // Remove from pending orders at original tick (move to queue)
         pendingBatchOrders[poolId][currentTick][zeroForOne] -= amount;
-        
+
         // Calculate maxWaitTime: if timeoutSeconds is 0, disable timeout (set to max)
-        uint256 maxWaitTime = timeoutSeconds == 0 
-            ? type(uint256).max 
-            : block.timestamp + timeoutSeconds;
-        
+        uint256 maxWaitTime = timeoutSeconds == 0 ? type(uint256).max : block.timestamp + timeoutSeconds;
+
         // Add to queue
-        bestPriceQueue[poolId].push(QueuedOrder({
-            batchOrderId: batchOrderId,
-            originalTick: currentTick,
-            targetTick: targetTick,
-            amount: amount,
-            queueTime: block.timestamp,
-            maxWaitTime: maxWaitTime,
-            zeroForOne: zeroForOne
-        }));
-        
+        bestPriceQueue[poolId].push(
+            QueuedOrder({
+                batchOrderId: batchOrderId,
+                originalTick: currentTick,
+                targetTick: targetTick,
+                amount: amount,
+                queueTime: block.timestamp,
+                maxWaitTime: maxWaitTime,
+                zeroForOne: zeroForOne
+            })
+        );
+
         emit OrderQueuedForBestExecution(batchOrderId, currentTick, targetTick, amount);
     }
 
@@ -179,23 +170,21 @@ library BatchOrderLogic {
      * @param maxSlippageBps Maximum slippage in basis points
      * @return slippageProtectedPrice Price limit with slippage protection
      */
-    function calculateSlippageProtectedPrice(
-        int24 tick,
-        bool zeroForOne,
-        uint256 maxSlippageBps
-    ) external pure returns (uint160 slippageProtectedPrice) {
+    function calculateSlippageProtectedPrice(int24 tick, bool zeroForOne, uint256 maxSlippageBps)
+        external
+        pure
+        returns (uint160 slippageProtectedPrice)
+    {
         uint160 targetPrice = TickMath.getSqrtPriceAtTick(tick);
-        
+
         if (maxSlippageBps == 0) {
             // No slippage protection - use min/max limits
-            return zeroForOne 
-                ? TickMath.MIN_SQRT_PRICE + 1
-                : TickMath.MAX_SQRT_PRICE - 1;
+            return zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
         }
-        
+
         // Calculate slippage adjustment
         uint256 slippageAdjustment = (uint256(targetPrice) * maxSlippageBps) / 10000;
-        
+
         if (zeroForOne) {
             // For zeroForOne swaps, protect against price going too low
             slippageProtectedPrice = uint160(uint256(targetPrice) - slippageAdjustment);

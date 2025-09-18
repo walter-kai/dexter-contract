@@ -13,19 +13,19 @@ library PriceLibrary {
      */
     function sqrtPriceToPrice(uint160 sqrtPriceX96) internal pure returns (uint256 price) {
         if (sqrtPriceX96 == 0) return 0;
-        
+
         // Convert sqrtPriceX96 to price using the standard Uniswap formula
         // price = (sqrtPriceX96 / 2^96)^2
-        
+
         // To avoid overflow, we can rearrange: price = (sqrtPriceX96^2) / (2^192)
         // And then adjust for decimal differences between tokens
-        
+
         uint256 priceX192 = uint256(sqrtPriceX96) * uint256(sqrtPriceX96);
-        
+
         // For ETH/USDC: ETH (18 decimals) / USDC (6 decimals) = need 10^12 adjustment
         // This gives us USDC per ETH price
         price = (priceX192 * 1e12) >> 192;
-        
+
         // Additional safety check to prevent unrealistic prices
         // For ETH/USDC, reasonable range is 100-10000 USDC per ETH
         if (price > 50000 || price == 0) {
@@ -43,16 +43,15 @@ library PriceLibrary {
      * @param slippageTolerance Slippage tolerance
      * @return executable Whether the order can be executed
      */
-    function isPriceExecutable(
-        uint160 sqrtPriceX96,
-        uint256 limitPrice,
-        bool zeroForOne,
-        uint256 slippageTolerance
-    ) internal pure returns (bool executable) {
+    function isPriceExecutable(uint160 sqrtPriceX96, uint256 limitPrice, bool zeroForOne, uint256 slippageTolerance)
+        internal
+        pure
+        returns (bool executable)
+    {
         uint256 currentPrice = sqrtPriceToPrice(sqrtPriceX96);
         uint256 limitPriceScaled = limitPrice; // limitPrice is already properly scaled
         uint256 tolerance = (limitPriceScaled * slippageTolerance) / 10000;
-        
+
         if (zeroForOne) {
             // For ETH -> USDC, execute if current price >= limit price (selling ETH)
             return currentPrice >= (limitPriceScaled - tolerance);

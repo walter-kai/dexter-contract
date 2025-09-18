@@ -10,10 +10,10 @@ library NetworkUtils {
     // Known chain IDs
     uint256 constant MAINNET_CHAIN_ID = 1;
     uint256 constant SEPOLIA_CHAIN_ID = 11155111;
-    
+
     // Known addresses for mainnet
     address constant MAINNET_POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
-    
+
     /**
      * @notice Check if the current network is mainnet
      * @return true if running on Ethereum mainnet
@@ -21,7 +21,7 @@ library NetworkUtils {
     function isMainnet() internal view returns (bool) {
         return block.chainid == MAINNET_CHAIN_ID;
     }
-    
+
     /**
      * @notice Check if the current network is Sepolia testnet
      * @return true if running on Sepolia testnet
@@ -29,7 +29,7 @@ library NetworkUtils {
     function isSepolia() internal view returns (bool) {
         return block.chainid == SEPOLIA_CHAIN_ID;
     }
-    
+
     /**
      * @notice Check if the current network is forked mainnet (Anvil)
      * @dev Since Anvil forks from mainnet, it uses chain ID 1 but we can detect
@@ -42,7 +42,7 @@ library NetworkUtils {
         // For now, we'll assume all chain ID 1 could be Anvil in testing
         return false; // This should be set by the calling context
     }
-    
+
     /**
      * @notice Check if we should perform real liquidity checks
      * @dev Returns true for mainnet and testnets where we have access
@@ -53,7 +53,7 @@ library NetworkUtils {
         // For Anvil (forked mainnet), this depends on testing context
         return isMainnet() || isSepolia();
     }
-    
+
     /**
      * @notice Check if we should use the HookManager for liquidity validation
      * @dev Returns true when we have a deployed hook that can access pool state
@@ -63,7 +63,7 @@ library NetworkUtils {
         // Use HookManager validation on mainnet where hooks are properly deployed
         return isMainnet();
     }
-    
+
     /**
      * @notice Get the expected PoolManager address for the current network
      * @return The PoolManager address for the current network

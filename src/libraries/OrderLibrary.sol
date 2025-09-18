@@ -34,11 +34,11 @@ library OrderLibrary {
     ) internal {
         uint256 index = activeOrderIndex[orderId];
         require(index < activeOrders.length, "Invalid order index");
-        
+
         uint256 lastOrderId = activeOrders[activeOrders.length - 1];
         activeOrders[index] = lastOrderId;
         activeOrderIndex[lastOrderId] = index;
-        
+
         activeOrders.pop();
         delete activeOrderIndex[orderId];
     }

@@ -1,3 +1,4 @@
+
 # Build outputs
 /cache
 /out
@@ -47,3 +48,4 @@ forge-cache/
 package-lock.json
 yarn.lock
 /lib
+/pnpm-lock.yaml
