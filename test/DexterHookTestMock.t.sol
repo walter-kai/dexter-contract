@@ -103,17 +103,17 @@ contract MockDCABot {
         Order storage o = orders[dcaId];
         require(o.user == msg.sender, "Not owner");
         require(o.status == IDexterHook.OrderStatus.ACTIVE, "Not active");
-        
+
         // Calculate unused gas to refund
         uint256 unusedGas = o.gasAllocated - o.gasUsed;
         if (unusedGas > 0) {
             // Transfer unused gas back to user
             payable(msg.sender).transfer(unusedGas);
         }
-        
+
         // Update order status
         o.status = IDexterHook.OrderStatus.CANCELLED;
-        
+
         // Refund unexecuted tokens
         uint256 unexecutedAmount = o.totalAmount - o.executedAmount;
         if (unexecutedAmount > 0) {
@@ -186,7 +186,7 @@ contract MockDCABot {
         if (takeProfitHit) {
             o.isFullyExecuted = true;
             o.status = IDexterHook.OrderStatus.COMPLETED;
-            
+
             // Refund unused gas on take profit
             uint256 unusedGas = o.gasAllocated - o.gasUsed;
             if (unusedGas > 0) {
@@ -878,11 +878,8 @@ contract SimpleStrat is Test {
 
     // Test gas refund when cancelling before any execution
     function test_gasRefundOnImmediateCancel() public {
-        IDexterHook.PoolParams memory poolParams = IDexterHook.PoolParams({
-            currency0: address(weth),
-            currency1: address(usdc),
-            fee: 3000
-        });
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
@@ -907,11 +904,8 @@ contract SimpleStrat is Test {
 
     // Test gas refund after partial execution
     function test_gasRefundAfterPartialExecution() public {
-        IDexterHook.PoolParams memory poolParams = IDexterHook.PoolParams({
-            currency0: address(weth),
-            currency1: address(usdc),
-            fee: 3000
-        });
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
@@ -946,11 +940,8 @@ contract SimpleStrat is Test {
 
     // Test gas refund on take profit hit
     function test_gasRefundOnTakeProfit() public {
-        IDexterHook.PoolParams memory poolParams = IDexterHook.PoolParams({
-            currency0: address(weth),
-            currency1: address(usdc),
-            fee: 3000
-        });
+        IDexterHook.PoolParams memory poolParams =
+            IDexterHook.PoolParams({currency0: address(weth), currency1: address(usdc), fee: 3000});
 
         IDexterHook.DCAParams memory dca = IDexterHook.DCAParams({
             zeroForOne: true,
@@ -973,7 +964,7 @@ contract SimpleStrat is Test {
         inputs[0] = 1 ether;
         outputs[0] = 2100 * 1e6; // Price moved up 10% hitting take profit
         uint256 gasUsed = gasFunded / 3;
-        
+
         uint256 balanceBefore = address(this).balance;
         mock.simulateExecution(id, gasUsed, 0, inputs, outputs);
         uint256 balanceAfter = address(this).balance;

@@ -10,6 +10,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
  *         customizable pool and DCA parameters, and batch execution with advanced controls.
  */
 interface IDexterHook {
+    
     // Order execution status
     enum OrderStatus {
         ACTIVE, // Order is running normally

@@ -47,8 +47,7 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
     mapping(uint256 => uint256) public dcaCurrentLevel; // Current DCA level (0 = initial swap done)
     mapping(uint256 => int24) public dcaTakeProfitTick; // Current take profit tick
 
-    // Gas management system
-    mapping(uint256 => uint256) public orderGasFunded; // dcaId => ETH amount reserved for gas
+    
 
     struct OrderInfo {
         address user;
@@ -153,10 +152,28 @@ uint256 public gasCompensationPool;
         uint32 slippage,
         uint256 expirationTime
     ) external payable virtual returns (uint256 dcaId) {
-        // Calculate gas internally based on strategy parameters
-        uint256 gasBaseAmount = _calculateSwapGasCost();
-    
-    
+        // Calculate required gas allocation
+        uint256 gasAllocation = _calculateTotalStrategyGas(_calculateSwapGasCost(), dca.maxSwapOrders);
+        
+        // Check if ETH is the input token
+        address inputToken = dca.zeroForOne ? pool.currency0 : pool.currency1;
+        bool isETHInput = inputToken == address(0);
+        
+        if (isETHInput) {
+            // For ETH input: msg.value should be >= token amount + gas allocation
+            uint256 firstLevelAmount = (dca.swapOrderAmount * dca.swapOrderMultiplier) / 10;
+            uint256 totalTokenAmount = dca.swapOrderAmount + firstLevelAmount;
+            uint256 requiredETH = totalTokenAmount + gasAllocation;
+            
+            if (msg.value < requiredETH) revert InsufficientETHForOrderPlusGas();
+        } else {
+            // For ERC20 input: use msg.value as gas allocation if provided
+            if (msg.value > 0) {
+                gasAllocation = msg.value;
+            } else if (msg.value < gasAllocation) {
+                revert InsufficientGasTank();
+            }
+        }
 
         return _createDCAStrategyInternal(
             pool.currency0,
@@ -171,7 +188,7 @@ uint256 public gasCompensationPool;
             dca.swapOrderMultiplier,
             slippage,
             expirationTime,
-            gasBaseAmount
+            gasAllocation
         );
     }
 
@@ -188,7 +205,7 @@ uint256 public gasCompensationPool;
         uint32 swapOrderMultiplier,
         uint32 slippage,
         uint256 expirationTime,
-        uint256 gasBaseAmount
+        uint256 gasAllocation
     ) internal returns (uint256 dcaId) {
         _validateDCAInputs(
             takeProfitPercent,
@@ -200,12 +217,11 @@ uint256 public gasCompensationPool;
             expirationTime,
             currency0,
             currency1,
-            gasBaseAmount
+            gasAllocation
         );
 
-        // Calculate total estimated gas for entire strategy
-        uint256 totalEstimatedGas = _calculateTotalStrategyGas(gasBaseAmount, maxSwapOrders);
-        gasCompensationPool += totalEstimatedGas;
+        // Use the calculated gas allocation
+        uint256 totalEstimatedGas = gasAllocation;
         PoolKey memory key = _createPoolKey(currency0, currency1, fee);
         _ensurePoolInitialized(key);
 
@@ -287,22 +303,19 @@ uint256 public gasCompensationPool;
         order.status = IDexterHook.OrderStatus.CANCELLED;
 
         // Get remaining gas to refund
-        uint256 remainingGas = orderGasFunded[dcaOrderId];
-        orderGasFunded[dcaOrderId] = 0;
+       
 
         // Refund unspent input tokens plus remaining gas
-        uint256 totalRefund = totalPendingInput + remainingGas;
+        uint256 totalRefund = totalPendingInput;
         Currency inputCurrency = order.zeroForOne ? order.poolKey.currency0 : order.poolKey.currency1;
         if (Currency.unwrap(inputCurrency) == address(0)) {
             (bool success,) = payable(msg.sender).call{value: totalRefund}("");
             require(success, "ETH send failed");
         } else {
             IERC20(Currency.unwrap(inputCurrency)).safeTransfer(msg.sender, totalPendingInput);
-            payable(msg.sender).transfer(remainingGas);
         }
 
         // Gas settlement handled above
-        emit GasRefunded(dcaOrderId, remainingGas);
         emit OrderCancelledOptimized(dcaOrderId, msg.sender);
     }
 
@@ -380,9 +393,9 @@ uint256 public gasCompensationPool;
     /* ==========================================================
        CALLBACK + HOOKS
        ========================================================== */
-    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+    function unlockCallback(bytes calldata data) external override   returns (bytes memory) {
         if (data.length > 64) {
-            (string memory operationType) = abi.decode(data, (string));
+             (string memory operationType, bytes memory operationData) = abi.decode(data, (string, bytes));
             if (keccak256(bytes(operationType)) == keccak256("general_liquidity")) {
                 (, PoolKey memory key, ModifyLiquidityParams memory params) =
                     abi.decode(data, (string, PoolKey, ModifyLiquidityParams));
@@ -397,7 +410,40 @@ uint256 public gasCompensationPool;
             } catch {}
         }
         (PoolKey memory swapKey, SwapParams memory swapParams) = abi.decode(data, (PoolKey, SwapParams));
+        
+        // Execute the swap
         BalanceDelta delta = poolManager.swap(swapKey, swapParams, "");
+        
+        // Handle settlement for the swap - only settle if we have the tokens
+        if (delta.amount0() > 0) {
+            if (Currency.unwrap(swapKey.currency0) == address(0)) {
+                // ETH settlement - check if we have enough ETH
+                uint256 requiredETH = uint256(int256(delta.amount0()));
+                if (address(this).balance >= requiredETH) {
+                    poolManager.settle{value: requiredETH}();
+                }
+            } else {
+                // ERC20 settlement - check if we have enough tokens
+                uint256 requiredTokens = uint256(int256(delta.amount0()));
+                if (IERC20(Currency.unwrap(swapKey.currency0)).balanceOf(address(this)) >= requiredTokens) {
+                    Currency.wrap(Currency.unwrap(swapKey.currency0)).transfer(
+                        address(poolManager), requiredTokens
+                    );
+                    poolManager.settle();
+                }
+            }
+        }
+        if (delta.amount1() > 0) {
+            // ERC20 settlement - check if we have enough tokens
+            uint256 requiredTokens = uint256(int256(delta.amount1()));
+            if (IERC20(Currency.unwrap(swapKey.currency1)).balanceOf(address(this)) >= requiredTokens) {
+                Currency.wrap(Currency.unwrap(swapKey.currency1)).transfer(
+                    address(poolManager), requiredTokens
+                );
+                poolManager.settle();
+            }
+        }
+        
         return abi.encode(delta);
     }
 
@@ -434,7 +480,7 @@ uint256 public gasCompensationPool;
         return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    function _beforeSwap(address caller, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         internal
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -442,18 +488,27 @@ uint256 public gasCompensationPool;
         if (msg.sender == address(this)) {
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
+
+        
         // Estimate gas used for order execution
         uint256 startGas = gasleft();
         
         BeforeSwapDelta delta = _processLimitOrdersBeforeSwap(key, params);
         
         uint256 gasUsed = startGas - gasleft();
-        uint256 compensation = (gasUsed * tx.gasprice) * COMPENSATION_RATE / 100;
+        uint256 compensation = (gasUsed * tx.gasprice * COMPENSATION_RATE) / 100;
     
         if (compensation > 0 && gasCompensationPool >= compensation) {
             gasCompensationPool -= compensation;
-            (bool success ,) = payable(msg.sender).call{value: compensation}("");
-            require(success, "Refunds Failed");
+            if (caller != address(0)) {
+                (bool success,) = payable(caller).call{value: compensation}("");
+                if (!success) {
+                    // If refund fails, add the compensation back to the pool
+                    gasCompensationPool += compensation;
+                } else {
+                    emit GasRefunded(0, compensation); // Use 0 as dcaId for general gas refunds
+                }
+            }
         } 
 
         // Use the pool's actual fee instead of overriding
@@ -528,7 +583,7 @@ uint256 public gasCompensationPool;
         if (swapOrderMultiplier < 10 || swapOrderMultiplier > 100) revert InvalidMultiplier(); // 0.1-10.0
         if (expirationTime <= block.timestamp) revert ExpiredDeadline();
         if (currency0 == currency1) revert SameCurrencies();
-        if (gasBaseAmount == 0) revert InsufficientGasTank();
+       
     }
 
     function _calculateTotalStrategyGas(uint256 gasBaseAmount, uint8 maxSwapOrders) internal pure returns (uint256) {
@@ -540,19 +595,16 @@ uint256 public gasCompensationPool;
     }
 
     // Deduct gas using pre-allocation first, then gasTank
-    function _deductGasForOrder(uint256 dcaId, uint256 gasCost) internal returns (bool success) {
-        OrderInfo storage order = orders[dcaId];
-        uint256 availableGas = orderGasFunded[dcaId];
-
-        if (availableGas >= gasCost) {
-            orderGasFunded[dcaId] = availableGas - gasCost;
-            order.gasUsed += gasCost;
-            return true;
-        }
-
-        return false;
+function _deductGasForOrder(uint256 dcaId, uint256 gasCost) internal returns (bool success) {
+    OrderInfo storage order = orders[dcaId];
+    uint256 availableGas = order.gasFunded > order.gasUsed ? order.gasFunded - order.gasUsed : 0;
+    
+    if (availableGas >= gasCost) {
+        order.gasUsed += gasCost;
+        return true;
     }
-
+    return false;
+}
 
 
     function _calculateInitialDCALevel(
@@ -879,25 +931,31 @@ uint256 public gasCompensationPool;
         uint256 dcaId
     ) internal {
         address sellToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
-
+        orders[dcaId].gasFunded = gasAllocation; 
+        
         if (sellToken == address(0)) {
-            // For ETH swaps, require total amount + gas allocation
+            // For ETH swaps: msg.value contains both token amount and gas allocation
             uint256 requiredETH = totalAmount + gasAllocation;
             if (msg.value < requiredETH) revert InsufficientETHForOrderPlusGas();
+            
+            // Refund excess ETH if any
             if (msg.value > requiredETH) {
                 (bool success,) = payable(msg.sender).call{value: msg.value - requiredETH}("");
                 require(success, "ETH refund failed");
             }
-            orderGasFunded[dcaId] = gasAllocation;
+            // ETH for tokens is already in contract, gas allocation is stored separately
+          
         } else {
-            // For token swaps, require ETH for gas allocation + token amount
+            // For ERC20 swaps: msg.value is only for gas allocation
             if (msg.value < gasAllocation) revert InsufficientGasTank();
+            
+            // Refund excess ETH if any
             if (msg.value > gasAllocation) {
                 (bool success,) = payable(msg.sender).call{value: msg.value - gasAllocation}("");
                 require(success, "ETH refund failed");
             }
-            // Store the gas allocation for this order
-            orderGasFunded[dcaId] = gasAllocation;
+            
+            // Transfer ERC20 tokens
             IERC20(sellToken).safeTransferFrom(msg.sender, address(this), totalAmount);
         }
     }
@@ -1126,13 +1184,12 @@ uint256 public gasCompensationPool;
     // Settle gas accounting when order completes
     function _settleGasAccounting(uint256 dcaId, uint256 profitAmount) internal returns (uint256 adjustedAmount) {
         // Get remaining gas funds
-        uint256 remainingGas = orderGasFunded[dcaId];
+       
         
         // Return any unused gas to the user along with profits
-        adjustedAmount = profitAmount + remainingGas;
+        adjustedAmount = profitAmount;
         
-        // Clear the gas funding
-        orderGasFunded[dcaId] = 0;
+       
 
         return adjustedAmount;
     }
