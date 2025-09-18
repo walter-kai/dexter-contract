@@ -260,8 +260,3 @@ This table shows typical event payloads and how a UI or integration should inter
 - When a user cancels or redeems, listen for `BatchOrderCancelledOptimized` to confirm on-chain settlement.
   - When a user cancels an order, listen for `BatchOrderCancelledOptimized` to confirm on-chain settlement.
 
-If you'd like, I can also:
-- Add TypeScript/TypeChain interface snippets for these structs and events.
-- Generate a small example script that creates a DCA order with realistic param values.
-
-
