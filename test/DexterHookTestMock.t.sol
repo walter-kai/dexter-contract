@@ -754,7 +754,7 @@ contract SimpleStrat is Test {
         });
 
         vm.expectRevert(); // Should revert with ExpiredDeadline
-        mock.createDCAStrategy{value: 1 ether}(poolParams, validParams, 100, block.timestamp - 1 hours);
+        mock.createDCAStrategy{value: 1 ether}(poolParams, validParams, 100, 1); // Use timestamp 1 (clearly in the past)
     }
 
     function test_sellNowFunction() public {

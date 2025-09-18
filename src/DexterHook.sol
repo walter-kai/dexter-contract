@@ -1004,22 +1004,39 @@ function _deductGasForOrder(uint256 dcaId, uint256 gasCost) internal returns (bo
         returns (bytes memory)
     {
         (BalanceDelta delta,) = poolManager.modifyLiquidity(key, params, "");
+        
+        // Handle currency0 settlement
         if (delta.amount0() > 0) {
+            // Pool manager owes us tokens, we need to take them
             if (Currency.unwrap(key.currency0) == address(0)) {
-                poolManager.settle{value: uint256(int256(delta.amount0()))}();
+                poolManager.take(key.currency0, address(this), uint256(int256(delta.amount0())));
+            } else {
+                poolManager.take(key.currency0, address(this), uint256(int256(delta.amount0())));
+            }
+        } else if (delta.amount0() < 0) {
+            // We owe tokens to the pool manager
+            if (Currency.unwrap(key.currency0) == address(0)) {
+                poolManager.settle{value: uint256(int256(-delta.amount0()))}();
             } else {
                 Currency.wrap(Currency.unwrap(key.currency0)).transfer(
-                    address(poolManager), uint256(int256(delta.amount0()))
+                    address(poolManager), uint256(int256(-delta.amount0()))
                 );
                 poolManager.settle();
             }
         }
+        
+        // Handle currency1 settlement
         if (delta.amount1() > 0) {
+            // Pool manager owes us tokens, we need to take them
+            poolManager.take(key.currency1, address(this), uint256(int256(delta.amount1())));
+        } else if (delta.amount1() < 0) {
+            // We owe tokens to the pool manager
             Currency.wrap(Currency.unwrap(key.currency1)).transfer(
-                address(poolManager), uint256(int256(delta.amount1()))
+                address(poolManager), uint256(int256(-delta.amount1()))
             );
             poolManager.settle();
         }
+        
         return abi.encode(delta);
     }
 

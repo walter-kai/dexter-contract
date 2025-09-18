@@ -227,7 +227,7 @@ contract DexterHookTest is Test, Deployers {
         SwapParams memory swapParams = SwapParams({
             zeroForOne: false, // Buy token0 with token1
             amountSpecified: -0.1 ether, // Exact output
-            sqrtPriceLimitX96: 0
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1 // Use a valid max price limit
         });
         
         PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
@@ -295,6 +295,9 @@ contract DexterHookTest is Test, Deployers {
     function test_ETHInputToken() public {
         vm.txGasPrice(1 gwei);
         
+        // Give this test contract ETH for pool operations
+        vm.deal(address(this), 200 ether);
+        
         // Create a pool with ETH as currency0 (address(0))
         PoolKey memory ethPoolKey = PoolKey({
             currency0: Currency.wrap(address(0)), // ETH
@@ -311,7 +314,7 @@ contract DexterHookTest is Test, Deployers {
         ModifyLiquidityParams memory liqParams = ModifyLiquidityParams({
             tickLower: TickMath.minUsableTick(60),
             tickUpper: TickMath.maxUsableTick(60),
-            liquidityDelta: 1000 ether,
+            liquidityDelta: 100 ether, // Match the ETH amount sent
             salt: bytes32(0)
         });
         modifyLiquidityRouter.modifyLiquidity{value: 100 ether}(ethPoolKey, liqParams, ZERO_BYTES);
@@ -335,8 +338,8 @@ contract DexterHookTest is Test, Deployers {
         // Calculate required amounts
         uint256 firstLevelAmount = (dcaParams.swapOrderAmount * dcaParams.swapOrderMultiplier) / 10; // 0.2 ETH
         uint256 totalTokenAmount = dcaParams.swapOrderAmount + firstLevelAmount; // 0.3 ETH
-        uint256 gasAllocation = (150000 * tx.gasprice * 5 * 120) / 100; // ~0.0009 ETH at 1 gwei
-        uint256 totalETHNeeded = totalTokenAmount + gasAllocation; // ~0.3009 ETH
+        uint256 gasAllocation = (150000 * tx.gasprice * (2 + dcaParams.maxSwapOrders) * 120) / 100; // Correct formula
+        uint256 totalETHNeeded = totalTokenAmount + gasAllocation;
         
         console.log("Total ETH needed:", totalETHNeeded);
         console.log("Token amount:", totalTokenAmount);
