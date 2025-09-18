@@ -9,9 +9,7 @@
 .env.local
 .env.*.local
 
-# Dependencies
-node_modules/
-/lib
+
 
 # IDE files
 .vscode/
