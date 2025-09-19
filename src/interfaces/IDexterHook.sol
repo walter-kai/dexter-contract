@@ -68,26 +68,25 @@ interface IDexterHook {
             uint24 currentFee
         );
 
-    function getDCAInfoExtended(uint256 dcaId)
+    // Get all DCA orders (returns arrays of order IDs and their info)
+    function getAllOrders()
         external
         view
         returns (
-            address user,
-            address currency0,
-            address currency1,
-            uint256 totalAmount,
-            uint256 executedAmount,
-            uint256 claimableAmount,
-            IDexterHook.OrderStatus status,
-            bool isFullyExecuted,
-            uint256 expirationTime,
-            bool zeroForOne,
-            uint256 totalBatches,
-            uint24 currentFee,
-            uint256 gasAllocated,
-            uint256 gasUsed
+            uint256[] memory orderIds,
+            address[] memory users,
+            address[] memory currency0s,
+            address[] memory currency1s,
+            uint256[] memory totalAmounts,
+            uint256[] memory executedAmounts,
+            IDexterHook.OrderStatus[] memory statuses,
+            bool[] memory isFullyExecuted
         );
 
+    // Get total number of DCA orders created
+    function getOrderCount() external view returns (uint256);
+
+    // DEPRECATED: Use getDCAInfo instead - kept for backwards compatibility
     function getDCAOrder(uint256 dcaId)
         external
         view

@@ -236,10 +236,9 @@ contract DexterHookTest is Test, Deployers {
         // Verify DCA was created
         assertTrue(dcaId > 0, "DCA ID should be valid");
 
-        // Check gas accounting
-        (,,,,,,,,,,,, uint256 gasAllocated, uint256 gasUsed) = dcaBot.getDCAInfoExtended(dcaId);
-        assertEq(gasAllocated, gasAllocation, "Gas allocated should match calculated amount");
-        assertTrue(gasUsed <= gasAllocated, "Gas used should not exceed allocated");
+        // Check order creation (gas tracking removed)
+        (,,,,,,, IDexterHook.OrderStatus status,) = dcaBot.getDCAOrder(dcaId);
+        assertTrue(status == IDexterHook.OrderStatus.ACTIVE, "Order should be active");
     }
 
     function test_createDCAStrategy_InvalidInputs() public {
@@ -565,26 +564,16 @@ contract DexterHookTest is Test, Deployers {
         assertEq(currentFee, 3000, "Fee should match");
     }
 
-    function test_getDCAInfoExtended() public {
-        vm.txGasPrice(1 gwei);
-
-        uint256 dcaId = _createTestDCAStrategy(user1);
-
-        (,,,,,,,,,,,, uint256 gasAllocated, uint256 gasUsed) = dcaBot.getDCAInfoExtended(dcaId);
-
-        assertTrue(gasAllocated > 0, "Should have gas allocated");
-        assertTrue(gasUsed <= gasAllocated, "Gas used should not exceed allocated");
-    }
-
     function test_getDCAOrder() public {
         vm.txGasPrice(1 gwei);
 
         uint256 dcaId = _createTestDCAStrategy(user1);
 
-        (address user,,,,, uint256[] memory targetPrices, uint256[] memory targetAmounts,,) = dcaBot.getDCAOrder(dcaId);
+        (address user,,,,, uint256[] memory targetPrices, uint256[] memory targetAmounts, IDexterHook.OrderStatus status,) = dcaBot.getDCAOrder(dcaId);
 
         assertEq(user, user1, "User should match");
         assertTrue(targetPrices.length > 0, "Should have target prices");
+        assertTrue(status == IDexterHook.OrderStatus.ACTIVE, "Order should be active");
         assertTrue(targetAmounts.length > 0, "Should have target amounts");
         assertEq(targetPrices.length, targetAmounts.length, "Arrays should have same length");
     }

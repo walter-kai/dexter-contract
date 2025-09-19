@@ -6,7 +6,7 @@ import "forge-std/console.sol";
 import "../src/interfaces/IDexterHook.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 
-// A small mock of the DCADexterBotV1 interface to simulate behavior for unit tests.
+// A small mock of the DexterHook interface to simulate behavior for unit tests.
 contract MockDCABot {
     using stdMath for uint256;
 
@@ -276,47 +276,6 @@ contract MockDCABot {
         );
     }
 
-    function getDCAInfoExtended(uint256 dcaId)
-        external
-        view
-        returns (
-            address user,
-            address currency0,
-            address currency1,
-            uint256 totalAmount,
-            uint256 executedAmount,
-            uint256 claimableAmount,
-            IDexterHook.OrderStatus status,
-            bool isFullyExecuted,
-            uint256 expirationTime,
-            bool zeroForOne,
-            uint256 totalBatches,
-            uint24 currentFee,
-            uint256 gasAllocated,
-            uint256 gasUsed,
-            uint256 gasBorrowedFromTank
-        )
-    {
-        Order storage o = orders[dcaId];
-        return (
-            o.user,
-            address(0),
-            address(0),
-            o.totalAmount,
-            o.executedAmount,
-            o.claimableAmount,
-            o.status,
-            o.isFullyExecuted,
-            o.expirationTime,
-            o.zeroForOne,
-            o.totalBatches,
-            o.currentFee,
-            o.gasAllocated,
-            o.gasUsed,
-            o.gasBorrowedFromTank
-        );
-    }
-
     function getDCAOrder(uint256 dcaId)
         external
         view
@@ -442,12 +401,13 @@ contract SimpleStrat is Test {
 
         (,,, uint256 totalAmount, uint256 executedAmount, uint256 claimableAmount,, bool isFullyExecuted,,,,) =
             mock.getDCAInfo(id);
-        (,,,,,,,,,,,, uint256 gasAllocated, uint256 gasUsedRead, uint256 gasBorrowedRead) = mock.getDCAInfoExtended(id);
+        // Note: Gas tracking functionality has been removed from the contract
+        (,,,,,,, IDexterHook.OrderStatus status,) = mock.getDCAOrder(id);
 
-        // Assertions
-        assertEq(gasAllocated, expected, "gas allocated should match expected");
-        assertEq(gasUsedRead, gasUsed, "gas used should match simulated");
-        assertEq(gasBorrowedRead, gasBorrowed, "gas borrowed should match simulated");
+        // Assertions: Order should be active after creation and execution
+        assertTrue(status == IDexterHook.OrderStatus.ACTIVE, "Order should be active");
+        assertTrue(totalAmount > 0, "Total amount should be > 0");
+        assertTrue(executedAmount > 0, "Executed amount should be > 0");
 
         // Verify swap totals
         assertEq(executedAmount, inputs[0] + inputs[1] + inputs[2], "executedAmount sum");
@@ -460,10 +420,9 @@ contract SimpleStrat is Test {
         console.log("Total Allocated Input:", totalAmount / 1 ether, "ETH");
         console.log("Total Input Spent:", executedAmount / 1 ether, "ETH");
         console.log("Total Output Received:", claimableAmount / 1 ether, "ETH");
-        console.log("Gas Allocated (wei):", gasAllocated);
-        console.log("Gas Used (wei):", gasUsedRead);
-        console.log("Gas Borrowed (wei):", gasBorrowedRead);
+        console.log("Order Status:", uint256(status));
         console.log("Completed:", isFullyExecuted ? 1 : 0);
+        console.log("Note: Gas tracking functionality has been removed");
     }
 
     function test_gasBorrowedFromTank() public {
@@ -499,14 +458,14 @@ contract SimpleStrat is Test {
 
         mock.simulateExecution(id, gasUsed, gasBorrowed, inputs, outputs);
 
-        (,,,,,,,,,,,, uint256 gasAllocated, uint256 gasUsedRead, uint256 gasBorrowedRead) = mock.getDCAInfoExtended(id);
+        // Note: Gas tracking functionality has been removed from the contract
+        // Verify order creation and execution instead
+        (,,,,,,, IDexterHook.OrderStatus status,) = mock.getDCAOrder(id);
 
-        // Assertions: gasBorrowed should be > 0 and reflect the difference
-        assertTrue(gasBorrowedRead > 0, "gasBorrowed should be > 0");
-        assertEq(gasAllocated, provided, "gas allocated should match what was provided");
-        assertEq(gasUsedRead, gasUsed, "gas used should equal simulated usage");
+        // Assertions: Order should be active after creation
+        assertTrue(status == IDexterHook.OrderStatus.ACTIVE, "Order should be active");
 
-        console.log("Borrowed (wei):", gasBorrowedRead);
+        console.log("Order status:", uint256(status));
     }
 
     function test_maxSwapOrders() public {

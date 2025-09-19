@@ -30,7 +30,7 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
-import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BaseHook} from "@uniswap/v4-periphery/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
@@ -87,6 +87,9 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
     
     uint256 public constant COMPENSATION_RATE = 120; // 120% of actual gas used
     uint256 public gasCompensationPool;
+    
+    // Track gas borrowed from compensation pool per order
+    mapping(uint256 => uint256) public gasBorrowedFromPool;
 
     /* ==========================================================
        ERRORS – DCA system errors
@@ -98,7 +101,6 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
     error NotAuthorized();
     error NoTokensToCancel();
     error OrderAlreadyExecutedUseRedeem();
-    error InsufficientClaimTokenBalance();
     error InvalidFeeRecipient();
     error InvalidExecutorAddress();
     error ExpiredDeadline();
@@ -111,8 +113,6 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
     error InvalidPriceDeviation();
     error InvalidMultiplier();
     error InsufficientGasTank();
-    error OrderStalled();
-    error Justfortest();
 
     /* ==========================================================
        EVENTS – DCA system events
@@ -131,6 +131,8 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
     event OrderCancelledOptimized(uint256 indexed orderId, address indexed user);
     event PoolInitializationTracked(PoolId indexed poolId, int24 initialTick, uint256 timestamp);
     event GasRefunded(uint256 indexed dcaId, uint256 amount);
+    event GasBorrowed(uint256 indexed dcaId, uint256 amount);
+    event GasRepaid(uint256 indexed dcaId, uint256 amount);
 
     modifier validOrder(uint256 orderId) {
         if (!(orderId > 0 && orderId < nextOrderId)) revert InvalidOrderId();
@@ -304,9 +306,31 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         // Mark order as cancelled
         order.status = IDexterHook.OrderStatus.CANCELLED;
 
-        // Get remaining gas to refund
+        // Calculate gas settlement: return unused gas to pool, deduct borrowed gas
+        uint256 unusedGas = order.gasFunded > order.gasUsed ? order.gasFunded - order.gasUsed : 0;
+        uint256 borrowedGas = gasBorrowedFromPool[dcaOrderId];
+        
+        if (unusedGas > borrowedGas) {
+            // User has excess gas after paying back borrowed amount
+            uint256 gasToReturn = unusedGas - borrowedGas;
+            gasCompensationPool += gasToReturn;
+            gasBorrowedFromPool[dcaOrderId] = 0;
+        } else if (borrowedGas > unusedGas) {
+            // User still owes gas to the pool
+            uint256 gasDebt = borrowedGas - unusedGas;
+            // Convert gas debt to ETH and deduct from refund
+            uint256 gasDebtInWei = gasDebt;
+            if (totalPendingInput >= gasDebtInWei) {
+                totalPendingInput -= gasDebtInWei;
+                gasCompensationPool += gasDebtInWei;
+            }
+            gasBorrowedFromPool[dcaOrderId] = 0;
+        } else {
+            // Exact balance, just clear the borrowed amount
+            gasBorrowedFromPool[dcaOrderId] = 0;
+        }
 
-        // Refund unspent input tokens plus remaining gas
+        // Refund unspent input tokens after gas settlement
         uint256 totalRefund = totalPendingInput;
         Currency inputCurrency = order.zeroForOne ? order.poolKey.currency0 : order.poolKey.currency1;
         if (Currency.unwrap(inputCurrency) == address(0)) {
@@ -371,8 +395,32 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         // Reset accumulated output since we sold it all
         dcaAccumulatedOutput[dcaId] = 0;
 
-        // Transfer proceeds with gas settlement
+        // Calculate gas settlement before transferring proceeds
+        uint256 unusedGas = order.gasFunded > order.gasUsed ? order.gasFunded - order.gasUsed : 0;
+        uint256 borrowedGas = gasBorrowedFromPool[dcaId];
+        uint256 gasDebtInWei = 0;
+        
+        if (unusedGas > borrowedGas) {
+            // User has excess gas after paying back borrowed amount
+            uint256 gasToReturn = unusedGas - borrowedGas;
+            gasCompensationPool += gasToReturn;
+            gasBorrowedFromPool[dcaId] = 0;
+        } else if (borrowedGas > unusedGas) {
+            // User owes gas to the pool - deduct from proceeds
+            gasDebtInWei = borrowedGas - unusedGas;
+            gasBorrowedFromPool[dcaId] = 0;
+        } else {
+            // Exact balance, just clear the borrowed amount
+            gasBorrowedFromPool[dcaId] = 0;
+        }
+
+        // Transfer proceeds after gas settlement
         uint256 adjustedProceeds = amountOut;
+        if (gasDebtInWei > 0 && adjustedProceeds >= gasDebtInWei) {
+            adjustedProceeds -= gasDebtInWei;
+            gasCompensationPool += gasDebtInWei;
+        }
+        
         Currency proceedsToken = order.zeroForOne ? order.poolKey.currency0 : order.poolKey.currency1;
         if (Currency.unwrap(proceedsToken) == address(0)) {
             (bool success,) = payable(msg.sender).call{value: adjustedProceeds}("");
@@ -395,21 +443,6 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
        CALLBACK + HOOKS
        ========================================================== */
     function unlockCallback(bytes calldata data) external override onlyPoolManager returns (bytes memory) {
-        if (data.length > 64) {
-            (string memory operationType,) = abi.decode(data, (string, bytes));
-            if (keccak256(bytes(operationType)) == keccak256("general_liquidity")) {
-                (, PoolKey memory key, ModifyLiquidityParams memory params) =
-                    abi.decode(data, (string, PoolKey, ModifyLiquidityParams));
-                return _handleGeneralLiquidityOperation(key, params);
-            }
-            try this._decodeLiquidityOperation(data) returns (
-                PoolKey memory liquidityKey, uint256 amount, bool zeroForOne, string memory orderOperation
-            ) {
-                if (keccak256(bytes(orderOperation)) == keccak256("ADD_LIQUIDITY")) {
-                    return _handleLiquidityOperation(liquidityKey, amount, zeroForOne);
-                }
-            } catch {}
-        }
         (PoolKey memory swapKey, SwapParams memory swapParams) = abi.decode(data, (PoolKey, SwapParams));
 
         // Execute the swap
@@ -550,7 +583,7 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
 
         uint256 swapAmount =
             params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        uint256 limitOrderFulfillment = _min(totalLimitOrderAmount, swapAmount);
+        uint256 limitOrderFulfillment = totalLimitOrderAmount < swapAmount ? totalLimitOrderAmount : swapAmount;
         if (limitOrderFulfillment == 0) return BeforeSwapDeltaLibrary.ZERO_DELTA;
 
         _executeLimitOrdersInRange(key, currentTick, targetTick, params.zeroForOne, limitOrderFulfillment);
@@ -593,16 +626,34 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         return 150000 * tx.gasprice; // ESTIMATED_EXECUTION_GAS inlined
     }
 
-    // Deduct gas using pre-allocation first, then gasTank
+    // Deduct gas using pre-allocation first, then borrow from compensation pool
     function _deductGasForOrder(uint256 dcaId, uint256 gasCost) internal returns (bool success) {
         OrderInfo storage order = orders[dcaId];
         uint256 availableGas = order.gasFunded > order.gasUsed ? order.gasFunded - order.gasUsed : 0;
 
         if (availableGas >= gasCost) {
+            // User has enough allocated gas
             order.gasUsed += gasCost;
             return true;
+        } else {
+            // User needs to borrow from compensation pool
+            uint256 shortfall = gasCost - availableGas;
+            
+            if (gasCompensationPool >= shortfall) {
+                // Borrow from compensation pool
+                gasCompensationPool -= shortfall;
+                order.gasUsed += gasCost; // Track total gas used (including borrowed)
+                
+                // Track the borrowed amount separately for later repayment
+                gasBorrowedFromPool[dcaId] += shortfall;
+                
+                emit GasBorrowed(dcaId, shortfall);
+                return true;
+            }
+            
+            // Not enough gas in compensation pool either
+            return false;
         }
-        return false;
     }
 
     function _calculateInitialDCALevel(
@@ -967,72 +1018,6 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         return 60;
     }
 
-    function _decodeLiquidityOperation(bytes calldata data)
-        external
-        pure
-        returns (PoolKey memory key, uint256 amount, bool zeroForOne, string memory operation)
-    {
-        return abi.decode(data, (PoolKey, uint256, bool, string));
-    }
-
-    function _handleLiquidityOperation(PoolKey memory key, uint256 amount, bool) internal returns (bytes memory) {
-        (, int24 currentTick,,) = StateLibrary.getSlot0(poolManager, key.toId());
-        int24 tickSpacing = key.tickSpacing;
-        int24 tickLower = (currentTick - (100 * tickSpacing)) / tickSpacing * tickSpacing;
-        int24 tickUpper = (currentTick + (100 * tickSpacing)) / tickSpacing * tickSpacing;
-        uint128 liquidityDelta = uint128(amount / 100);
-        if (liquidityDelta == 0) liquidityDelta = 1000;
-        ModifyLiquidityParams memory params = ModifyLiquidityParams({
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            liquidityDelta: int256(uint256(liquidityDelta)),
-            salt: bytes32(uint256(block.timestamp))
-        });
-        (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(key, params, "");
-        return abi.encode(callerDelta);
-    }
-
-    function _handleGeneralLiquidityOperation(PoolKey memory key, ModifyLiquidityParams memory params)
-        internal
-        returns (bytes memory)
-    {
-        (BalanceDelta delta,) = poolManager.modifyLiquidity(key, params, "");
-
-        // Handle currency0 settlement
-        if (delta.amount0() > 0) {
-            // Pool manager owes us tokens, we need to take them
-            if (Currency.unwrap(key.currency0) == address(0)) {
-                poolManager.take(key.currency0, address(this), uint256(int256(delta.amount0())));
-            } else {
-                poolManager.take(key.currency0, address(this), uint256(int256(delta.amount0())));
-            }
-        } else if (delta.amount0() < 0) {
-            // We owe tokens to the pool manager
-            if (Currency.unwrap(key.currency0) == address(0)) {
-                poolManager.settle{value: uint256(int256(-delta.amount0()))}();
-            } else {
-                Currency.wrap(Currency.unwrap(key.currency0)).transfer(
-                    address(poolManager), uint256(int256(-delta.amount0()))
-                );
-                poolManager.settle();
-            }
-        }
-
-        // Handle currency1 settlement
-        if (delta.amount1() > 0) {
-            // Pool manager owes us tokens, we need to take them
-            poolManager.take(key.currency1, address(this), uint256(int256(delta.amount1())));
-        } else if (delta.amount1() < 0) {
-            // We owe tokens to the pool manager
-            Currency.wrap(Currency.unwrap(key.currency1)).transfer(
-                address(poolManager), uint256(int256(-delta.amount1()))
-            );
-            poolManager.settle();
-        }
-
-        return abi.encode(delta);
-    }
-
     /* ==========================================================
        LIMIT ORDER HELPERS
        ========================================================== */
@@ -1085,7 +1070,7 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
             for (int24 tick = currentTick; tick >= targetTick && remainingAmount > 0; tick -= key.tickSpacing) {
                 uint256 availableAmount = pendingOrders[poolId][tick][limitOrderDirection];
                 if (availableAmount > 0) {
-                    uint256 executeAmount = _min(availableAmount, remainingAmount);
+                    uint256 executeAmount = availableAmount < remainingAmount ? availableAmount : remainingAmount;
                     _executeLimitOrdersAtTick(poolId, tick, limitOrderDirection, executeAmount);
                     remainingAmount -= executeAmount;
                 }
@@ -1094,7 +1079,7 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
             for (int24 tick = currentTick; tick <= targetTick && remainingAmount > 0; tick += key.tickSpacing) {
                 uint256 availableAmount = pendingOrders[poolId][tick][limitOrderDirection];
                 if (availableAmount > 0) {
-                    uint256 executeAmount = _min(availableAmount, remainingAmount);
+                    uint256 executeAmount = availableAmount < remainingAmount ? availableAmount : remainingAmount;
                     _executeLimitOrdersAtTick(poolId, tick, limitOrderDirection, executeAmount);
                     remainingAmount -= executeAmount;
                 }
@@ -1122,7 +1107,7 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
             for (uint256 j = 0; j < order.ticksLength; j++) {
                 if (orderTargetTicks[orderId][j] == tick) {
                     uint256 orderAmountAtTick = orderTargetAmounts[orderId][j];
-                    uint256 executeFromOrder = _min(orderAmountAtTick, remainingToExecute);
+                    uint256 executeFromOrder = orderAmountAtTick < remainingToExecute ? orderAmountAtTick : remainingToExecute;
                     claimableOutputTokens[orderId] += executeFromOrder;
                     remainingToExecute -= executeFromOrder;
 
@@ -1152,10 +1137,6 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         } else {
             return toBeforeSwapDelta(-int128(int256(amount)), int128(int256(amount)));
         }
-    }
-
-    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
-        return a < b ? a : b;
     }
 
     function _handleDCAExecution(uint256 dcaId, uint256 buyAmount) internal {
@@ -1214,13 +1195,6 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         claimableOutputTokens[dcaId] += takeProfitAmount;
 
         emit DCASwapExecuted(dcaId, 999, takeProfitAmount, 0, !order.zeroForOne); // 999 indicates take profit
-    }
-
-    function _calculateEstimatedGasFee() internal view returns (uint256) {
-        uint256 estimatedCost = 150000 * tx.gasprice; // ESTIMATED_EXECUTION_GAS inlined
-        estimatedCost = (estimatedCost * 120) / 100; // GAS_PRICE_BUFFER_MULTIPLIER inlined
-        if (estimatedCost > 0.01 ether) estimatedCost = 0.01 ether; // MAX_GAS_FEE_ETH inlined
-        return estimatedCost;
     }
 
     /* ==========================================================
@@ -1289,47 +1263,52 @@ contract DexterHook is IDexterHook, ERC6909Base, BaseHook, IUnlockCallback {
         );
     }
 
-    function getDCAInfoExtended(uint256 dcaId)
+    // Get all DCA orders (returns arrays of order IDs and their info)
+    function getAllOrders()
         external
         view
         returns (
-            address user,
-            address currency0,
-            address currency1,
-            uint256 totalAmount,
-            uint256 executedAmount,
-            uint256 claimableAmount,
-            IDexterHook.OrderStatus status,
-            bool isFullyExecuted,
-            uint256 expirationTime,
-            bool zeroForOne,
-            uint256 totalOrders,
-            uint24 currentFee,
-            uint256 gasAllocated,
-            uint256 gasUsed
+            uint256[] memory orderIds,
+            address[] memory users,
+            address[] memory currency0s,
+            address[] memory currency1s,
+            uint256[] memory totalAmounts,
+            uint256[] memory executedAmounts,
+            IDexterHook.OrderStatus[] memory statuses,
+            bool[] memory isFullyExecuted
         )
     {
-        OrderInfo storage order = orders[dcaId];
-        if (order.user == address(0)) revert InvalidOrder();
-        uint256 execAmount = uint256(order.totalAmount) - claimTokensSupply[dcaId];
-        return (
-            order.user,
-            Currency.unwrap(order.poolKey.currency0),
-            Currency.unwrap(order.poolKey.currency1),
-            uint256(order.totalAmount),
-            execAmount,
-            claimableOutputTokens[dcaId],
-            order.status,
-            claimTokensSupply[dcaId] == 0,
-            uint256(order.expirationTime),
-            order.zeroForOne,
-            nextOrderId - 1,
-            order.poolKey.fee,
-            order.gasFunded,
-            order.gasUsed
-        );
+        uint256 totalOrders = nextOrderId - 1;
+        orderIds = new uint256[](totalOrders);
+        users = new address[](totalOrders);
+        currency0s = new address[](totalOrders);
+        currency1s = new address[](totalOrders);
+        totalAmounts = new uint256[](totalOrders);
+        executedAmounts = new uint256[](totalOrders);
+        statuses = new IDexterHook.OrderStatus[](totalOrders);
+        isFullyExecuted = new bool[](totalOrders);
+
+        for (uint256 i = 1; i <= totalOrders; i++) {
+            OrderInfo storage order = orders[i];
+            if (order.user != address(0)) {
+                orderIds[i - 1] = i;
+                users[i - 1] = order.user;
+                currency0s[i - 1] = Currency.unwrap(order.poolKey.currency0);
+                currency1s[i - 1] = Currency.unwrap(order.poolKey.currency1);
+                totalAmounts[i - 1] = uint256(order.totalAmount);
+                executedAmounts[i - 1] = uint256(order.totalAmount) - claimTokensSupply[i];
+                statuses[i - 1] = order.status;
+                isFullyExecuted[i - 1] = claimTokensSupply[i] == 0;
+            }
+        }
     }
 
+    // Get total number of DCA orders created
+    function getOrderCount() external view returns (uint256) {
+        return nextOrderId - 1;
+    }
+
+    // DEPRECATED: Use getDCAInfo instead - kept for backwards compatibility
     function getDCAOrder(uint256 dcaId)
         external
         view
