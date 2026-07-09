@@ -1,4 +1,4 @@
-# 🏆 Uniswap V4 Hookathon Submission
+# Dexter 
 
 ## **Intelligent Automated DCA with Dynamic Batch Ordering**
 
